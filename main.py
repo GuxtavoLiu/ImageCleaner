@@ -123,7 +123,7 @@ class ImageCleaner:
                     lbl = tk.Label(frame, image=photo)
                     lbl.image = photo
                     lbl.pack(side="left", padx=5, pady=5)
-                    chk = tk.Checkbutton(frame, text=os.path.basename(filepath), variable=var)
+                    chk = tk.Checkbutton(frame, text=filepath, variable=var)
                     chk.pack(side="left", padx=5, pady=5)
                 except Exception as e:
                     print(f"Erro ao carregar imagem {filepath}: {e}")
