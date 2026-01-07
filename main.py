@@ -60,15 +60,60 @@ class ImageCleaner:
         self.path_label = tk.Label(self.master, text="", fg="blue", wraplength=400)
         self.path_label.pack(pady=5)
 
+        # Frame para checkbox de subpastas (inicialmente oculto)
+        self.subfolder_frame = tk.Frame(self.master)
+
+        # Checkbox para escanear subpastas (marcada por padrão)
+        self.scan_subfolders_var = tk.IntVar(value=1)
+        self.subfolder_check = tk.Checkbutton(
+            self.subfolder_frame,
+            text="Escanear subpastas",
+            variable=self.scan_subfolders_var
+        )
+        self.subfolder_check.pack(side="left")
+
+        # Ícone de informação (tooltip)
+        self.info_label = tk.Label(self.subfolder_frame, text="ℹ️", fg="blue", cursor="hand2")
+        self.info_label.pack(side="left", padx=5)
+
+        # Binds para o tooltip
+        self.create_tooltip(self.info_label,
+                           "Se marcado, o programa irá escanear a pasta selecionada\n"
+                           "e todas as suas subpastas recursivamente.\n"
+                           "Se desmarcado, apenas a pasta raiz será escaneada.")
+
         # Botão Iniciar (inicialmente oculto)
         self.start_btn = tk.Button(self.master, text="Iniciar", command=self.start_scan)
-        # Não exibe o botão inicialmente
+        # Não exibe o botão nem o frame de subpastas inicialmente
+
+    def create_tooltip(self, widget, text):
+        """Cria um tooltip para um widget"""
+        def on_enter(event):
+            tooltip = tk.Toplevel()
+            tooltip.wm_overrideredirect(True)
+            tooltip.wm_geometry(f"+{event.x_root+10}+{event.y_root+10}")
+
+            label = tk.Label(tooltip, text=text, justify='left',
+                           background="#ffffe0", relief='solid', borderwidth=1,
+                           font=("Arial", 9))
+            label.pack()
+
+            widget.tooltip = tooltip
+
+        def on_leave(event):
+            if hasattr(widget, 'tooltip'):
+                widget.tooltip.destroy()
+                del widget.tooltip
+
+        widget.bind('<Enter>', on_enter)
+        widget.bind('<Leave>', on_leave)
 
     def select_folder(self):
         folder = filedialog.askdirectory(title="Selecione a pasta com imagens")
         if folder:
             self.selected_folder = folder
             self.path_label.config(text=f"Pasta selecionada: {folder}")
+            self.subfolder_frame.pack(pady=5)
             self.start_btn.pack(pady=10)
 
     def start_scan(self):
@@ -79,20 +124,46 @@ class ImageCleaner:
     def scan_folder(self):
         self.images_data = []
         valid_extensions = [".jpg", ".jpeg", ".png", ".bmp", ".gif"]
-        for root, dirs, files in os.walk(self.selected_folder):
-            for file in files:
-                if os.path.splitext(file)[1].lower() in valid_extensions:
-                    filepath = os.path.join(root, file)
-                    try:
-                        # Calcula perceptual hash
-                        with Image.open(filepath) as img:
-                            hash_val = imagehash.phash(img)
-                        # Calcula MD5 para detectar arquivos idênticos
-                        md5_val = get_file_md5(filepath)
-                        # Armazena tupla com (caminho, p-hash, md5)
-                        self.images_data.append((filepath, hash_val, md5_val))
-                    except Exception as e:
-                        print(f"Erro ao processar {filepath}: {e}")
+
+        # Verifica se deve escanear subpastas
+        scan_subfolders = self.scan_subfolders_var.get() == 1
+
+        if scan_subfolders:
+            # Escaneia recursivamente todas as subpastas
+            for root, dirs, files in os.walk(self.selected_folder):
+                for file in files:
+                    if os.path.splitext(file)[1].lower() in valid_extensions:
+                        filepath = os.path.join(root, file)
+                        try:
+                            # Calcula perceptual hash
+                            with Image.open(filepath) as img:
+                                hash_val = imagehash.phash(img)
+                            # Calcula MD5 para detectar arquivos idênticos
+                            md5_val = get_file_md5(filepath)
+                            # Armazena tupla com (caminho, p-hash, md5)
+                            self.images_data.append((filepath, hash_val, md5_val))
+                        except Exception as e:
+                            print(f"Erro ao processar {filepath}: {e}")
+        else:
+            # Escaneia apenas a pasta raiz (sem subpastas)
+            try:
+                files = os.listdir(self.selected_folder)
+                for file in files:
+                    filepath = os.path.join(self.selected_folder, file)
+                    # Verifica se é um arquivo (não diretório)
+                    if os.path.isfile(filepath) and os.path.splitext(file)[1].lower() in valid_extensions:
+                        try:
+                            # Calcula perceptual hash
+                            with Image.open(filepath) as img:
+                                hash_val = imagehash.phash(img)
+                            # Calcula MD5 para detectar arquivos idênticos
+                            md5_val = get_file_md5(filepath)
+                            # Armazena tupla com (caminho, p-hash, md5)
+                            self.images_data.append((filepath, hash_val, md5_val))
+                        except Exception as e:
+                            print(f"Erro ao processar {filepath}: {e}")
+            except Exception as e:
+                print(f"Erro ao listar arquivos: {e}")
 
         # Ajuste o threshold conforme necessário
         self.group_images(threshold=10)
