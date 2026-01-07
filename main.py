@@ -1,10 +1,13 @@
 import os
 import hashlib
 import tkinter as tk
-from tkinter import filedialog, messagebox
-from PIL import Image, ImageTk
+from tkinter import filedialog, messagebox, scrolledtext
+from PIL import Image, ImageTk, ImageFile
 import imagehash
 from datetime import datetime
+
+# Permite carregar imagens truncadas/corrompidas parcialmente
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 class UnionFind:
     """Classe simples de Union-Find (Disjoint Set)."""
@@ -50,6 +53,7 @@ class ImageCleaner:
         self.current_page = 0
         self.groups_per_page = 10
         self.group_check_vars = {}  # Armazena check_vars por grupo
+        self.scan_errors = []  # Armazena erros de escaneamento
         self.create_widgets()
 
     def create_widgets(self):
@@ -123,27 +127,63 @@ class ImageCleaner:
 
     def scan_folder(self):
         self.images_data = []
+        self.scan_errors = []  # Reseta lista de erros
         valid_extensions = [".jpg", ".jpeg", ".png", ".bmp", ".gif"]
+
+        total_files = 0
+        processed_files = 0
 
         # Verifica se deve escanear subpastas
         scan_subfolders = self.scan_subfolders_var.get() == 1
+
+        def process_image(filepath):
+            """Processa uma imagem e categoriza erros se houver"""
+            nonlocal processed_files
+            try:
+                # Calcula perceptual hash
+                with Image.open(filepath) as img:
+                    hash_val = imagehash.phash(img)
+                # Calcula MD5 para detectar arquivos idênticos
+                md5_val = get_file_md5(filepath)
+                # Armazena tupla com (caminho, p-hash, md5)
+                self.images_data.append((filepath, hash_val, md5_val))
+                processed_files += 1
+                return True
+            except Exception as e:
+                # Categoriza o erro
+                error_type = "Desconhecido"
+                error_msg = str(e)
+
+                if "truncated" in error_msg.lower():
+                    error_type = "Arquivo Truncado"
+                    error_msg = "Imagem incompleta ou corrompida (dados faltando)"
+                elif "broken data stream" in error_msg.lower():
+                    error_type = "Dados Corrompidos"
+                    error_msg = "Fluxo de dados da imagem está quebrado"
+                elif "cannot identify image file" in error_msg.lower():
+                    error_type = "Formato Inválido"
+                    error_msg = "Arquivo não é uma imagem válida ou formato não suportado"
+                elif "permission" in error_msg.lower():
+                    error_type = "Sem Permissão"
+                    error_msg = "Sem permissão para ler o arquivo"
+                else:
+                    error_msg = str(e)
+
+                self.scan_errors.append({
+                    'filepath': filepath,
+                    'type': error_type,
+                    'message': error_msg
+                })
+                return False
 
         if scan_subfolders:
             # Escaneia recursivamente todas as subpastas
             for root, dirs, files in os.walk(self.selected_folder):
                 for file in files:
                     if os.path.splitext(file)[1].lower() in valid_extensions:
+                        total_files += 1
                         filepath = os.path.join(root, file)
-                        try:
-                            # Calcula perceptual hash
-                            with Image.open(filepath) as img:
-                                hash_val = imagehash.phash(img)
-                            # Calcula MD5 para detectar arquivos idênticos
-                            md5_val = get_file_md5(filepath)
-                            # Armazena tupla com (caminho, p-hash, md5)
-                            self.images_data.append((filepath, hash_val, md5_val))
-                        except Exception as e:
-                            print(f"Erro ao processar {filepath}: {e}")
+                        process_image(filepath)
         else:
             # Escaneia apenas a pasta raiz (sem subpastas)
             try:
@@ -152,21 +192,107 @@ class ImageCleaner:
                     filepath = os.path.join(self.selected_folder, file)
                     # Verifica se é um arquivo (não diretório)
                     if os.path.isfile(filepath) and os.path.splitext(file)[1].lower() in valid_extensions:
-                        try:
-                            # Calcula perceptual hash
-                            with Image.open(filepath) as img:
-                                hash_val = imagehash.phash(img)
-                            # Calcula MD5 para detectar arquivos idênticos
-                            md5_val = get_file_md5(filepath)
-                            # Armazena tupla com (caminho, p-hash, md5)
-                            self.images_data.append((filepath, hash_val, md5_val))
-                        except Exception as e:
-                            print(f"Erro ao processar {filepath}: {e}")
+                        total_files += 1
+                        process_image(filepath)
             except Exception as e:
-                print(f"Erro ao listar arquivos: {e}")
+                messagebox.showerror("Erro", f"Erro ao listar arquivos: {e}")
+                return
+
+        # Exibe resumo do escaneamento
+        self.show_scan_summary(total_files, processed_files)
 
         # Ajuste o threshold conforme necessário
         self.group_images(threshold=10)
+
+    def show_scan_summary(self, total_files, processed_files):
+        """Exibe resumo do escaneamento com detalhes de erros"""
+        if not self.scan_errors:
+            # Sem erros
+            messagebox.showinfo("Escaneamento Concluído",
+                               f"✓ {processed_files} de {total_files} imagens processadas com sucesso!")
+            return
+
+        # Há erros - mostra janela detalhada
+        error_window = tk.Toplevel(self.master)
+        error_window.title("Relatório de Escaneamento")
+        error_window.geometry("700x500")
+
+        # Frame superior com resumo
+        summary_frame = tk.Frame(error_window, bg="#fff3cd", padx=10, pady=10)
+        summary_frame.pack(fill="x", padx=10, pady=10)
+
+        success_count = processed_files
+        error_count = len(self.scan_errors)
+
+        summary_text = (
+            f"✓ Imagens processadas: {success_count}\n"
+            f"✗ Imagens com erro: {error_count}\n"
+            f"📊 Total encontrado: {total_files}"
+        )
+
+        tk.Label(summary_frame, text=summary_text, font=("Arial", 10, "bold"),
+                bg="#fff3cd", justify="left").pack(anchor="w")
+
+        # Categoriza erros
+        error_types = {}
+        for error in self.scan_errors:
+            error_type = error['type']
+            if error_type not in error_types:
+                error_types[error_type] = []
+            error_types[error_type].append(error)
+
+        # Frame com categorias
+        categories_frame = tk.Frame(error_window, padx=10)
+        categories_frame.pack(fill="x", padx=10, pady=5)
+
+        tk.Label(categories_frame, text="Tipos de Erro Encontrados:",
+                font=("Arial", 9, "bold")).pack(anchor="w")
+
+        for error_type, errors in error_types.items():
+            tk.Label(categories_frame, text=f"  • {error_type}: {len(errors)} arquivo(s)",
+                    font=("Arial", 9)).pack(anchor="w")
+
+        # Lista de erros em scrolled text
+        tk.Label(error_window, text="Detalhes dos Erros:", font=("Arial", 9, "bold")).pack(anchor="w", padx=10, pady=(10, 5))
+
+        text_frame = tk.Frame(error_window)
+        text_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+        error_text = scrolledtext.ScrolledText(text_frame, wrap=tk.WORD, font=("Courier", 8))
+        error_text.pack(fill="both", expand=True)
+
+        # Agrupa por tipo
+        for error_type, errors in error_types.items():
+            error_text.insert(tk.END, f"\n═══ {error_type} ({len(errors)}) ═══\n", "header")
+            for error in errors:
+                error_text.insert(tk.END, f"\n📁 Arquivo: {error['filepath']}\n")
+                error_text.insert(tk.END, f"💬 Detalhes: {error['message']}\n")
+
+        # Configurações de tag
+        error_text.tag_config("header", font=("Courier", 9, "bold"), foreground="#d9534f")
+        error_text.config(state="disabled")
+
+        # Frame inferior com botões e informações
+        bottom_frame = tk.Frame(error_window)
+        bottom_frame.pack(fill="x", padx=10, pady=10)
+
+        # Informações úteis
+        info_frame = tk.LabelFrame(bottom_frame, text="O que fazer?", padx=10, pady=10)
+        info_frame.pack(fill="x", pady=(0, 10))
+
+        info_text = (
+            "• Arquivo Truncado: Imagem incompleta, possivelmente download interrompido\n"
+            "• Dados Corrompidos: Arquivo danificado, pode estar corrompido no disco\n"
+            "• Formato Inválido: Extensão .jpg mas não é uma imagem válida\n\n"
+            "💡 Recomendação: Você pode tentar recuperar essas imagens com ferramentas\n"
+            "   especializadas ou movê-las para uma pasta separada para análise manual."
+        )
+
+        tk.Label(info_frame, text=info_text, justify="left", font=("Arial", 8)).pack(anchor="w")
+
+        # Botão fechar
+        tk.Button(bottom_frame, text="Fechar", command=error_window.destroy,
+                 bg="#5cb85c", fg="white", padx=20).pack()
 
     def group_images(self, threshold=10):
         """
