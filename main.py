@@ -1,7 +1,7 @@
 import os
 import hashlib
 import tkinter as tk
-from tkinter import filedialog, messagebox, scrolledtext
+from tkinter import filedialog, messagebox, scrolledtext, ttk
 from PIL import Image, ImageTk, ImageFile
 import imagehash
 from datetime import datetime
@@ -123,7 +123,50 @@ class ImageCleaner:
     def start_scan(self):
         """Inicia o escaneamento quando o usuário clicar no botão Iniciar"""
         if self.selected_folder:
-            self.scan_folder()
+            self.create_progress_window()
+            # Agenda o scan para depois que a janela for criada
+            self.master.after(100, self.scan_folder)
+
+    def create_progress_window(self):
+        """Cria janela de progresso"""
+        self.progress_window = tk.Toplevel(self.master)
+        self.progress_window.title("Escaneando Imagens")
+        self.progress_window.geometry("500x150")
+        self.progress_window.resizable(False, False)
+
+        # Centraliza a janela
+        self.progress_window.transient(self.master)
+        self.progress_window.grab_set()
+
+        # Frame principal
+        main_frame = tk.Frame(self.progress_window, padx=20, pady=20)
+        main_frame.pack(fill="both", expand=True)
+
+        # Label de status
+        self.progress_label = tk.Label(main_frame, text="Inicializando...", font=("Arial", 10))
+        self.progress_label.pack(pady=(0, 10))
+
+        # Barra de progresso
+        self.progress_bar = ttk.Progressbar(main_frame, length=450, mode='determinate')
+        self.progress_bar.pack(pady=10)
+
+        # Label de contagem
+        self.progress_count_label = tk.Label(main_frame, text="0 / 0 imagens", font=("Arial", 9))
+        self.progress_count_label.pack(pady=(5, 0))
+
+    def update_progress(self, current, total, filename):
+        """Atualiza a barra de progresso"""
+        if hasattr(self, 'progress_window') and self.progress_window.winfo_exists():
+            # Atualiza o progresso
+            progress_percent = (current / total * 100) if total > 0 else 0
+            self.progress_bar['value'] = progress_percent
+
+            # Atualiza labels
+            self.progress_label.config(text=f"Processando: {os.path.basename(filename)}")
+            self.progress_count_label.config(text=f"{current} / {total} imagens")
+
+            # Força atualização da interface
+            self.progress_window.update()
 
     def scan_folder(self):
         self.images_data = []
@@ -136,6 +179,38 @@ class ImageCleaner:
         # Verifica se deve escanear subpastas
         scan_subfolders = self.scan_subfolders_var.get() == 1
 
+        # Primeira passagem: contar total de arquivos
+        self.progress_label.config(text="Contando arquivos...")
+        self.progress_window.update()
+
+        file_list = []
+        if scan_subfolders:
+            for root, dirs, files in os.walk(self.selected_folder):
+                for file in files:
+                    if os.path.splitext(file)[1].lower() in valid_extensions:
+                        file_list.append(os.path.join(root, file))
+        else:
+            try:
+                files = os.listdir(self.selected_folder)
+                for file in files:
+                    filepath = os.path.join(self.selected_folder, file)
+                    if os.path.isfile(filepath) and os.path.splitext(file)[1].lower() in valid_extensions:
+                        file_list.append(filepath)
+            except Exception as e:
+                if hasattr(self, 'progress_window'):
+                    self.progress_window.destroy()
+                messagebox.showerror("Erro", f"Erro ao listar arquivos: {e}")
+                return
+
+        total_files = len(file_list)
+
+        if total_files == 0:
+            if hasattr(self, 'progress_window'):
+                self.progress_window.destroy()
+            messagebox.showinfo("Resultado", "Nenhuma imagem encontrada.")
+            return
+
+        # Segunda passagem: processar arquivos
         def process_image(filepath):
             """Processa uma imagem e categoriza erros se houver"""
             nonlocal processed_files
@@ -174,29 +249,17 @@ class ImageCleaner:
                     'type': error_type,
                     'message': error_msg
                 })
+                processed_files += 1  # Conta mesmo com erro
                 return False
 
-        if scan_subfolders:
-            # Escaneia recursivamente todas as subpastas
-            for root, dirs, files in os.walk(self.selected_folder):
-                for file in files:
-                    if os.path.splitext(file)[1].lower() in valid_extensions:
-                        total_files += 1
-                        filepath = os.path.join(root, file)
-                        process_image(filepath)
-        else:
-            # Escaneia apenas a pasta raiz (sem subpastas)
-            try:
-                files = os.listdir(self.selected_folder)
-                for file in files:
-                    filepath = os.path.join(self.selected_folder, file)
-                    # Verifica se é um arquivo (não diretório)
-                    if os.path.isfile(filepath) and os.path.splitext(file)[1].lower() in valid_extensions:
-                        total_files += 1
-                        process_image(filepath)
-            except Exception as e:
-                messagebox.showerror("Erro", f"Erro ao listar arquivos: {e}")
-                return
+        # Processa cada arquivo com atualização de progresso
+        for idx, filepath in enumerate(file_list, 1):
+            process_image(filepath)
+            self.update_progress(idx, total_files, filepath)
+
+        # Fecha janela de progresso
+        if hasattr(self, 'progress_window') and self.progress_window.winfo_exists():
+            self.progress_window.destroy()
 
         # Exibe resumo do escaneamento
         self.show_scan_summary(total_files, processed_files)
@@ -329,9 +392,58 @@ class ImageCleaner:
         else:
             self.show_groups()
 
+    def create_groups_progress_window(self):
+        """Cria janela de progresso para inicialização de grupos"""
+        self.groups_progress_window = tk.Toplevel(self.master)
+        self.groups_progress_window.title("Preparando Grupos")
+        self.groups_progress_window.geometry("500x150")
+        self.groups_progress_window.resizable(False, False)
+
+        # Centraliza a janela
+        self.groups_progress_window.transient(self.master)
+        self.groups_progress_window.grab_set()
+
+        # Frame principal
+        main_frame = tk.Frame(self.groups_progress_window, padx=20, pady=20)
+        main_frame.pack(fill="both", expand=True)
+
+        # Label de status
+        self.groups_progress_label = tk.Label(main_frame, text="Inicializando grupos...", font=("Arial", 10))
+        self.groups_progress_label.pack(pady=(0, 10))
+
+        # Barra de progresso
+        self.groups_progress_bar = ttk.Progressbar(main_frame, length=450, mode='determinate')
+        self.groups_progress_bar.pack(pady=10)
+
+        # Label de contagem
+        self.groups_progress_count_label = tk.Label(main_frame, text="0 / 0 grupos", font=("Arial", 9))
+        self.groups_progress_count_label.pack(pady=(5, 0))
+
+        # Força atualização
+        self.groups_progress_window.update()
+
+    def update_groups_progress(self, current, total):
+        """Atualiza a barra de progresso de grupos"""
+        if hasattr(self, 'groups_progress_window') and self.groups_progress_window.winfo_exists():
+            # Atualiza o progresso
+            progress_percent = (current / total * 100) if total > 0 else 0
+            self.groups_progress_bar['value'] = progress_percent
+
+            # Atualiza labels
+            self.groups_progress_label.config(text=f"Preparando grupo {current} de {total}...")
+            self.groups_progress_count_label.config(text=f"{current} / {total} grupos")
+
+            # Força atualização da interface
+            self.groups_progress_window.update()
+
     def initialize_all_groups(self):
         """Inicializa estrutura de dados para todos os grupos antes de renderizar"""
+        total_groups = len(self.groups)
+
         for idx, group in enumerate(self.groups):
+            # Atualiza progresso
+            self.update_groups_progress(idx + 1, total_groups)
+
             check_vars = []
             image_info_list = []
 
@@ -366,8 +478,15 @@ class ImageCleaner:
         self.current_page = 0
         self.group_check_vars = {}  # Reseta a estrutura
 
+        # Cria janela de progresso
+        self.create_groups_progress_window()
+
         # Inicializa estrutura de dados para TODOS os grupos
         self.initialize_all_groups()
+
+        # Fecha janela de progresso
+        if hasattr(self, 'groups_progress_window') and self.groups_progress_window.winfo_exists():
+            self.groups_progress_window.destroy()
 
         self.groups_window = tk.Toplevel(self.master)
         self.groups_window.title("Grupos de Imagens Similares")
