@@ -284,6 +284,10 @@ class ImageCleaner:
         error_window.title("Relatório de Escaneamento")
         error_window.geometry("700x500")
 
+        # Torna a janela modal
+        error_window.transient(self.master)
+        error_window.grab_set()
+
         # Frame superior com resumo
         summary_frame = tk.Frame(error_window, bg="#fff3cd", padx=10, pady=10)
         summary_frame.pack(fill="x", padx=10, pady=10)
@@ -301,8 +305,8 @@ class ImageCleaner:
                 bg="#fff3cd", justify="left").pack(anchor="w")
 
         # Aviso sobre tempo de carregamento
-        warning_frame = tk.Frame(error_window, bg="#fff3cd", padx=10, pady=(0, 10))
-        warning_frame.pack(fill="x", padx=10)
+        warning_frame = tk.Frame(error_window, bg="#fff3cd", padx=10)
+        warning_frame.pack(fill="x", padx=10, pady=(0, 10))
 
         warning_text = "⚠️ Ao fechar esta janela, o carregamento pode demorar alguns minutos. Por favor, aguarde."
         tk.Label(warning_frame, text=warning_text, font=("Arial", 9),
@@ -368,6 +372,9 @@ class ImageCleaner:
         # Botão fechar
         tk.Button(bottom_frame, text="Fechar", command=error_window.destroy,
                  bg="#5cb85c", fg="white", padx=20).pack()
+
+        # Aguarda o usuário fechar a janela antes de continuar
+        error_window.wait_window()
 
     def group_images(self, threshold=10):
         """
@@ -516,6 +523,12 @@ class ImageCleaner:
                                          command=self.select_identical_images,
                                          bg="#4CAF50", fg="white")
         btn_select_identical.pack(side="left", padx=5)
+
+        # Botão para selecionar semelhantes
+        btn_select_similar = tk.Button(top_frame, text="Selecionar Semelhantes",
+                                       command=self.select_similar_images,
+                                       bg="#FF9800", fg="white")
+        btn_select_similar.pack(side="left", padx=5)
 
         # Botões de ação global
         btn_move_all = tk.Button(top_frame, text="Mover Todas Selecionadas",
@@ -720,6 +733,32 @@ class ImageCleaner:
 
         messagebox.showinfo("Seleção Concluída",
                            f"{selected_count} imagens idênticas foram selecionadas (mantendo a mais antiga de cada grupo).")
+
+    def select_similar_images(self):
+        """Seleciona automaticamente imagens semelhantes (MD5 diferente),
+           deixando apenas a mais antiga de cada grupo não selecionada."""
+        selected_count = 0
+
+        # Itera sobre todos os grupos
+        for group_idx, group_data in self.group_check_vars.items():
+            images = group_data['images']
+            md5_count = group_data['md5_count']
+
+            # Filtra apenas imagens semelhantes (MD5 único, ou seja, não duplicado)
+            similar_images = [img_info for img_info in images if md5_count[img_info['md5']] == 1]
+
+            # Se há pelo menos 2 imagens semelhantes no grupo
+            if len(similar_images) > 1:
+                # Ordena por data de modificação (mais antiga primeiro)
+                similar_images.sort(key=lambda x: x['mtime'])
+
+                # Seleciona todas exceto a primeira (mais antiga)
+                for img_info in similar_images[1:]:
+                    img_info['var'].set(1)
+                    selected_count += 1
+
+        messagebox.showinfo("Seleção Concluída",
+                           f"{selected_count} imagens semelhantes foram selecionadas (mantendo a mais antiga de cada grupo).")
 
     def move_all_selected(self):
         """Move todas as imagens selecionadas de todos os grupos"""
