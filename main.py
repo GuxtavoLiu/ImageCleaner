@@ -271,8 +271,12 @@ class ImageCleaner:
         """Exibe resumo do escaneamento com detalhes de erros"""
         if not self.scan_errors:
             # Sem erros
-            messagebox.showinfo("Escaneamento Concluído",
-                               f"✓ {processed_files} de {total_files} imagens processadas com sucesso!")
+            message = (
+                f"✓ {processed_files} de {total_files} imagens processadas com sucesso!\n\n"
+                f"⚠️ Ao clicar em OK, o carregamento pode demorar alguns minutos.\n"
+                f"Por favor, aguarde."
+            )
+            messagebox.showinfo("Escaneamento Concluído", message)
             return
 
         # Há erros - mostra janela detalhada
@@ -295,6 +299,14 @@ class ImageCleaner:
 
         tk.Label(summary_frame, text=summary_text, font=("Arial", 10, "bold"),
                 bg="#fff3cd", justify="left").pack(anchor="w")
+
+        # Aviso sobre tempo de carregamento
+        warning_frame = tk.Frame(error_window, bg="#fff3cd", padx=10, pady=(0, 10))
+        warning_frame.pack(fill="x", padx=10)
+
+        warning_text = "⚠️ Ao fechar esta janela, o carregamento pode demorar alguns minutos. Por favor, aguarde."
+        tk.Label(warning_frame, text=warning_text, font=("Arial", 9),
+                bg="#fff3cd", fg="#856404", justify="left").pack(anchor="w")
 
         # Categoriza erros
         error_types = {}
