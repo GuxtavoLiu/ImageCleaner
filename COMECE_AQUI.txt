@@ -1,0 +1,103 @@
+
+╔═══════════════════════════════════════════════════════════════════╗
+║                                                                   ║
+║            🚀 GERAR EXECUTÁVEL - COMECE AQUI! 🚀                 ║
+║                                                                   ║
+╚═══════════════════════════════════════════════════════════════════╝
+
+
+📋 PASSO A PASSO SIMPLES:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+PASSO 1: Teste se está tudo OK
+──────────────────────────────
+👉 Dê duplo clique em: testar_antes_build.bat
+
+   Se aparecer "TUDO OK", prossiga para o passo 2.
+   Se der erro, siga as instruções na tela.
+
+
+PASSO 2: Gere o executável
+──────────────────────────────
+Escolha UMA das opções abaixo:
+
+   OPÇÃO A (RECOMENDADA): Arquivo único .exe
+   ────────────────────────────────────────
+   👉 Dê duplo clique em: build_simples.bat
+
+   Resultado: Um único arquivo .exe portátil
+   Local: dist\ImageCleaner.exe
+
+
+   OPÇÃO B (ALTERNATIVA): Pasta portátil
+   ────────────────────────────────────────
+   👉 Dê duplo clique em: build_pasta.bat
+
+   Resultado: Uma pasta com o programa
+   Local: dist\ImageCleaner\
+   ⚠️  Copie a PASTA INTEIRA para o pendrive
+
+
+PASSO 3: Teste o executável
+──────────────────────────────
+1. Abra a pasta dist\
+2. Execute o ImageCleaner.exe
+3. Teste se funciona normalmente
+
+
+PASSO 4: Copie para o pendrive
+──────────────────────────────
+Arquivo único: Copie só o .exe
+Pasta: Copie a pasta inteira
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+📁 ARQUIVOS DISPONÍVEIS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🟢 COMEÇAR AQUI:
+   ├─ testar_antes_build.bat    👈 EXECUTE PRIMEIRO!
+   ├─ build_simples.bat          👈 Build arquivo único
+   └─ build_pasta.bat            👈 Build pasta portátil
+
+🔵 OUTROS (Opcional):
+   ├─ build_exe_v2.bat           (Com debug avançado)
+   ├─ INSTRUCOES_BUILD.txt       (Instruções detalhadas)
+   └─ README_BUILD.md            (Guia completo)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+❓ PROBLEMAS COMUNS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+❌ "Python não é reconhecido"
+   → Instale Python de: https://www.python.org/downloads/
+   → Marque "Add Python to PATH" na instalação
+
+❌ Nada acontece ao executar o .bat
+   → Clique com botão direito → "Executar como administrador"
+
+❌ Antivírus bloqueia o .exe
+   → Isso é normal (falso positivo)
+   → Adicione exceção no antivírus
+   → Ou use build_pasta.bat
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+💡 DICA IMPORTANTE:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Sempre que modificar o código (main.py), execute novamente
+o script de build para gerar uma nova versão do executável!
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Boa sorte! 🎉
+

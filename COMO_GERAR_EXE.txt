@@ -1,0 +1,50 @@
+═══════════════════════════════════════════════════════════════
+  GUIA RÁPIDO: COMO GERAR O EXECUTÁVEL (.EXE)
+═══════════════════════════════════════════════════════════════
+
+MÉTODO MAIS FÁCIL (RECOMENDADO):
+─────────────────────────────────────────────────────────────
+
+1. Dê um DUPLO CLIQUE no arquivo: build_exe.bat
+
+2. Aguarde o processo (2-5 minutos)
+
+3. Pronto! O executável estará em: dist\ImageCleaner.exe
+
+
+═══════════════════════════════════════════════════════════════
+
+QUANDO ATUALIZAR O CÓDIGO:
+─────────────────────────────────────────────────────────────
+
+1. Faça suas modificações no main.py
+
+2. Dê um DUPLO CLIQUE no arquivo: build_exe.bat
+
+3. O script irá automaticamente:
+   - Limpar builds anteriores
+   - Recompilar com o código atualizado
+   - Gerar o novo executável
+
+4. Teste o novo executável antes de distribuir!
+
+
+═══════════════════════════════════════════════════════════════
+
+PRÉ-REQUISITOS:
+─────────────────────────────────────────────────────────────
+
+✓ Python 3.7 ou superior instalado
+✓ Acesso à internet (para instalar dependências)
+
+
+═══════════════════════════════════════════════════════════════
+
+PROBLEMAS?
+─────────────────────────────────────────────────────────────
+
+Leia o arquivo: README_BUILD.md
+(Contém soluções detalhadas para problemas comuns)
+
+
+═══════════════════════════════════════════════════════════════

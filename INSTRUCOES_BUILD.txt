@@ -1,0 +1,114 @@
+═══════════════════════════════════════════════════════════════════════
+  INSTRUÇÕES: COMO GERAR O EXECUTÁVEL
+═══════════════════════════════════════════════════════════════════════
+
+Você tem 3 opções de scripts. Tente nesta ordem:
+
+═══════════════════════════════════════════════════════════════════════
+OPÇÃO 1: build_simples.bat (RECOMENDADO - TENTE PRIMEIRO!)
+═══════════════════════════════════════════════════════════════════════
+
+✓ O mais fácil e direto
+✓ Gera um ÚNICO arquivo .exe
+✓ Perfeito para pendrive
+
+Como usar:
+1. Dê duplo clique em: build_simples.bat
+2. Aguarde 2-5 minutos
+3. O arquivo estará em: dist\ImageCleaner.exe
+4. Copie esse .exe para o pendrive e pronto!
+
+
+═══════════════════════════════════════════════════════════════════════
+OPÇÃO 2: build_pasta.bat (SE A OPÇÃO 1 NÃO FUNCIONAR)
+═══════════════════════════════════════════════════════════════════════
+
+✓ Mais confiável
+✓ Gera uma PASTA com o executável
+✓ Também funciona no pendrive
+
+Como usar:
+1. Dê duplo clique em: build_pasta.bat
+2. Aguarde 1-3 minutos
+3. Uma PASTA será criada em: dist\ImageCleaner\
+4. Copie a PASTA INTEIRA para o pendrive
+5. Execute: ImageCleaner.exe dentro da pasta
+
+IMPORTANTE: Copie a pasta inteira, não apenas o .exe!
+
+
+═══════════════════════════════════════════════════════════════════════
+OPÇÃO 3: build_exe_v2.bat (AVANÇADO - COM DEBUG)
+═══════════════════════════════════════════════════════════════════════
+
+✓ Versão com mais verificações
+✓ Gera log de erros (build_log.txt)
+✓ Útil para descobrir problemas
+
+Como usar:
+1. Dê duplo clique em: build_exe_v2.bat
+2. Se der erro, leia o arquivo: build_log.txt
+
+
+═══════════════════════════════════════════════════════════════════════
+TESTANDO O EXECUTÁVEL
+═══════════════════════════════════════════════════════════════════════
+
+Antes de copiar para o pendrive:
+
+1. Execute o .exe no seu computador
+2. Teste se abre normalmente
+3. Teste selecionar uma pasta
+4. Teste escanear imagens
+
+Se funcionar no seu PC, vai funcionar em outros!
+
+
+═══════════════════════════════════════════════════════════════════════
+PROBLEMAS COMUNS
+═══════════════════════════════════════════════════════════════════════
+
+❌ "Python não é reconhecido"
+   Solução: Instale Python de https://www.python.org/downloads/
+           Marque "Add Python to PATH" na instalação
+
+❌ "main.py não encontrado"
+   Solução: Execute o .bat na mesma pasta onde está o main.py
+
+❌ O executável não abre
+   Solução:
+   - Tente a OPÇÃO 2 (build_pasta.bat)
+   - Verifique se o antivírus está bloqueando
+   - Teste o código primeiro: python main.py
+
+❌ Antivírus bloqueia o .exe
+   Solução: Isso é normal! É um "falso positivo"
+   - Adicione exceção no antivírus
+   - Ou use a OPÇÃO 2 (pasta ao invés de arquivo único)
+
+
+═══════════════════════════════════════════════════════════════════════
+QUANDO ATUALIZAR O CÓDIGO
+═══════════════════════════════════════════════════════════════════════
+
+1. Modifique o main.py
+2. Execute novamente o script de build que funcionou
+3. Teste o novo executável
+4. Distribua a nova versão
+
+
+═══════════════════════════════════════════════════════════════════════
+RESUMO RÁPIDO
+═══════════════════════════════════════════════════════════════════════
+
+Para arquivo único (.exe):
+→ build_simples.bat
+
+Para pasta portátil:
+→ build_pasta.bat
+
+Para debug de erros:
+→ build_exe_v2.bat
+
+
+═══════════════════════════════════════════════════════════════════════
