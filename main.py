@@ -1,5 +1,6 @@
 import bisect
 import os
+import subprocess
 import hashlib
 import logging
 import logging.handlers
@@ -102,6 +103,46 @@ def make_button(parent, text, kind="light", **kw):
                 disabledforeground="#9E9E9E")
     opts.update(kw)
     return tk.Button(parent, **opts)
+
+
+def format_bytes(n):
+    """Tamanho legível em pt-BR: 1.245 bytes -> '1,2 KB'; 3.4e9 -> '3,2 GB'."""
+    if n is None:
+        return "?"
+    value = float(n)
+    for unit in ("bytes", "KB", "MB", "GB", "TB"):
+        if value < 1024 or unit == "TB":
+            if unit == "bytes":
+                return f"{int(value)} bytes"
+            return f"{value:.1f}".replace(".", ",") + f" {unit}"
+        value /= 1024
+    return f"{n} bytes"
+
+
+def format_resolution(dims):
+    """(largura, altura) -> '4608 x 3456 (15,9 MP)'; None -> 'desconhecida'."""
+    if not dims:
+        return "desconhecida"
+    w, h = dims
+    mp = w * h / 1e6
+    mp_str = (f"{mp:.1f}" if mp < 10 else f"{mp:.0f}").replace(".", ",")
+    return f"{w} x {h} ({mp_str} MP)"
+
+
+def shorten_path(filepath, roots):
+    """
+    Caminho curto para a tela: (tag, pasta_relativa, nome_do_arquivo).
+    roots: lista de (tag, pasta_raiz); a primeira raiz que contém o arquivo
+    vence (ex.: [("ALVO", alvo), ("REF", referência)]). Fora de qualquer raiz:
+    tag vazia e a pasta completa.
+    """
+    name = os.path.basename(filepath)
+    key = cache_key(filepath)
+    for tag, root in roots:
+        if root and key.startswith(folder_prefix(root)):
+            rel = os.path.dirname(os.path.relpath(filepath, root))
+            return tag, ("" if rel == "." else rel), name
+    return "", os.path.dirname(filepath), name
 
 
 def apply_theme(root):
@@ -2182,10 +2223,12 @@ class ImageCleaner:
             for (_, _, md5_val) in group:
                 md5_count[md5_val] = md5_count.get(md5_val, 0) + 1
 
-            # Cria IntVar para cada imagem
+            # Cria IntVar para cada imagem (com trace: pinta a linha e atualiza
+            # os contadores quando a seleção muda, por qualquer caminho)
             for filepath, p_hash, md5_val in group:
                 var = tk.IntVar()
                 check_vars.append(var)
+                var.trace_add("write", lambda *a, g=idx, p=len(check_vars) - 1: self._on_var_changed(g, p))
 
                 image_info_list.append({
                     'filepath': filepath,
@@ -2219,6 +2262,8 @@ class ImageCleaner:
         self.page_by_view = {"pending": 0, "verified": 0}
         self.group_frames = {}              # idx -> LabelFrame na página atual
         self.thumb_cache = {}               # filepath -> PhotoImage (ou None se falhou)
+        self.image_dims = {}                # filepath -> (largura, altura), lido com a miniatura
+        self.row_widgets = {}               # (idx, pos) -> widgets da linha (para pintar a seleção)
 
         # Cria janela de progresso
         self.create_groups_progress_window()
@@ -2340,6 +2385,7 @@ class ImageCleaner:
         photo = None
         try:
             with Image.open(filepath) as img:
+                self.image_dims[filepath] = img.size   # antes do draft: tamanho real
                 if img.format == "JPEG":
                     img.draft("RGB", (THUMB_SIZE * 2, THUMB_SIZE * 2))
                 img.thumbnail((THUMB_SIZE, THUMB_SIZE))
@@ -2385,6 +2431,7 @@ class ImageCleaner:
         old_frame = self.content_frame
         self.content_frame = tk.Frame(self.canvas)
         self.group_frames = {}
+        self.row_widgets = {}
 
         total, _ = self._update_page_info()
         visible = self._visible_groups()
@@ -2544,7 +2591,7 @@ class ImageCleaner:
             # (impossível selecionar, mesmo clicando)
             if is_ref:
                 lbl_ref = tk.Label(text_frame, text="REFERÊNCIA (protegida)", fg="white",
-                                   bg="#2E7D32", font=("Arial", 9, "bold"), padx=4)
+                                   bg=PALETTE["primary"], font=FONT_BOLD, padx=4)
                 lbl_ref.pack(anchor="w")
                 row_widgets.append(lbl_ref)
 
@@ -2552,6 +2599,19 @@ class ImageCleaner:
             chk = tk.Checkbutton(text_frame, text="Selecionar", variable=var,
                                  state="disabled" if is_ref else "normal")
             chk.pack(anchor="w")
+
+            # Nome do arquivo em destaque + pasta curta; caminho completo no
+            # tooltip e no menu de contexto
+            tag, rel_dir, name = shorten_path(filepath, self._path_roots())
+            lbl_name = tk.Label(text_frame, text=name, font=FONT_BOLD, anchor="w",
+                                cursor="" if is_ref else "hand2")
+            lbl_name.pack(anchor="w")
+            where = (f"[{tag}] " if tag else "") + (rel_dir or "(raiz)")
+            lbl_path = tk.Label(text_frame, text=where, fg=PALETTE["muted"], anchor="w",
+                                cursor="" if is_ref else "hand2")
+            lbl_path.pack(anchor="w")
+            self.create_tooltip(lbl_name, filepath)
+            self.create_tooltip(lbl_path, filepath)
 
             # Verifica se a imagem é idêntica (MD5 duplicado) ou apenas semelhante
             if md5_count[md5_val] > 1:
@@ -2561,38 +2621,113 @@ class ImageCleaner:
 
             # Metadados do arquivo (protegido: o arquivo pode ter sido
             # movido/excluído por uma ação anterior nesta mesma tela)
-            origin_text = "Origem: REFERÊNCIA (protegida)\n" if is_ref else ""
+            resolution = format_resolution(self.image_dims.get(filepath))
             try:
                 st = os.stat(filepath)
                 ctime_str = datetime.fromtimestamp(st.st_ctime).strftime("%Y-%m-%d %H:%M:%S")
                 mtime_str = datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
                 info_text = (
-                    origin_text +
-                    f"Caminho: {filepath}\n"
-                    f"Status: {status}\n"
-                    f"Tamanho: {st.st_size} bytes\n"
-                    f"Criado em: {ctime_str}\n"
-                    f"Modificado em: {mtime_str}\n"
+                    f"Status: {status}   |   Resolução: {resolution}\n"
+                    f"Tamanho: {format_bytes(st.st_size)} ({st.st_size} bytes)\n"
+                    f"Criado em: {ctime_str}   |   Modificado em: {mtime_str}"
                 )
             except OSError:
                 info_text = (
-                    origin_text +
-                    f"Caminho: {filepath}\n"
-                    f"Status: {status}\n"
-                    f"Arquivo não encontrado (movido ou excluído)\n"
+                    f"Status: {status}   |   Resolução: {resolution}\n"
+                    f"Arquivo não encontrado (movido ou excluído)"
                 )
 
             lbl_info = tk.Label(text_frame, text=info_text, justify="left", anchor="w",
                                 cursor="" if is_ref else "hand2")
             lbl_info.pack(anchor="w")
-            row_widgets.append(lbl_info)
+            row_widgets.extend([lbl_name, lbl_path, lbl_info])
             for w in row_widgets:
                 w.bind("<Button-1>", toggle_row)
+            # Menu de contexto (botão direito) na linha inteira e na miniatura
+            for w in row_widgets + [lbl_img, chk]:
+                w.bind("<Button-3>",
+                       lambda e, fp=filepath, g=idx, p=pos: self._show_row_menu(e, fp, g, p))
+
+            # Cor de fundo da linha conforme a seleção (pintada pelo trace do var)
+            self.row_widgets[(idx, pos)] = [item_frame, text_frame, chk, lbl_img,
+                                            lbl_name, lbl_path, lbl_info]
+            self._paint_row(idx, pos)
 
         # Repete a navegação no fim de grupos grandes (evita rolar até o topo)
         if len(images) > MAX_IMAGES_PER_GROUP_DISPLAY:
             self._render_group_nav(frame, idx, images, offset)
         return frame
+
+    def _path_roots(self):
+        """Raízes para encurtar caminhos na tela: alvo e (se houver) referência."""
+        roots = [("ALVO", self.selected_folder)]
+        if self.reference_folder:
+            roots.append(("REF", self.reference_folder))
+        return roots
+
+    def _paint_row(self, idx, pos):
+        """Fundo da linha: verde-claro quando selecionada; referência em tom fixo."""
+        widgets = self.row_widgets.get((idx, pos))
+        if not widgets:
+            return
+        info = self.group_check_vars[idx]['images'][pos]
+        if info.get('is_reference'):
+            color = PALETTE["reference_row"]
+        else:
+            color = PALETTE["selected_row"] if info['var'].get() == 1 else PALETTE["bg"]
+        for w in widgets:
+            try:
+                if not w.winfo_exists():
+                    return
+                w.configure(bg=color)
+                if isinstance(w, tk.Checkbutton):
+                    w.configure(activebackground=color, selectcolor="white")
+            except tk.TclError:
+                return
+
+    def _on_var_changed(self, idx, pos):
+        """Trace dos IntVar: chamado em qualquer mudança de seleção."""
+        self._paint_row(idx, pos)
+        self._schedule_counter_update()
+
+    def _schedule_counter_update(self):
+        """Atualização (coalescida) dos contadores da barra superior."""
+        # preenchido na etapa de progresso/contadores
+        return
+
+    def _show_row_menu(self, event, filepath, group_idx, pos):
+        menu = tk.Menu(self.groups_window, tearoff=0)
+        menu.add_command(label="Pré-visualizar", command=lambda: self.open_preview(group_idx, pos))
+        menu.add_command(label="Abrir imagem", command=lambda: self.open_image(filepath))
+        menu.add_command(label="Abrir pasta no Explorer", command=lambda: self.open_in_explorer(filepath))
+        menu.add_separator()
+        menu.add_command(label="Copiar caminho", command=lambda: self.copy_path(filepath))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def open_image(self, filepath):
+        """Abre a imagem no visualizador padrão do Windows."""
+        try:
+            os.startfile(filepath)
+        except OSError as e:
+            messagebox.showerror("Abrir imagem", f"Não foi possível abrir:\n{filepath}\n\n{e}")
+
+    def open_in_explorer(self, filepath):
+        """Abre o Explorer com o arquivo selecionado."""
+        try:
+            subprocess.Popen(["explorer", "/select,", os.path.normpath(filepath)])
+        except OSError as e:
+            messagebox.showerror("Abrir pasta", f"Não foi possível abrir a pasta de:\n{filepath}\n\n{e}")
+
+    def copy_path(self, filepath):
+        """Copia o caminho completo para a área de transferência."""
+        try:
+            self.master.clipboard_clear()
+            self.master.clipboard_append(filepath)
+        except tk.TclError:
+            pass
 
     def _scroll_anchor_for(self, idx):
         """Posição vertical (px) a manter ao remover o grupo idx da vista:

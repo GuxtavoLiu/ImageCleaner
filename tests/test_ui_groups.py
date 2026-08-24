@@ -146,3 +146,59 @@ def test_f1_f2_seguem_a_vista(app_with_groups):
     assert app.current_page == 0
     app.toggle_view(); root.update()
     assert _titles(app) == ["Grupo 1 ✓ verificado"]
+
+
+def _row_labels(app, name):
+    """Widgets da linha cujo rótulo de nome é `name`."""
+    for (idx, pos), widgets in app.row_widgets.items():
+        info = app.group_check_vars[idx]['images'][pos]
+        if os.path.basename(info['filepath']) == name:
+            return idx, pos, widgets
+    raise AssertionError(f"linha {name} não encontrada")
+
+
+def test_linha_resolucao_caminho_curto_e_cor(app_with_groups):
+    app, root, _ = app_with_groups
+    app.groups_per_page = 20
+    app.render_page(); root.update()
+    idx, pos, widgets = _row_labels(app, "a_copy.jpg")
+    textos = [str(w.cget("text")) for w in widgets if isinstance(w, tk.Label)]
+    assert "a_copy.jpg" in textos                       # nome em destaque
+    assert "[ALVO] (raiz)" in textos                    # caminho curto com a tag
+    info_text = next(t for t in textos if t.startswith("Status:"))
+    assert "Resolução: 128 x 128 (0,0 MP)" in info_text
+    assert "Idêntica" in info_text and "bytes)" in info_text
+    # cor da linha acompanha a seleção
+    var = app.group_check_vars[idx]['images'][pos]['var']
+    assert widgets[0].cget("bg") == ic.PALETTE["bg"]
+    var.set(1); root.update()
+    assert widgets[0].cget("bg") == ic.PALETTE["selected_row"]
+    assert widgets[2].cget("bg") == ic.PALETTE["selected_row"]   # checkbox também
+    var.set(0); root.update()
+    assert widgets[0].cget("bg") == ic.PALETTE["bg"]
+    # re-render preserva a cor conforme o var
+    var.set(1); app.render_page(); root.update()
+    _, _, widgets2 = _row_labels(app, "a_copy.jpg")
+    assert widgets2[0].cget("bg") == ic.PALETTE["selected_row"]
+    # caminho em subpasta
+    _, _, w_b = _row_labels(app, "b_copy.png")
+    assert "[ALVO] sub" in [str(w.cget("text")) for w in w_b if isinstance(w, tk.Label)]
+
+
+def test_menu_de_contexto_handlers(app_with_groups, monkeypatch):
+    app, root, msgs = app_with_groups
+    calls = []
+    monkeypatch.setattr(os, "startfile", lambda p: calls.append(("start", p)), raising=False)
+    monkeypatch.setattr(ic.subprocess, "Popen", lambda args, **k: calls.append(("popen", args)))
+    fp = app.group_check_vars[0]['images'][0]['filepath']
+    app.open_image(fp)
+    app.open_in_explorer(fp)
+    app.copy_path(fp)
+    root.update()
+    assert calls[0] == ("start", fp)
+    assert calls[1][0] == "popen" and calls[1][1][:2] == ["explorer", "/select,"] and calls[1][1][2] == os.path.normpath(fp)
+    assert root.clipboard_get() == fp
+    # erro ao abrir vira mensagem, não exceção
+    monkeypatch.setattr(os, "startfile", lambda p: (_ for _ in ()).throw(OSError("x")), raising=False)
+    app.open_image(fp)
+    assert msgs[-1][0] == "showerror"
