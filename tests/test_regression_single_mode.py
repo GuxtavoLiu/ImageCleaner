@@ -25,14 +25,52 @@ def test_fixture_distancias(tmp_path):
 
 
 def test_modo_uma_pasta_igual_ao_snapshot_dourado(tmp_path):
+    """Sem confirmação por segundo hash: comportamento original, bit a bit."""
     root = build_single_fixture(str(tmp_path / "fix"))
-    atual = snapshot_single_mode(root)
+    atual = snapshot_single_mode(root, confirm=False)
     with open(GOLDEN_PATH, encoding="utf-8") as f:
         dourado = json.load(f)
     assert atual == dourado
+
+
+def test_modo_uma_pasta_confirmado_igual_ao_snapshot_dourado(tmp_path):
+    """Com confirmação: snapshot próprio (gerado igual ao original: recompressões
+       não são rejeitadas pelo dhash)."""
+    from conftest import GOLDEN_CONFIRM_PATH
+    root = build_single_fixture(str(tmp_path / "fix"))
+    atual = snapshot_single_mode(root, confirm=True)
+    with open(GOLDEN_CONFIRM_PATH, encoding="utf-8") as f:
+        dourado = json.load(f)
+    assert atual == dourado
+    with open(GOLDEN_PATH, encoding="utf-8") as f:
+        assert atual == json.load(f)
+
+
+def test_fixture_confirm_igual_ao_snapshot_dourado(tmp_path):
+    from conftest import GOLDEN_FIXTURE_CONFIRM_PATH, build_confirm_fixture
+    root = build_confirm_fixture(str(tmp_path / "fx"))
+    atual = snapshot_single_mode(root, confirm=True)
+    with open(GOLDEN_FIXTURE_CONFIRM_PATH, encoding="utf-8") as f:
+        assert atual == json.load(f)
 
 
 def test_selftest_uma_pasta(tmp_path):
     root = build_single_fixture(str(tmp_path / "fix"))
     summary = ic.run_selftest(root)
     assert summary.startswith("SELFTEST OK: 7 arquivos, 7 hashes, 0 erros, 2 grupos, 4 idênticas")
+    assert f"| CONF(dhash<={ic.DHASH_THRESHOLD}): 0 grupos e 0 imagens descartados" in summary
+    sem = ic.run_selftest(root, confirm_similar=False)
+    assert sem.startswith("SELFTEST OK: 7 arquivos, 7 hashes, 0 erros, 2 grupos, 4 idênticas")
+    assert "CONF(" not in sem
+
+
+def test_selftest_fixture_confirm(tmp_path):
+    from conftest import build_confirm_fixture
+    root = build_confirm_fixture(str(tmp_path / "fx"))
+    com = ic.run_selftest(root)
+    sem = ic.run_selftest(root, confirm_similar=False)
+    assert "2 grupos, 2 idênticas" in com          # alpha_text par + true_a par
+    assert "CONF(" in com and "descartados" in com
+    assert "CONF(" not in sem
+    n_sem = int(sem.split(" grupos")[0].split(", ")[-1])
+    assert n_sem >= 3                              # sem confirmação: falsos e degenerados agrupam

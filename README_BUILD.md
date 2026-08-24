@@ -244,6 +244,41 @@ executável não abre sem eles.
     desligado; hashes com e sem essa opção usam caches separados.
   - `MAX_IMAGES_PER_GROUP_DISPLAY` (padrão 200): miniaturas exibidas por
     grupo (as ações continuam valendo para o grupo inteiro).
+  - `CONFIRM_SIMILAR` (padrão `True`) e `DHASH_THRESHOLD` (padrão 14):
+    confirmação de "Semelhante" por um segundo hash (dhash). O agrupamento
+    por phash (threshold 10) não muda; dentro de cada grupo, um par com MD5
+    diferente só continua junto se o dhash também estiver próximo. Elimina
+    fotos diferentes agrupadas por coincidência de luz/sombra grossa.
+    Calibrado no acervo real: quase-duplicatas reais ficam a dhash 0 a 6 e
+    os falsos positivos a 23 a 36; com 14, 99,6% das quase-duplicatas
+    continuam agrupadas. Pode ser desligado pela checkbox "Confirmar
+    semelhantes com segundo hash" (o resultado volta a ser o antigo).
+    Imagens com hash degenerado (toda preta/branca, PNG transparente) só
+    ficam em grupo por MD5 igual; PNGs com transparência passam a ser
+    compostos sobre branco antes do hash.
+
+### Modo de comparação de duas pastas (referência protegida)
+Na tela inicial, além da pasta alvo, é possível escolher uma **pasta de
+referência** (um acervo já organizado). Nada da referência é selecionado,
+movido ou excluído: as duplicatas saem só da pasta alvo, e a seleção
+automática mantém a cópia do acervo em vez da mais antiga. Grupos só com
+imagens da referência não são exibidos; a checkbox "Mostrar duplicatas
+internas da pasta alvo" controla os grupos sem par no acervo.
+
+### Diagnóstico sem interface (útil para validar o `.exe`)
+```bash
+ImageCleaner.exe --selftest PASTA
+ImageCleaner.exe --selftest PASTA --ref PASTA_DE_REFERENCIA
+ImageCleaner.exe --selftest PASTA --no-confirm      # sem a confirmação por dhash
+```
+Roda o pipeline inteiro (listar, hash, agrupar, MD5, confirmação) sem alterar
+nada nem usar o cache, e imprime um resumo (também gravado no log).
+
+### Testes automatizados
+`python -m pytest tests -q` (o `testar_antes_build.bat` roda isso se o pytest
+estiver instalado). Inclui snapshots dourados do modo de uma pasta com e sem
+a confirmação; regenerá-los só quando uma mudança de comportamento for
+intencional (ver docstring de `tests/test_regression_single_mode.py`).
 
 ### Para incluir um README junto:
 ```bash

@@ -114,8 +114,66 @@ def build_reference_fixture(base):
     return alvo, ref
 
 
-def run_pipeline(root):
-    """Pipeline puro completo do modo de uma pasta, como o run_selftest faz."""
+def build_confirm_fixture(root):
+    """
+    Pasta para a confirmação por segundo hash e para hashes degenerados:
+      - alpha_text.png (RGBA transparente com barras pretas) + alpha_text_copy.png
+        (idênticas): antes da composição sobre branco tinham phash zero;
+      - black.png e black2.png: pretas, bytes diferentes (degeneradas: NÃO devem
+        ficar juntas com a confirmação ligada);
+      - white.jpg: branca lisa (degenerada);
+      - fake_a.png / fake_b.png: "falso semelhante" (phash próximo, dhash longe);
+      - true_a.jpg / true_a_q30.jpg: recompressão (phash e dhash próximos).
+    """
+    os.makedirs(root, exist_ok=True)
+    alpha = Image.new("RGBA", (128, 128), (0, 0, 0, 0))
+    a = np.zeros((128, 128, 4), dtype=np.uint8)
+    for x0 in (10, 40, 70, 100):
+        a[20:110, x0:x0 + 12] = (0, 0, 0, 255)
+    a[60:70, 10:118] = (0, 0, 0, 255)
+    alpha = Image.fromarray(a, "RGBA")
+    alpha.save(os.path.join(root, "alpha_text.png"))
+    os.utime(os.path.join(root, "alpha_text.png"), (T0 + 10, T0 + 10))
+    _write(root, "alpha_text_copy.png", copy_of="alpha_text.png", mtime=T0 + 20)
+    Image.new("RGB", (128, 128), (0, 0, 0)).save(os.path.join(root, "black.png"))
+    Image.new("RGB", (96, 96), (0, 0, 0)).save(os.path.join(root, "black2.png"))
+    Image.new("RGB", (128, 128), (255, 255, 255)).save(os.path.join(root, "white.jpg"), quality=95)
+    _make_fake_pair(root)
+    _write(root, "true_a.jpg", kind="A", quality=95, mtime=T0 + 100)
+    _write(root, "true_a_q30.jpg", kind="A", quality=30, mtime=T0 + 200)
+    for name, t in (("black.png", 30), ("black2.png", 40), ("white.jpg", 50),
+                    ("fake_a.png", 60), ("fake_b.png", 70)):
+        os.utime(os.path.join(root, name), (T0 + t, T0 + t))
+    return root
+
+
+def _make_fake_pair(root, amp=15):
+    """Par de imagens diferentes com phash próximo e dhash distante: mesma
+       estrutura grossa de luz/sombra (gradiente + disco) somada a faixas
+       verticais de polaridade OPOSTA. O phash (DCT baixa frequência) vê a
+       estrutura compartilhada; o dhash (gradiente entre colunas vizinhas)
+       vê as faixas invertidas."""
+    h, w = 128, 144
+    yy, xx = np.mgrid[0:h, 0:w]
+    base = 128 + 60 * (yy / h - 0.5) * 2
+    base = base - 70 * (((xx - 90) ** 2 + (yy - 50) ** 2) < 35 ** 2)
+    stripes = np.array([+1, +1, -1, -1, +1, +1, -1, -1, +1])[xx * 9 // w] * amp
+    for name, sign in (("fake_a.png", +1), ("fake_b.png", -1)):
+        arr = np.clip(base + sign * stripes, 0, 255).astype(np.uint8)
+        Image.fromarray(arr).convert("RGB").save(os.path.join(root, name))
+
+
+def _confirm_stage(images_data, stats, groups_idx, md5_by_idx):
+    dhash_by_idx, _ = ic.dhash_for_groups(images_data, stats, groups_idx, md5_by_idx, None, WORKERS)
+    groups_idx, cstats = ic.confirm_similar_groups(
+        images_data, groups_idx, md5_by_idx, dhash_by_idx,
+        ic.SIMILARITY_THRESHOLD, ic.DHASH_THRESHOLD)
+    return groups_idx, cstats
+
+
+def run_pipeline(root, confirm=False):
+    """Pipeline puro completo do modo de uma pasta, como o run_selftest faz.
+       confirm=True acrescenta a confirmação por segundo hash."""
     entries = ic.list_image_files(root, True, ic.VALID_EXTENSIONS)
     results, errors_by_idx, _ = ic.hash_files(entries, None, WORKERS)
     images_data = [r for r in results if r is not None]
@@ -123,6 +181,8 @@ def run_pipeline(root):
     groups_idx = ic.find_similar_groups(hashes, ic.SIMILARITY_THRESHOLD)
     stats = [entries[i][1:] for i, r in enumerate(results) if r is not None]
     md5_by_idx, _ = ic.md5_for_groups(images_data, stats, groups_idx, None, WORKERS)
+    if confirm:
+        groups_idx, _ = _confirm_stage(images_data, stats, groups_idx, md5_by_idx)
     groups = ic.build_groups(images_data, groups_idx, md5_by_idx)
     return entries, images_data, groups
 
@@ -167,13 +227,13 @@ def oracle_similar_selection(images, md5_count):
     return []
 
 
-def snapshot_single_mode(root):
+def snapshot_single_mode(root, confirm=False):
     """
     Estrutura serializável do resultado completo do modo de uma pasta:
     grupos (caminhos relativos + rótulo Idêntica/Semelhante, na ordem) e as
     seleções automáticas (como listas ordenadas de caminhos relativos).
     """
-    _, _, groups = run_pipeline(root)
+    _, _, groups = run_pipeline(root, confirm=confirm)
 
     def rel(fp):
         return os.path.relpath(fp, root).replace("\\", "/")
@@ -205,14 +265,16 @@ def snapshot_single_mode(root):
     }
 
 
-GOLDEN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                           "golden_single_mode.json")
+TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
+GOLDEN_PATH = os.path.join(TESTS_DIR, "golden_single_mode.json")
+GOLDEN_CONFIRM_PATH = os.path.join(TESTS_DIR, "golden_single_mode_confirm.json")
+GOLDEN_FIXTURE_CONFIRM_PATH = os.path.join(TESTS_DIR, "golden_confirm_fixture.json")
 
 
-def generate_golden(tmp_root):
-    """Gera o snapshot dourado (rodar UMA vez, com o main.py pré-mudança)."""
-    build_single_fixture(tmp_root)
-    snap = snapshot_single_mode(tmp_root)
-    with open(GOLDEN_PATH, "w", encoding="utf-8") as f:
+def generate_golden(tmp_root, confirm=False, path=GOLDEN_PATH, builder=build_single_fixture):
+    """Gera um snapshot dourado (rodar UMA vez, de forma deliberada)."""
+    builder(tmp_root)
+    snap = snapshot_single_mode(tmp_root, confirm=confirm)
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(snap, f, indent=2, ensure_ascii=False)
     return snap

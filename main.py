@@ -57,6 +57,30 @@ MAX_IMAGES_PER_GROUP_DISPLAY = 200
 # Threshold de similaridade (distância de Hamming máxima entre phashes).
 SIMILARITY_THRESHOLD = 10
 
+# Confirmação de "Semelhante" por um segundo hash (dhash). É um pós-filtro:
+# não altera o agrupamento por phash (find_similar_groups); dentro de cada
+# grupo, um par com MD5 diferente só continua junto se o dhash também estiver
+# próximo. Desligado, o resultado é exatamente o de sempre. Motivo: fotos
+# totalmente diferentes podem cair a distância 10 de phash por coincidência de
+# luz/sombra grossa; o dhash (gradientes) nessas mesmas fotos fica em 23 a 36,
+# enquanto quase-duplicatas reais ficam em 0 a 6.
+CONFIRM_SIMILAR = True
+
+# Distância de Hamming máxima entre dhashes (64 bits) para confirmar um par.
+# Calibrado no acervo real (ver calibração de 2026-08-24).
+DHASH_THRESHOLD = 14
+
+# phash "degenerado": quase nenhum ou quase todos os bits ligados. Acontece com
+# imagens lisas (toda preta/branca) e com PNGs transparentes convertidos para
+# preto. Todas caem no mesmo hash, então imagens degeneradas só ficam em grupo
+# por MD5 igual (nunca como "Semelhante"). Um phash normal tem 32 bits ligados.
+DEGENERATE_MIN_BITS = 4
+DEGENERATE_MAX_BITS = 60
+
+# Extensões que podem carregar transparência (para recalcular hashes antigos
+# degenerados que vieram do cache: ver hash_files).
+ALPHA_CAPABLE_EXTENSIONS = {".png", ".gif", ".webp", ".tif", ".tiff"}
+
 
 def get_app_data_dir():
     """Pasta de dados do app (cache e log) em %LOCALAPPDATA%/ImageCleaner."""
@@ -140,12 +164,32 @@ class HashCache:
             self.conn.execute(
                 f"CREATE TABLE IF NOT EXISTS {self.table} ("
                 "path TEXT PRIMARY KEY, size INTEGER, mtime_ns INTEGER, "
-                "phash TEXT, md5 TEXT)"
+                "phash TEXT, md5 TEXT, dhash TEXT)"
             )
             self.conn.commit()
         except Exception as e:
             log.warning("Cache desativado: não foi possível abrir %s: %s", self.path, e)
             self.conn = None
+        # Migração: bancos criados antes da coluna dhash ganham a coluna sem
+        # perder nada (ALTER TABLE ADD COLUMN não reescreve as linhas; o
+        # phash/MD5 já calculados continuam válidos).
+        self.has_dhash = False
+        if self.conn is not None:
+            try:
+                cols = {r[1] for r in self.conn.execute(f"PRAGMA table_info({self.table})")}
+                if "dhash" not in cols:
+                    self.conn.execute(f"ALTER TABLE {self.table} ADD COLUMN dhash TEXT")
+                    self.conn.commit()
+                    log.info("Cache: coluna dhash adicionada a %s", self.table)
+                self.has_dhash = True
+            except Exception as e:
+                log.warning("Cache: sem coluna dhash (%s); segundo hash não será cacheado", e)
+        self._cols = "size, mtime_ns, phash, md5" + (", dhash" if self.has_dhash else "")
+
+    @staticmethod
+    def _row5(row):
+        """Normaliza um registro para (size, mtime_ns, phash, md5, dhash)."""
+        return tuple(row) + (None,) * (5 - len(row))
 
     @property
     def active(self):
@@ -173,11 +217,11 @@ class HashCache:
             # como emojis, na ordenação binária UTF-8 do SQLite.)
             upper = prefix[:-1] + chr(ord(prefix[-1]) + 1)
             rows = self.conn.execute(
-                f"SELECT path, size, mtime_ns, phash, md5 FROM {self.table} "
+                f"SELECT path, {self._cols} FROM {self.table} "
                 "WHERE path >= ? AND path < ?",
                 (prefix, upper)
             ).fetchall()
-            self.loaded.update({r[0]: (r[1], r[2], r[3], r[4]) for r in rows})
+            self.loaded.update({r[0]: self._row5(r[1:]) for r in rows})
             self.loaded_prefixes.append(prefix)
             log.info("Cache: %d registros carregados para %s", len(rows), root)
         except Exception as e:
@@ -186,10 +230,8 @@ class HashCache:
             # individual do lookup, que continua funcionando).
             log.warning("Cache: falha ao carregar registros de %s: %s", root, e)
 
-    def lookup(self, filepath, size, mtime_ns):
-        """Retorna (phash_str, md5_ou_None) se houver cache válido, senão None."""
-        if self.conn is None:
-            return None
+    def _find_row(self, filepath):
+        """Registro (size, mtime_ns, phash, md5, dhash) do arquivo, ou None."""
         key = cache_key(filepath)
         row = self.loaded.get(key)
         if row is None:
@@ -199,21 +241,40 @@ class HashCache:
                 return None
             try:
                 row = self.conn.execute(
-                    f"SELECT size, mtime_ns, phash, md5 FROM {self.table} WHERE path = ?",
+                    f"SELECT {self._cols} FROM {self.table} WHERE path = ?",
                     (key,)
                 ).fetchone()
             except Exception as e:
                 log.warning("Cache: falha na consulta de %s: %s", filepath, e)
                 return None
+            if row is not None:
+                row = self._row5(row)
+        return row
+
+    def lookup(self, filepath, size, mtime_ns):
+        """Retorna (phash_str, md5_ou_None) se houver cache válido, senão None."""
+        if self.conn is None:
+            return None
+        row = self._find_row(filepath)
         if row and row[0] == size and row[1] == mtime_ns:
             return row[2], row[3]
         return None
 
-    def store(self, filepath, size, mtime_ns, phash_str, md5=None):
-        """Agenda a gravação de um registro (gravado em lote no flush)."""
+    def lookup_dhash(self, filepath, size, mtime_ns):
+        """Retorna o dhash (hex) se houver cache válido com dhash, senão None."""
+        if self.conn is None:
+            return None
+        row = self._find_row(filepath)
+        if row and row[0] == size and row[1] == mtime_ns:
+            return row[4]
+        return None
+
+    def store(self, filepath, size, mtime_ns, phash_str, md5=None, dhash=None):
+        """Agenda a gravação de um registro (gravado em lote no flush).
+           Substitui a linha inteira: md5/dhash não repassados ficam nulos."""
         if self.conn is None:
             return
-        self.pending.append(("insert", (cache_key(filepath), size, mtime_ns, phash_str, md5)))
+        self.pending.append(("insert", (cache_key(filepath), size, mtime_ns, phash_str, md5, dhash)))
         if len(self.pending) >= 500:
             self.flush()
 
@@ -225,29 +286,46 @@ class HashCache:
         if len(self.pending) >= 500:
             self.flush()
 
+    def update_dhash(self, filepath, dhash_str):
+        """Agenda a gravação do dhash de um arquivo já cacheado."""
+        if self.conn is None or not self.has_dhash:
+            return
+        self.pending.append(("dhash", (dhash_str, cache_key(filepath))))
+        if len(self.pending) >= 500:
+            self.flush()
+
     def flush(self):
         if self.conn is None or not self.pending:
             return
         inserts = [args for kind, args in self.pending if kind == "insert"]
         md5s = [args for kind, args in self.pending if kind == "md5"]
+        dhashes = [args for kind, args in self.pending if kind == "dhash"]
         self.pending = []
-        insert_sql = (f"INSERT OR REPLACE INTO {self.table} "
-                      "(path, size, mtime_ns, phash, md5) VALUES (?, ?, ?, ?, ?)")
+        if self.has_dhash:
+            insert_sql = (f"INSERT OR REPLACE INTO {self.table} "
+                          "(path, size, mtime_ns, phash, md5, dhash) VALUES (?, ?, ?, ?, ?, ?)")
+        else:
+            insert_sql = (f"INSERT OR REPLACE INTO {self.table} "
+                          "(path, size, mtime_ns, phash, md5) VALUES (?, ?, ?, ?, ?)")
+            inserts = [row[:5] for row in inserts]
         update_sql = f"UPDATE {self.table} SET md5 = ? WHERE path = ?"
+        dhash_sql = f"UPDATE {self.table} SET dhash = ? WHERE path = ?"
         try:
             if inserts:
                 self.conn.executemany(insert_sql, inserts)
             if md5s:
                 self.conn.executemany(update_sql, md5s)
+            if dhashes:
+                self.conn.executemany(dhash_sql, dhashes)
             self.conn.commit()
         except Exception as e:
             # Um único registro inválido (ex.: nome de arquivo com surrogate
             # UTF-16) não pode derrubar o lote inteiro: regrava um a um e
             # descarta apenas os problemáticos.
             log.warning("Cache: falha no lote de %d registros (%s); regravando um a um",
-                        len(inserts) + len(md5s), e)
+                        len(inserts) + len(md5s) + len(dhashes), e)
             dropped = 0
-            for sql, rows in ((insert_sql, inserts), (update_sql, md5s)):
+            for sql, rows in ((insert_sql, inserts), (update_sql, md5s), (dhash_sql, dhashes)):
                 for row in rows:
                     try:
                         self.conn.execute(sql, row)
@@ -312,18 +390,61 @@ def get_file_md5(filepath):
     return hash_md5.hexdigest()
 
 
+def _flatten_alpha(img):
+    """
+    Compõe a transparência sobre fundo branco. Sem isso, o Pillow descarta o
+    alfa ao converter para cinza e um PNG com texto preto sobre fundo
+    transparente vira uma imagem toda preta (phash degenerado, igual ao de
+    qualquer outra imagem preta). Imagens sem transparência voltam intocadas:
+    nenhum bit muda para o resto do acervo.
+    Detecta: canal "A" (RGBA, LA, PA...) ou chave "transparency" (P, L, RGB
+    com tRNS; GIF fica no primeiro quadro).
+    """
+    if "A" not in img.getbands() and "transparency" not in img.info:
+        return img
+    rgba = img.convert("RGBA")
+    background = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+    return Image.alpha_composite(background, rgba).convert("RGB")
+
+
+def _prepare_for_hash(img):
+    """Preparação comum a phash e dhash: draft JPEG (se ligado) e alfa."""
+    if USE_FAST_JPEG_DECODE and img.format == "JPEG":
+        # O phash trabalha com a imagem em tons de cinza reduzida a 32x32.
+        # Pedimos ao decoder JPEG algo >= 64x64 em modo "L": ele escolhe a
+        # maior redução DCT possível (1/2, 1/4 ou 1/8) sem ficar abaixo disso.
+        # (JPEG nunca tem alfa, então draft e _flatten_alpha não colidem.)
+        img.draft("L", (64, 64))
+    return _flatten_alpha(img)
+
+
 def compute_phash(filepath):
     """
     Calcula o perceptual hash (phash) de uma imagem.
     Para JPEGs, usa decodificação em escala reduzida (muito mais rápida).
     """
     with Image.open(filepath) as img:
-        if USE_FAST_JPEG_DECODE and img.format == "JPEG":
-            # O phash trabalha com a imagem em tons de cinza reduzida a 32x32.
-            # Pedimos ao decoder JPEG algo >= 64x64 em modo "L": ele escolhe a
-            # maior redução DCT possível (1/2, 1/4 ou 1/8) sem ficar abaixo disso.
-            img.draft("L", (64, 64))
-        return imagehash.phash(img)
+        return imagehash.phash(_prepare_for_hash(img))
+
+
+def compute_dhash(filepath):
+    """
+    Calcula o difference hash (dhash, 64 bits) de uma imagem: sinal do
+    gradiente horizontal numa grade 9x8. Independente do phash (DCT), por
+    isso serve de segunda opinião para confirmar "Semelhante".
+    """
+    with Image.open(filepath) as img:
+        return imagehash.dhash(_prepare_for_hash(img))
+
+
+def is_degenerate_hash(h):
+    """
+    True se o hash (ImageHash ou int de 64 bits) tem quase nenhum ou quase
+    todos os bits ligados (imagem lisa ou transparente convertida para preto).
+    """
+    value = h if isinstance(h, int) else hash_to_int(h)
+    bits = bin(value).count("1")
+    return bits <= DEGENERATE_MIN_BITS or bits >= DEGENERATE_MAX_BITS
 
 
 def hash_to_int(h):
@@ -601,6 +722,7 @@ def hash_files(entries, cache, workers, progress_cb=None, cancel_check=None):
 
     # 1) Cache: separa o que ainda precisa ser calculado
     to_compute = []
+    cached_md5 = {}   # idx -> md5 do cache preservado num recálculo de phash
     for idx, (filepath, size, mtime_ns) in enumerate(entries):
         if idx % 500 == 0:
             if cancel_check and cancel_check():
@@ -612,9 +734,17 @@ def hash_files(entries, cache, workers, progress_cb=None, cancel_check=None):
             cached = cache.lookup(filepath, size, mtime_ns)
         if cached is not None:
             try:
-                results[idx] = (filepath, imagehash.hex_to_hash(cached[0]), cached[1])
-                processed += 1
-                continue
+                hash_val = imagehash.hex_to_hash(cached[0])
+                # phash degenerado de um formato com transparência: foi
+                # calculado antes da composição sobre branco (imagem lida
+                # como toda preta). Recalcula só esses, preservando o MD5.
+                if (is_degenerate_hash(hash_val)
+                        and os.path.splitext(filepath)[1].lower() in ALPHA_CAPABLE_EXTENSIONS):
+                    cached_md5[idx] = cached[1]
+                else:
+                    results[idx] = (filepath, hash_val, cached[1])
+                    processed += 1
+                    continue
             except Exception:
                 pass  # cache inválido: recalcula
         to_compute.append(idx)
@@ -636,9 +766,10 @@ def hash_files(entries, cache, workers, progress_cb=None, cancel_check=None):
         idx, hash_val, err = result
         filepath, size, mtime_ns = entries[idx]
         if err is None:
-            results[idx] = (filepath, hash_val, None)
+            md5_val = cached_md5.get(idx)
+            results[idx] = (filepath, hash_val, md5_val)
             if cache is not None and size is not None:
-                cache.store(filepath, size, mtime_ns, str(hash_val), None)
+                cache.store(filepath, size, mtime_ns, str(hash_val), md5_val)
         else:
             errors_by_idx[idx] = categorize_scan_error(filepath, err)
         processed += 1
@@ -866,6 +997,200 @@ def is_protected_path(filepath, reference_keys, reference_prefix):
     return bool(reference_prefix) and key.startswith(reference_prefix)
 
 
+# ---------------------------------------------------------------------------
+# Confirmação de "Semelhante" por segundo hash (dhash): pós-filtro dos grupos
+# ---------------------------------------------------------------------------
+
+def dhash_for_groups(images_data, stats, groups_idx, md5_by_idx, cache, workers,
+                     progress_cb=None, cancel_check=None):
+    """
+    Calcula (ou lê do cache) o dhash apenas das imagens que a confirmação vai
+    consultar: membros de grupos com pelo menos dois MD5 distintos (um grupo
+    em que todas são idênticas não precisa de segunda opinião), exceto as de
+    phash degenerado (que só podem ficar em grupo por MD5 igual).
+
+    Mesmo padrão de md5_for_groups. Retorna (dhash_by_idx, cancelled), com
+    dhash_by_idx: idx -> int de 64 bits. Índice ausente = não calculado (erro
+    de leitura, registrado no log): o par cai no critério antigo (só phash).
+    """
+    dhash_by_idx = {}
+    to_compute = []
+    for group in groups_idx:
+        if len({md5_by_idx.get(i, images_data[i][2]) for i in group}) < 2:
+            continue
+        for i in group:
+            filepath, hash_val, _ = images_data[i]
+            if is_degenerate_hash(hash_val):
+                continue
+            size, mtime_ns = stats[i] if stats[i] else (None, None)
+            cached = None
+            if cache is not None and size is not None:
+                cached = cache.lookup_dhash(filepath, size, mtime_ns)
+            if cached:
+                try:
+                    dhash_by_idx[i] = hash_to_int(imagehash.hex_to_hash(cached))
+                    continue
+                except Exception:
+                    pass  # cache inválido: recalcula
+            to_compute.append(i)
+
+    total = len(to_compute)
+    processed = 0
+    cancelled = False
+    if total == 0:
+        return dhash_by_idx, False
+
+    def worker(idx):
+        filepath = images_data[idx][0]
+        try:
+            return idx, compute_dhash(filepath), None
+        except Exception as e:
+            return idx, None, e
+
+    def on_result(result):
+        nonlocal processed
+        idx, hash_val, err = result
+        filepath = images_data[idx][0]
+        if err is None:
+            dhash_by_idx[idx] = hash_to_int(hash_val)
+            if cache is not None:
+                cache.update_dhash(filepath, str(hash_val))
+        else:
+            log.warning("dhash falhou para %s (pares dela confirmados só pelo phash): %s",
+                        filepath, err)
+        processed += 1
+        if progress_cb:
+            progress_cb(processed, total, filepath)
+
+    try:
+        cancelled = _run_parallel_bounded(to_compute, worker, on_result, workers, cancel_check)
+    finally:
+        if cache is not None:
+            cache.flush()
+
+    return dhash_by_idx, cancelled
+
+
+def _new_confirm_stats():
+    return {
+        "groups_in": 0, "groups_out": 0, "groups_unchanged": 0, "groups_split": 0,
+        "groups_dropped": 0, "images_in": 0, "images_out": 0, "images_dropped": 0,
+        "images_degenerate": 0, "pairs_checked": 0, "pairs_rejected_dhash": 0,
+        "pairs_rejected_degenerate": 0, "pairs_without_dhash": 0,
+    }
+
+
+def confirm_similar_groups(images_data, groups_idx, md5_by_idx, dhash_by_idx,
+                           phash_threshold, dhash_threshold,
+                           progress_cb=None, cancel_check=None):
+    """
+    Pós-filtro dos grupos: dentro de cada grupo, um par (i, j) é confirmado se
+        MD5 igual
+        OU ( nenhum dos dois com phash degenerado
+             E distância de phash <= phash_threshold
+             E ( distância de dhash <= dhash_threshold, se ambos têm dhash;
+                 senão confirmado só pelo phash, como antes ) ).
+    O grupo é refeito por Union-Find sobre as arestas confirmadas (isso também
+    impede que uma cadeia de coincidências arraste imagens não relacionadas);
+    componentes de uma única imagem desaparecem.
+
+    Garantias: cada subgrupo está contido num grupo de entrada; imagens com
+    MD5 igual nunca se separam; a ordem dos grupos e dos índices é preservada
+    (subgrupos de um grupo dividido saem na posição dele, pelo menor índice).
+    Retorna (groups_out, stats). Levanta ScanCancelled se cancel_check() der True.
+    """
+    stats = _new_confirm_stats()
+    out = []
+    total = len(groups_idx)
+    for gi, group in enumerate(groups_idx):
+        if cancel_check and cancel_check():
+            raise ScanCancelled()
+        k = len(group)
+        stats["groups_in"] += 1
+        stats["images_in"] += k
+        md5s = [md5_by_idx.get(i, images_data[i][2]) for i in group]
+        if len(set(md5s)) < 2:
+            # Todas idênticas entre si: nada a confirmar
+            out.append(group)
+            stats["groups_out"] += 1
+            stats["groups_unchanged"] += 1
+            stats["images_out"] += k
+            if progress_cb:
+                progress_cb(gi + 1, total)
+            continue
+
+        P = np.array([hash_to_int(images_data[i][1]) for i in group], dtype=np.uint64)
+        deg = np.array([is_degenerate_hash(p) for p in P.tolist()], dtype=bool)
+        class_of = {}
+        cls = np.array([class_of.setdefault(m, len(class_of)) for m in md5s], dtype=np.int64)
+        has = np.array([i in dhash_by_idx for i in group], dtype=bool)
+        D = np.array([dhash_by_idx.get(i, 0) for i in group], dtype=np.uint64)
+        stats["images_degenerate"] += int(deg.sum())
+
+        uf = UnionFind(k)
+        first_of_class = {}
+        for pos, c in enumerate(cls.tolist()):
+            if c in first_of_class:
+                uf.union(first_of_class[c], pos)
+            else:
+                first_of_class[c] = pos
+
+        # Pares (r < c) em blocos, como em find_similar_groups, para grupos
+        # gigantes não estourarem a memória.
+        block = int(max(16, min(512, 4_000_000 // k)))
+        for start in range(0, k, block):
+            if cancel_check and cancel_check():
+                raise ScanCancelled()
+            if start + 1 >= k:
+                break
+            end = min(start + block, k)
+            rows = slice(start, end)
+            cols = slice(start + 1, k)
+            pd = _popcount_u64(P[rows][:, None] ^ P[cols][None, :])
+            dd = _popcount_u64(D[rows][:, None] ^ D[cols][None, :])
+            both = has[rows][:, None] & has[cols][None, :]
+            nondeg = (~deg[rows])[:, None] & (~deg[cols])[None, :]
+            same = cls[rows][:, None] == cls[cols][None, :]
+            close_p = pd <= phash_threshold
+            close_d = dd <= dhash_threshold
+            # linha global start+r, coluna global start+1+c: par válido se r <= c
+            tri = np.arange(end - start)[:, None] <= np.arange(k - start - 1)[None, :]
+            cand = close_p & ~same & tri            # pares que dependem da confirmação
+            stats["pairs_checked"] += int(cand.sum())
+            stats["pairs_rejected_degenerate"] += int((cand & ~nondeg).sum())
+            stats["pairs_rejected_dhash"] += int((cand & nondeg & both & ~close_d).sum())
+            stats["pairs_without_dhash"] += int((cand & nondeg & ~both).sum())
+            ok = cand & nondeg & (close_d | ~both)
+            rr, cc = np.nonzero(ok)
+            gr = (rr + start).tolist()
+            gc = (cc + start + 1).tolist()
+            CHUNK = 200_000
+            for s in range(0, len(gr), CHUNK):
+                if s and cancel_check and cancel_check():
+                    raise ScanCancelled()
+                for a, b in zip(gr[s:s + CHUNK], gc[s:s + CHUNK]):
+                    uf.union(a, b)
+
+        components = {}
+        for pos in range(k):
+            components.setdefault(uf.find(pos), []).append(pos)
+        subgroups = [[group[p] for p in comp] for comp in components.values() if len(comp) > 1]
+        kept = sum(len(s) for s in subgroups)
+        out.extend(subgroups)
+        stats["groups_out"] += len(subgroups)
+        stats["images_out"] += kept
+        stats["images_dropped"] += k - kept
+        if not subgroups:
+            stats["groups_dropped"] += 1
+        elif len(subgroups) == 1 and kept == k:
+            stats["groups_unchanged"] += 1
+        else:
+            stats["groups_split"] += 1
+        if progress_cb:
+            progress_cb(gi + 1, total)
+    return out, stats
+
+
 class ImageCleaner:
     def __init__(self, master):
         self.master = master
@@ -874,21 +1199,51 @@ class ImageCleaner:
         self.images_data = []
         self.selected_folder = ""
         self.current_page = 0
-        self.groups_per_page = 10
+        self.groups_per_page = 20
         self.group_check_vars = {}  # Armazena check_vars por grupo
         self.scan_errors = []  # Armazena erros de escaneamento
         # Modo de comparação de duas pastas (vazio = modo normal de uma pasta)
         self.reference_folder = ""
         self.reference_keys = set()     # cache_key dos arquivos listados na referência
         self.reference_prefix = None    # folder_prefix(reference_folder) durante o scan
+        self.confirm_stats = None       # estatísticas da confirmação por dhash (se ligada)
         self.create_widgets()
 
     def create_widgets(self):
-        self.select_btn = tk.Button(self.master, text="Selecionar Pasta", command=self.select_folder)
+        # Janela inicial: tamanho decente e centralizada (só aparência; o
+        # fluxo de botões/opções abaixo é o mesmo de sempre).
+        width, height = 680, 540
+        self.master.minsize(640, 500)
+        try:
+            sw = self.master.winfo_screenwidth()
+            sh = self.master.winfo_screenheight()
+            self.master.geometry(f"{width}x{height}+{(sw - width) // 2}+{(sh - height) // 3}")
+        except tk.TclError:
+            self.master.geometry(f"{width}x{height}")
+
+        header = tk.Frame(self.master, bg="#2E7D32", padx=20, pady=14)
+        header.pack(fill="x")
+        tk.Label(header, text="Image Cleaner", font=("Segoe UI", 18, "bold"),
+                 fg="white", bg="#2E7D32").pack(anchor="w")
+        tk.Label(header, text="Encontre fotos duplicadas ou semelhantes e limpe seu acervo com segurança",
+                 font=("Segoe UI", 10), fg="#E8F5E9", bg="#2E7D32").pack(anchor="w")
+
+        steps = tk.Label(
+            self.master, justify="left", fg="#444444", font=("Segoe UI", 9),
+            text=("1. Selecione a pasta com as fotos a limpar.\n"
+                  "2. (Opcional) Selecione uma pasta de referência já organizada: nada dela será alterado.\n"
+                  "3. Clique em Iniciar e revise os grupos encontrados antes de mover ou excluir.")
+        )
+        steps.pack(anchor="w", padx=20, pady=(14, 6))
+
+        self.select_btn = tk.Button(self.master, text="Selecionar Pasta", command=self.select_folder,
+                                    font=("Segoe UI", 10, "bold"), bg="#2E7D32", fg="white",
+                                    activebackground="#1B5E20", activeforeground="white",
+                                    padx=18, pady=6, cursor="hand2")
         self.select_btn.pack(pady=10)
 
         # Label para exibir o caminho selecionado
-        self.path_label = tk.Label(self.master, text="", fg="blue", wraplength=400)
+        self.path_label = tk.Label(self.master, text="", fg="blue", wraplength=600)
         self.path_label.pack(pady=5)
 
         # Frame para checkbox de subpastas (inicialmente oculto)
@@ -931,6 +1286,24 @@ class ImageCleaner:
                             "um escaneamento cancelado pode ser retomado depois.\n"
                             "Arquivos alterados são sempre recalculados.")
 
+        # Confirmação de semelhantes por segundo hash (na mesma linha das opções)
+        self.confirm_similar_var = tk.IntVar(value=1 if CONFIRM_SIMILAR else 0)
+        self.confirm_check = tk.Checkbutton(
+            self.subfolder_frame,
+            text="Confirmar semelhantes com segundo hash",
+            variable=self.confirm_similar_var
+        )
+        self.confirm_check.pack(side="left", padx=(15, 0))
+        self.confirm_info_label = tk.Label(self.subfolder_frame, text="ℹ️", fg="blue", cursor="hand2")
+        self.confirm_info_label.pack(side="left", padx=5)
+        self.create_tooltip(self.confirm_info_label,
+                            "Além do hash perceptual (phash), exige que um segundo hash\n"
+                            "(dhash) também considere as imagens parecidas antes de\n"
+                            "mantê-las juntas como 'Semelhante'. Reduz falsos positivos\n"
+                            "(fotos diferentes agrupadas por coincidência de luz/sombra).\n"
+                            "Imagens idênticas (mesmo conteúdo) nunca são afetadas.\n"
+                            "Desmarque para ver o agrupamento amplo de antes.")
+
         # Área da pasta de referência (modo comparação; inicialmente oculta)
         self.reference_container = tk.Frame(self.master)
         ref_row = tk.Frame(self.reference_container)
@@ -956,7 +1329,7 @@ class ImageCleaner:
                             "Sem referência, o programa funciona no modo normal.")
         self.reference_path_label = tk.Label(
             self.reference_container, text="Nenhuma pasta de referência (modo normal)",
-            fg="#2E7D32", wraplength=400
+            fg="#2E7D32", wraplength=600
         )
         self.reference_path_label.pack(pady=(3, 0))
         self.show_target_only_var = tk.IntVar(value=1)
@@ -968,7 +1341,10 @@ class ImageCleaner:
         # (exibido só quando há referência selecionada; ver select_reference_folder)
 
         # Botão Iniciar (inicialmente oculto)
-        self.start_btn = tk.Button(self.master, text="Iniciar", command=self.start_scan)
+        self.start_btn = tk.Button(self.master, text="Iniciar escaneamento", command=self.start_scan,
+                                   font=("Segoe UI", 10, "bold"), bg="#1565C0", fg="white",
+                                   activebackground="#0D47A1", activeforeground="white",
+                                   padx=18, pady=6, cursor="hand2")
         # Não exibe o botão nem o frame de subpastas inicialmente
 
     def create_tooltip(self, widget, text):
@@ -1222,9 +1598,11 @@ class ImageCleaner:
         self.scan_origin_counts = None  # (n_alvo, n_referência) no modo comparação
         ref = self.reference_folder
         scan_started = time.time()
-        log.info("Iniciando escaneamento de: %s (subpastas=%s, cache=%s, threads=%d)",
+        log.info("Iniciando escaneamento de: %s (subpastas=%s, cache=%s, threads=%d, "
+                 "confirmar semelhantes=%s)",
                  self.selected_folder, self.scan_subfolders_var.get() == 1,
-                 self.use_cache_var.get() == 1, HASH_WORKERS)
+                 self.use_cache_var.get() == 1, HASH_WORKERS,
+                 CONFIRM_SIMILAR and self.confirm_similar_var.get() == 1)
         if ref:
             log.info("Modo referência: pasta protegida = %s (duplicatas internas do alvo: %s)",
                      ref, "exibidas" if self.show_target_only_var.get() == 1 else "ocultas")
@@ -1509,10 +1887,11 @@ class ImageCleaner:
 
         if self.close_requested:
             return
+        self.confirm_stats = None
+        hide_target_only = self.show_target_only_var.get() == 0
         if self.reference_folder and groups_idx:
             # Modo comparação: descarta grupos só da referência (nada a limpar)
             # ANTES do MD5, para não ler do disco arquivos que serão descartados.
-            hide_target_only = self.show_target_only_var.get() == 0
             before = len(groups_idx)
             groups_idx = filter_groups_for_reference(
                 groups_idx, self.images_data, self.reference_keys,
@@ -1551,6 +1930,72 @@ class ImageCleaner:
             if not self.close_requested:
                 messagebox.showinfo("Cancelado", "Verificação de imagens idênticas cancelada.")
             return
+
+        # Confirmação de "Semelhante" por segundo hash (pós-filtro opcional).
+        # Desligada, nada daqui executa e o resultado é o de sempre.
+        confirm = CONFIRM_SIMILAR and self.confirm_similar_var.get() == 1
+        if confirm and groups_idx:
+            t1 = time.time()
+            self.create_progress_window()
+            self.progress_window.title("Confirmando Semelhantes")
+            self.progress_label.config(text="Calculando segundo hash (dhash) das imagens agrupadas...")
+            self.progress_window.update()
+            confirm_stats = None
+            try:
+                dhash_by_idx, cancelled = dhash_for_groups(
+                    self.images_data, stats, groups_idx, md5_by_idx, self.hash_cache, HASH_WORKERS,
+                    progress_cb=lambda c, t, f: self.update_progress(c, t, f, unit="imagens"),
+                    cancel_check=lambda: self.scan_cancelled
+                )
+                if not (cancelled or self.scan_cancelled):
+                    self.progress_started_at = time.time()
+                    groups_idx, confirm_stats = confirm_similar_groups(
+                        self.images_data, groups_idx, md5_by_idx, dhash_by_idx,
+                        SIMILARITY_THRESHOLD, DHASH_THRESHOLD,
+                        progress_cb=lambda c, t: self.update_progress(c, t, "confirmando grupos", unit="grupos"),
+                        cancel_check=lambda: self.scan_cancelled
+                    )
+            except ScanCancelled:
+                cancelled = True
+            finally:
+                self._close_progress_window()
+            if cancelled or self.scan_cancelled or self.close_requested:
+                log.info("Confirmação de semelhantes cancelada")
+                if not self.close_requested:
+                    messagebox.showinfo("Cancelado", "Confirmação de imagens semelhantes cancelada.")
+                return
+            self.confirm_stats = confirm_stats
+            log.info("Confirmação (dhash<=%d) em %.1fs: %d grupos -> %d (%d divididos, %d descartados), "
+                     "%d imagens descartadas, %d degeneradas, %d pares rejeitados, %d pares sem dhash",
+                     DHASH_THRESHOLD, time.time() - t1, confirm_stats["groups_in"],
+                     confirm_stats["groups_out"], confirm_stats["groups_split"],
+                     confirm_stats["groups_dropped"], confirm_stats["images_dropped"],
+                     confirm_stats["images_degenerate"], confirm_stats["pairs_rejected_dhash"],
+                     confirm_stats["pairs_without_dhash"])
+            if self.reference_folder and groups_idx:
+                # Subgrupos podem ter virado só-referência (ou só-alvo)
+                before = len(groups_idx)
+                groups_idx = filter_groups_for_reference(
+                    groups_idx, self.images_data, self.reference_keys,
+                    hide_target_only=hide_target_only)
+                log.info("Modo referência (pós-confirmação): %d grupos descartados, %d restantes",
+                         before - len(groups_idx), len(groups_idx))
+            if confirm_stats["pairs_without_dhash"]:
+                messagebox.showwarning(
+                    "Confirmação incompleta",
+                    f"{confirm_stats['pairs_without_dhash']} par(es) de imagens não puderam ser "
+                    f"confirmados pelo segundo hash (arquivo ilegível) e valeram pelo critério "
+                    f"antigo.\n\nOs caminhos estão no log: {get_log_path()}"
+                )
+            if not groups_idx:
+                messagebox.showinfo(
+                    "Resultado",
+                    "Nenhuma imagem similar confirmada.\n\n"
+                    f"A confirmação por segundo hash descartou {confirm_stats['groups_in']} grupo(s) "
+                    "candidato(s) como coincidência. Desmarque 'Confirmar semelhantes com segundo "
+                    "hash' para vê-los."
+                )
+                return
 
         self.groups = build_groups(self.images_data, groups_idx, md5_by_idx)
         n_ident = 0
@@ -1749,11 +2194,15 @@ class ImageCleaner:
         nav_frame = tk.Frame(top_frame)
         nav_frame.pack(side="right")
 
-        self.prev_btn = tk.Button(nav_frame, text="← Anterior", command=self.prev_page)
+        self.prev_btn = tk.Button(nav_frame, text="← Anterior (F1)", command=self.prev_page)
         self.prev_btn.pack(side="left", padx=5)
 
-        self.next_btn = tk.Button(nav_frame, text="Próximo →", command=self.next_page)
+        self.next_btn = tk.Button(nav_frame, text="Próximo (F2) →", command=self.next_page)
         self.next_btn.pack(side="left", padx=5)
+
+        # Atalhos de teclado da paginação (valem com a janela de grupos em foco)
+        self.groups_window.bind("<F1>", lambda e: self.prev_page())
+        self.groups_window.bind("<F2>", lambda e: self.next_page())
 
         # --- Cria um Frame para conter o Canvas e a Scrollbar ---
         scroll_container = tk.Frame(self.groups_window)
@@ -1804,9 +2253,12 @@ class ImageCleaner:
         total_pages = (len(self.groups) + self.groups_per_page - 1) // self.groups_per_page
 
         # Atualiza label de informação
-        self.page_info_label.config(
-            text=f"Página {self.current_page + 1} de {total_pages} | Total de grupos: {len(self.groups)}"
-        )
+        info = f"Página {self.current_page + 1} de {total_pages} | Total de grupos: {len(self.groups)}"
+        cs = self.confirm_stats
+        if cs:
+            info += (f" | Confirmação por 2º hash: {cs['images_dropped']} imagem(ns) e "
+                     f"{cs['groups_dropped']} grupo(s) descartados, {cs['groups_split']} divididos")
+        self.page_info_label.config(text=info)
 
         # Atualiza estado dos botões
         self.prev_btn.config(state="normal" if self.current_page > 0 else "disabled")
@@ -2254,10 +2706,12 @@ def _report_callback_exception(exc_type, exc_value, exc_tb):
         pass
 
 
-def run_selftest(folder, reference=None):
+def run_selftest(folder, reference=None, confirm_similar=None):
     """
     Modo de diagnóstico sem interface: `ImageCleaner.exe --selftest PASTA`
-    ou `--selftest PASTA --ref REFERENCIA` (modo de comparação).
+    ou `--selftest PASTA --ref REFERENCIA` (modo de comparação), opcionalmente
+    com `--no-confirm` (desliga a confirmação de semelhantes por dhash;
+    confirm_similar=None usa o padrão CONFIRM_SIMILAR).
     Roda o pipeline completo (listar, hash, agrupar, MD5) e escreve o resumo
     no log (e no console, quando houver). Útil para validar o executável e
     para diagnosticar problemas em campo. Não usa o cache e não altera nada.
@@ -2291,6 +2745,16 @@ def run_selftest(folder, reference=None):
         groups_idx = filter_groups_for_reference(groups_idx, images_data, ref_keys)
     stats = [entries[i][1:] for i, r in enumerate(results) if r is not None]
     md5_by_idx, _ = md5_for_groups(images_data, stats, groups_idx, None, HASH_WORKERS)
+    if confirm_similar is None:
+        confirm_similar = CONFIRM_SIMILAR
+    confirm_stats = None
+    if confirm_similar and groups_idx:
+        dhash_by_idx, _ = dhash_for_groups(images_data, stats, groups_idx, md5_by_idx, None, HASH_WORKERS)
+        groups_idx, confirm_stats = confirm_similar_groups(
+            images_data, groups_idx, md5_by_idx, dhash_by_idx, SIMILARITY_THRESHOLD, DHASH_THRESHOLD)
+        if reference is not None:
+            groups_idx = filter_groups_for_reference(groups_idx, images_data, ref_keys)
+        log.info("SELFTEST confirmação: %s", confirm_stats)
     groups = build_groups(images_data, groups_idx, md5_by_idx)
     n_ident = 0
     for g in groups:
@@ -2301,6 +2765,12 @@ def run_selftest(folder, reference=None):
     summary = (f"SELFTEST OK: {len(entries)} arquivos, {len(images_data)} hashes, "
                f"{len(errors_by_idx)} erros, {len(groups)} grupos, {n_ident} idênticas, "
                f"{time.time() - t0:.1f}s")
+    if confirm_stats is not None:
+        summary += (f" | CONF(dhash<={DHASH_THRESHOLD}): {confirm_stats['groups_dropped']} grupos e "
+                    f"{confirm_stats['images_dropped']} imagens descartados pela confirmação, "
+                    f"{confirm_stats['groups_split']} divididos, "
+                    f"{confirm_stats['pairs_rejected_dhash']} pares rejeitados, "
+                    f"{confirm_stats['images_degenerate']} degeneradas")
     if reference is not None:
         # Simula a seleção automática (mesmas funções puras da interface)
         mtime_by_path = {fp: (mt / 1e9 if mt is not None else float("inf"))
@@ -2330,9 +2800,18 @@ if __name__ == "__main__":
     if len(sys.argv) >= 3 and sys.argv[1] == "--selftest":
         try:
             reference = None
-            if len(sys.argv) >= 5 and sys.argv[3] == "--ref":
-                reference = sys.argv[4]
-            result = run_selftest(sys.argv[2], reference)
+            confirm_similar = None
+            extra = sys.argv[3:]
+            while extra:
+                opt = extra.pop(0)
+                if opt == "--ref" and extra:
+                    reference = extra.pop(0)
+                elif opt == "--no-confirm":
+                    confirm_similar = False
+                else:
+                    raise ValueError(f"Opção desconhecida: {opt} "
+                                     "(uso: --selftest PASTA [--ref REFERENCIA] [--no-confirm])")
+            result = run_selftest(sys.argv[2], reference, confirm_similar)
             code = 0
         except (FileNotFoundError, ValueError) as e:
             log.error("SELFTEST: %s", e)
