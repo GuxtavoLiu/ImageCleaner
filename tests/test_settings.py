@@ -35,12 +35,10 @@ def test_push_recent():
     assert ic.push_recent(lst, r"E:\novo") == [r"E:\novo"] + lst[:4]
 
 
-def test_tela_inicial_lembra_pastas_e_opcoes(tmp_path, monkeypatch):
-    try:
-        root = tk.Tk()
-    except tk.TclError as e:
-        pytest.skip(f"Tk indisponível: {e}")
-    root.withdraw()
+def test_tela_inicial_lembra_pastas_e_opcoes(tk_root, tmp_path, monkeypatch):
+    root = tk_root
+    for w in root.winfo_children():
+        w.destroy()
     try:
         alvo, ref = build_reference_fixture(str(tmp_path))
         path = str(tmp_path / "settings.json")
@@ -72,4 +70,3 @@ def test_tela_inicial_lembra_pastas_e_opcoes(tmp_path, monkeypatch):
     finally:
         for w in root.winfo_children():
             w.destroy()
-        root.destroy()

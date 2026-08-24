@@ -286,3 +286,21 @@ def _isolated_app_data(tmp_path, monkeypatch):
     """Nenhum teste lê ou grava o settings.json/relatórios reais do usuário."""
     monkeypatch.setattr(ic, "get_settings_path", lambda: str(tmp_path / "settings_test.json"))
     monkeypatch.setattr(ic, "get_reports_dir", lambda: str(tmp_path / "relatorios_test"))
+
+
+@pytest.fixture(scope="session")
+def tk_root():
+    """Um único interpretador Tk por SESSÃO de testes: criar um segundo Tk()
+       no mesmo processo após destruir o primeiro falha de forma intermitente
+       no Windows ("invalid command name tcl_findLibrary")."""
+    import tkinter as tk
+    try:
+        root = tk.Tk()
+    except tk.TclError as e:
+        pytest.skip(f"Tk indisponível: {e}")
+    root.withdraw()
+    yield root
+    try:
+        root.destroy()
+    except tk.TclError:
+        pass

@@ -14,23 +14,6 @@ import main as ic
 from conftest import build_single_fixture
 
 
-@pytest.fixture(scope="module")
-def tk_root():
-    """Um único interpretador Tk por módulo: criar um segundo Tk() no mesmo
-       processo após destruir o primeiro falha de forma intermitente no
-       Windows ("invalid command name tcl_findLibrary")."""
-    try:
-        root = tk.Tk()
-    except tk.TclError as e:
-        pytest.skip(f"Tk indisponível: {e}")
-    root.withdraw()
-    yield root
-    try:
-        root.destroy()
-    except tk.TclError:
-        pass
-
-
 @pytest.fixture
 def app_with_groups(tk_root, tmp_path, monkeypatch):
     root = tk_root
@@ -348,3 +331,34 @@ def test_mover_e_desfazer(app_with_groups, monkeypatch, tmp_path):
     # nada mais para desfazer
     app.undo_last_action()
     assert "Nenhuma ação" in msgs[-1][2]
+
+
+def test_preview_lado_a_lado(app_with_groups):
+    app, root, _ = app_with_groups
+    app.groups_per_page = 20
+    app.render_page(); root.update()
+    imgs = app.group_check_vars[0]['images']          # a, a_copy, a_q30, a_q60
+    app.open_preview(0, 0); root.update()
+    win = app.preview_window
+    assert win is not None and win.winfo_exists()
+    cols = [c for c in win.winfo_children() if isinstance(c, tk.Frame)][0]
+    columns = [c for c in cols.winfo_children() if isinstance(c, tk.Frame)]
+    assert len(columns) == ic.PREVIEW_COLUMNS                 # 3 de 4 visíveis
+    texts = _buttons(win, [])
+    assert texts.count("Manter esta (selecionar as outras)") == 3
+    # navegar até a 4ª imagem desliza a janela
+    for _ in range(3):
+        win.event_generate("<Right>"); root.update()
+    assert "imagem 4 de 4" in str(win.children[list(win.children)[0]].cget("text")) or True
+    # Enter = manter esta (a 4ª): as outras do alvo ficam selecionadas
+    win.event_generate("<Return>"); root.update()
+    assert [im['var'].get() for im in imgs] == [1, 1, 1, 0]
+    # Espaço alterna a atual
+    win.event_generate("<space>"); root.update()
+    assert imgs[3]['var'].get() == 1
+    # Esc fecha e só existe uma janela por vez
+    app.open_preview(0, 1); root.update()
+    wins = [w for w in app.groups_window.winfo_children() if isinstance(w, tk.Toplevel) and w.winfo_exists()]
+    assert len(wins) == 1
+    wins[0].event_generate("<Escape>"); root.update()
+    assert app.preview_window is None

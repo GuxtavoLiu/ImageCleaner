@@ -85,6 +85,9 @@ RENDER_CHUNK = 3
 COLLAPSE_THRESHOLD = 8
 COLLAPSE_SHOW = 4
 
+# Pré-visualização lado a lado: colunas visíveis por vez
+PREVIEW_COLUMNS = 3
+
 # ---------------------------------------------------------------------------
 # Aparência: uma paleta e um único helper de botões para toda a interface.
 # Tema ttk "vista" (nativo do Windows) para caixas, barras e scrollbars.
@@ -3181,11 +3184,16 @@ class ImageCleaner:
 
     def open_preview(self, group_idx, pos):
         """
-        Pré-visualização grande de uma imagem do grupo. Setas esquerda/direita
-        navegam pelas imagens do MESMO grupo (todas, inclusive as fora da faixa
-        exibida), Espaço alterna a seleção, Esc ou clique fora da imagem fecha.
+        Pré-visualização lado a lado das imagens de um grupo (até
+        PREVIEW_COLUMNS colunas por vez; grupos maiores deslizam com as setas).
+        Cada coluna mostra a imagem, nome, resolução, tamanho, data, status,
+        origem, rótulos de diferença e o estado da seleção, com os botões
+        "Selecionar/Desmarcar" e "Manter esta (selecionar as outras)".
+        Teclado: ← → movem a coluna atual, Espaço alterna a atual, Enter =
+        "manter esta", Esc ou clique no fundo fecha. Só uma janela por vez.
         """
         images = self.group_check_vars[group_idx]['images']
+        md5_count = self.group_check_vars[group_idx]['md5_count']
         n = len(images)
         if n == 0:
             return
@@ -3201,52 +3209,144 @@ class ImageCleaner:
             self.preview_window = None
         win = tk.Toplevel(self.groups_window)
         self.preview_window = win
-        win.configure(bg="#111111")
+        dark, panel, fg = "#111111", "#1E1E1E", "#EEEEEE"
+        win.configure(bg=dark)
         win.transient(self.groups_window)
         sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
-        w, h = int(sw * 0.85), int(sh * 0.85)
+        w, h = int(sw * 0.9), int(sh * 0.88)
         win.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
 
-        lbl_info = tk.Label(win, fg="white", bg="#111111", font=("Segoe UI", 10),
-                            justify="center", wraplength=w - 40)
-        lbl_info.pack(side="bottom", fill="x", pady=(0, 8))
-        lbl_hint = tk.Label(win, fg="#AAAAAA", bg="#111111", font=("Segoe UI", 9),
-                            text="← → navegar no grupo   |   Espaço selecionar/desmarcar   |   Esc ou clique fora fecha")
-        lbl_hint.pack(side="bottom", fill="x", pady=(0, 6))
-        lbl_img = tk.Label(win, bg="#111111")
-        lbl_img.pack(expand=True)
+        ncols = min(PREVIEW_COLUMNS, n)
+        state = {'cur': pos % n, 'start': 0}
+        state['start'] = max(0, min(state['cur'], n - ncols))
 
-        state = {'pos': pos % n}
+        header = tk.Label(win, fg=fg, bg=dark, font=FONT_BOLD)
+        header.pack(side="top", fill="x", pady=(8, 2))
+        hint = tk.Label(win, fg="#AAAAAA", bg=dark, font=FONT_UI,
+                        text="← → coluna atual   |   Espaço selecionar/desmarcar   |   "
+                             "Enter manter esta   |   Esc ou clique no fundo fecha")
+        hint.pack(side="bottom", fill="x", pady=(0, 6))
+        columns_frame = tk.Frame(win, bg=dark)
+        columns_frame.pack(fill="both", expand=True, padx=10, pady=6)
+        background_widgets = {win, header, hint, columns_frame}
 
-        def refresh():
-            info = images[state['pos']]
-            fp = info['filepath']
-            try:
-                with Image.open(fp) as im:
-                    im.load()
-                    im.thumbnail((w - 40, h - 90))
-                    photo = ImageTk.PhotoImage(im)
-                lbl_img.config(image=photo, text="")
-                lbl_img.image = photo
-            except Exception as e:
-                log.warning("Erro ao carregar pré-visualização %s: %s", fp, e)
-                lbl_img.config(image="", text="(Erro ao carregar a imagem)", fg="white")
-                lbl_img.image = None
-            sel = "SELECIONADA" if info['var'].get() == 1 else "não selecionada"
-            ref = "   |   REFERÊNCIA (protegida)" if info.get('is_reference') else ""
-            lbl_info.config(text=f"Grupo {group_idx + 1}: imagem {state['pos'] + 1} de {n}   |   "
-                                 f"{sel}{ref}\n{fp}")
-            win.title(f"Pré-visualização: {os.path.basename(fp)}")
+        col_w = (w - 20) // ncols - 12
+        img_h = h - 260
 
-        def go(delta):
-            state['pos'] = (state['pos'] + delta) % n
-            refresh()
+        def all_dims_known():
+            return all(self.image_dims.get(im['filepath']) for im in images)
 
-        def toggle(event=None):
-            info = images[state['pos']]
+        def badges_for():
+            metas = []
+            for im in images:
+                fp = im['filepath']
+                d = self.image_dims.get(fp)
+                size = self.file_stats.get(fp, (None, None))[0]
+                mt = im.get('mtime')
+                metas.append({'pixels': d[0] * d[1] if d else None, 'size': size,
+                              'mtime': None if mt in (None, float("inf")) else mt})
+            return plan_badges(metas)
+
+        def load_photo(fp):
+            with Image.open(fp) as im:
+                self.image_dims[fp] = im.size
+                if im.format == "JPEG":
+                    im.draft("RGB", (col_w * 2, img_h * 2))
+                im.thumbnail((col_w, img_h))
+                return ImageTk.PhotoImage(im)
+
+        def toggle(i):
+            info = images[i]
             if not info.get('is_reference'):
                 info['var'].set(0 if info['var'].get() else 1)
                 refresh()
+
+        def keep_this(i):
+            """Mantém a imagem i: desmarca ela e seleciona as outras do alvo."""
+            for k, info in enumerate(images):
+                if info.get('is_reference'):
+                    continue
+                info['var'].set(0 if k == i else 1)
+            refresh()
+
+        def refresh():
+            for c in columns_frame.winfo_children():
+                c.destroy()
+            start = state['start']
+            visible = list(range(start, min(start + ncols, n)))
+            badges = badges_for()
+            for i in visible:
+                info = images[i]
+                fp = info['filepath']
+                is_cur = i == state['cur']
+                col = tk.Frame(columns_frame, bg=panel, highlightthickness=3,
+                               highlightbackground=("#4CAF50" if is_cur else panel),
+                               highlightcolor=("#4CAF50" if is_cur else panel))
+                col.pack(side="left", fill="both", expand=True, padx=6)
+                background_widgets.add(col)
+                col.bind("<Button-1>", lambda e, k=i: set_cur(k))
+                lbl_img = tk.Label(col, bg=panel)
+                lbl_img.pack(pady=(8, 4))
+                try:
+                    photo = load_photo(fp)
+                    lbl_img.config(image=photo)
+                    lbl_img.image = photo
+                except Exception as e:
+                    log.warning("Erro ao carregar pré-visualização %s: %s", fp, e)
+                    lbl_img.config(text="(Erro ao carregar a imagem)", fg=fg)
+                lbl_img.bind("<Button-1>", lambda e, k=i: set_cur(k))
+
+                sel = info['var'].get() == 1
+                ref = info.get('is_reference', False)
+                status = "Idêntica" if md5_count.get(info['md5'], 0) > 1 else "Semelhante"
+                dims = self.image_dims.get(fp)
+                size = self.file_stats.get(fp, (None, None))[0]
+                mt = info.get('mtime')
+                mt_str = (datetime.fromtimestamp(mt).strftime("%Y-%m-%d %H:%M:%S")
+                          if mt not in (None, float("inf")) else "?")
+                tag, rel_dir, name = shorten_path(fp, self._path_roots())
+                tk.Label(col, text=name, fg=fg, bg=panel, font=FONT_BOLD, wraplength=col_w).pack()
+                tk.Label(col, text=(f"[{tag}] " if tag else "") + (rel_dir or "(raiz)"),
+                         fg="#9E9E9E", bg=panel, wraplength=col_w).pack()
+                tk.Label(col, text=(f"{status}   |   {format_resolution(dims)}   |   "
+                                    f"{format_bytes(size)}\nModificado em: {mt_str}"),
+                         fg=fg, bg=panel, justify="center").pack(pady=(4, 2))
+                badge_row = tk.Frame(col, bg=panel)
+                badge_row.pack()
+                for text in badges.get(i, []):
+                    bfg, bbg = BADGE_STYLES[text]
+                    tk.Label(badge_row, text=text, fg=bfg, bg=bbg, font=("Segoe UI", 8),
+                             padx=6, pady=1).pack(side="left", padx=3)
+                if ref:
+                    tk.Label(col, text="REFERÊNCIA (protegida)", fg="white", bg=PALETTE["primary"],
+                             font=FONT_BOLD, padx=6).pack(pady=(4, 0))
+                state_lbl = tk.Label(col, text=("SELECIONADA" if sel else "não selecionada"),
+                                     fg=("#A5D6A7" if sel else "#BDBDBD"), bg=panel, font=FONT_BOLD)
+                state_lbl.pack(pady=(4, 2))
+                btns = tk.Frame(col, bg=panel)
+                btns.pack(pady=(2, 8))
+                if not ref:
+                    make_button(btns, "Desmarcar" if sel else "Selecionar", "select" if not sel else "light",
+                                command=lambda k=i: toggle(k)).pack(side="left", padx=4)
+                make_button(btns, "Manter esta (selecionar as outras)", "move",
+                            command=lambda k=i: keep_this(k)).pack(side="left", padx=4)
+                for wdg in (badge_row, btns, state_lbl):
+                    background_widgets.add(wdg)
+            cur = images[state['cur']]
+            header.config(text=f"Grupo {group_idx + 1}: imagem {state['cur'] + 1} de {n}   |   "
+                               f"{os.path.basename(cur['filepath'])}")
+            win.title(f"Pré-visualização: {os.path.basename(cur['filepath'])}")
+
+        def set_cur(i):
+            state['cur'] = i % n
+            if state['cur'] < state['start']:
+                state['start'] = state['cur']
+            elif state['cur'] >= state['start'] + ncols:
+                state['start'] = state['cur'] - ncols + 1
+            refresh()
+
+        def go(delta):
+            set_cur(state['cur'] + delta)
 
         def close(event=None):
             if self.preview_window is win:
@@ -3258,13 +3358,17 @@ class ImageCleaner:
                 pass
 
         def click(event):
-            # Clique fora da imagem fecha; na imagem, não faz nada
-            if event.widget is not lbl_img:
+            # Clique no fundo (fora de imagens/botões) fecha
+            if event.widget in background_widgets and event.widget is not columns_frame \
+                    and not isinstance(event.widget, tk.Frame):
+                close()
+            elif event.widget is win:
                 close()
 
         win.bind("<Left>", lambda e: go(-1))
         win.bind("<Right>", lambda e: go(1))
-        win.bind("<space>", toggle)
+        win.bind("<space>", lambda e: toggle(state['cur']))
+        win.bind("<Return>", lambda e: keep_this(state['cur']))
         win.bind("<Escape>", close)
         win.bind("<Button-1>", click)
         win.protocol("WM_DELETE_WINDOW", close)
