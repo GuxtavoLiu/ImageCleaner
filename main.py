@@ -1,3 +1,4 @@
+import bisect
 import os
 import hashlib
 import logging
@@ -53,6 +54,21 @@ VALID_EXTENSIONS = [".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".tif", ".
 # milhares de imagens não travarem a interface). As ações (selecionar, mover,
 # excluir) continuam valendo para TODAS as imagens do grupo.
 MAX_IMAGES_PER_GROUP_DISPLAY = 200
+
+# Tamanho (px) das miniaturas na tela de grupos. Não afeta a velocidade de
+# leitura (o draft do JPEG cai na mesma escala 1/8 para fotos grandes); afeta a
+# altura das linhas e a memória do cache.
+THUMB_SIZE = 200
+
+# Miniaturas já geradas ficam em cache na tela de grupos: trocar de página ou
+# verificar um grupo não decodifica de novo os JPEGs originais. O limite é
+# calculado para ~160 MB independentemente do THUMB_SIZE (4000 x 100x100).
+THUMB_CACHE_SIZE = max(500, int(4000 * (100 / THUMB_SIZE) ** 2))
+
+# Renderização da página de grupos em lotes (ver render_page): quantos grupos
+# aparecem de imediato e quantos entram por lote nos ciclos seguintes.
+RENDER_FIRST_CHUNK = 4
+RENDER_CHUNK = 3
 
 # Threshold de similaridade (distância de Hamming máxima entre phashes).
 SIMILARITY_THRESHOLD = 10
@@ -2145,12 +2161,21 @@ class ImageCleaner:
         self.current_page = 0
         self.group_check_vars = {}  # Reseta a estrutura
         self.group_page_offset = {}  # idx do grupo -> primeira imagem exibida (grupos grandes)
+        # Fila de revisão: cada grupo está em "pendentes" ou em "verificados".
+        # Os índices são sempre os ORIGINAIS (o rótulo "Grupo N" não muda).
+        self.pending_idx = []
+        self.verified_idx = []
+        self.view_mode = "pending"          # vista exibida: "pending" | "verified"
+        self.page_by_view = {"pending": 0, "verified": 0}
+        self.group_frames = {}              # idx -> LabelFrame na página atual
+        self.thumb_cache = {}               # filepath -> PhotoImage (ou None se falhou)
 
         # Cria janela de progresso
         self.create_groups_progress_window()
 
         # Inicializa estrutura de dados para TODOS os grupos
         self.initialize_all_groups()
+        self.pending_idx = list(range(len(self.groups)))
 
         # Fecha janela de progresso
         if hasattr(self, 'groups_progress_window') and self.groups_progress_window.winfo_exists():
@@ -2168,13 +2193,13 @@ class ImageCleaner:
         self.page_info_label.pack(side="left", padx=5)
 
         # Botão para selecionar idênticas
-        btn_select_identical = tk.Button(top_frame, text="Selecionar Idênticas",
+        btn_select_identical = tk.Button(top_frame, text="Selecionar Todas Idênticas",
                                          command=self.select_identical_images,
                                          bg="#4CAF50", fg="white")
         btn_select_identical.pack(side="left", padx=5)
 
         # Botão para selecionar semelhantes
-        btn_select_similar = tk.Button(top_frame, text="Selecionar Semelhantes",
+        btn_select_similar = tk.Button(top_frame, text="Selecionar Todas Semelhantes",
                                        command=self.select_similar_images,
                                        bg="#FF9800", fg="white")
         btn_select_similar.pack(side="left", padx=5)
@@ -2189,6 +2214,17 @@ class ImageCleaner:
                                    command=self.delete_all_selected,
                                    bg="#f44336", fg="white")
         btn_delete_all.pack(side="left", padx=5)
+
+        # Alterna entre a fila de pendentes e a lista de grupos já verificados
+        self.view_toggle_btn = tk.Button(top_frame, text="", command=self.toggle_view,
+                                         bg="#607D8B", fg="white")
+        self.view_toggle_btn.pack(side="left", padx=(20, 5))
+        self.create_tooltip(self.view_toggle_btn,
+                            "Ao usar 'Selecionar Idênticas/Semelhantes' ou 'Marcar verificado' de um\n"
+                            "grupo, ele sai da fila de pendentes e vai para 'Grupos verificados'.\n"
+                            "As seleções feitas continuam valendo para 'Mover/Excluir Todas Selecionadas'.\n"
+                            "A lista de verificados vale só nesta sessão.")
+        self._update_view_toggle()
 
         # Botões de navegação
         nav_frame = tk.Frame(top_frame)
@@ -2220,12 +2256,13 @@ class ImageCleaner:
         # --- Cria o Frame que conterá todo o conteúdo (grupos, imagens, etc.) ---
         self.content_frame = tk.Frame(self.canvas)
         # Insere o content_frame dentro do canvas como uma "janela"
-        self.canvas.create_window((0, 0), window=self.content_frame, anchor="nw")
+        self.content_window = self.canvas.create_window((0, 0), window=self.content_frame, anchor="nw")
 
         # Função para ajustar a região de rolagem sempre que o content_frame mudar de tamanho
         def on_configure(event):
             self.canvas.configure(scrollregion=self.canvas.bbox("all"))
 
+        self._on_content_configure = on_configure
         self.content_frame.bind("<Configure>", on_configure)
 
         # Adiciona suporte ao scroll do mouse
@@ -2241,139 +2278,459 @@ class ImageCleaner:
         # Renderiza a primeira página
         self.render_page()
 
-    def render_page(self):
-        """Renderiza os grupos da página atual usando dados já inicializados"""
-        # Limpa o conteúdo anterior
-        for widget in self.content_frame.winfo_children():
-            widget.destroy()
+    def _visible_groups(self):
+        """Índices dos grupos da vista atual (pendentes ou verificados)."""
+        return self.pending_idx if self.view_mode == "pending" else self.verified_idx
 
-        # Calcula índices da página atual
-        start_idx = self.current_page * self.groups_per_page
-        end_idx = min(start_idx + self.groups_per_page, len(self.groups))
-        total_pages = (len(self.groups) + self.groups_per_page - 1) // self.groups_per_page
+    def _load_thumbnail(self, filepath):
+        """
+        Miniatura THUMB_SIZE x THUMB_SIZE como PhotoImage, com cache. JPEGs são decodificados
+        já em escala reduzida (draft: 1/2, 1/4 ou 1/8 via DCT), o que é
+        várias vezes mais rápido do que decodificar os 20 MP inteiros para
+        depois encolher. Retorna None se a imagem não puder ser lida.
+        """
+        cache = self.thumb_cache
+        if filepath in cache:
+            return cache[filepath]
+        photo = None
+        try:
+            with Image.open(filepath) as img:
+                if img.format == "JPEG":
+                    img.draft("RGB", (THUMB_SIZE * 2, THUMB_SIZE * 2))
+                img.thumbnail((THUMB_SIZE, THUMB_SIZE))
+                photo = ImageTk.PhotoImage(img)
+        except Exception as e:
+            log.warning("Erro ao carregar miniatura %s: %s", filepath, e)
+        if len(cache) >= THUMB_CACHE_SIZE:
+            cache.pop(next(iter(cache)))   # descarta a mais antiga
+        cache[filepath] = photo
+        return photo
 
-        # Atualiza label de informação
-        info = f"Página {self.current_page + 1} de {total_pages} | Total de grupos: {len(self.groups)}"
+    def _update_page_info(self):
+        """Atualiza o rótulo de paginação e os botões Anterior/Próximo.
+           Retorna (total_de_grupos_visíveis, total_de_páginas)."""
+        visible = self._visible_groups()
+        total = len(visible)
+        total_pages = max(1, (total + self.groups_per_page - 1) // self.groups_per_page)
+        if self.current_page > total_pages - 1:
+            self.current_page = total_pages - 1
+        self.page_by_view[self.view_mode] = self.current_page
+        end_idx = min((self.current_page + 1) * self.groups_per_page, total)
+        vista = "Verificados" if self.view_mode == "verified" else "Pendentes"
+        info = (f"{vista}: página {self.current_page + 1} de {total_pages} | "
+                f"{len(self.pending_idx)} pendentes, {len(self.verified_idx)} verificados "
+                f"(total {len(self.groups)})")
         cs = self.confirm_stats
         if cs:
             info += (f" | Confirmação por 2º hash: {cs['images_dropped']} imagem(ns) e "
                      f"{cs['groups_dropped']} grupo(s) descartados, {cs['groups_split']} divididos")
         self.page_info_label.config(text=info)
-
-        # Atualiza estado dos botões
         self.prev_btn.config(state="normal" if self.current_page > 0 else "disabled")
-        self.next_btn.config(state="normal" if end_idx < len(self.groups) else "disabled")
+        self.next_btn.config(state="normal" if end_idx < total else "disabled")
+        return total, total_pages
 
-        # Renderiza grupos da página atual
-        for idx in range(start_idx, end_idx):
-            group_data = self.group_check_vars[idx]
-            group = group_data['group']
-            md5_count = group_data['md5_count']
-            images = group_data['images']
+    def render_page(self, keep_scroll_px=None):
+        """Renderiza os grupos da página atual da vista atual.
+           keep_scroll_px: posição vertical (em pixels do canvas) a manter após
+           renderizar; None rola para o topo."""
+        # A página nova é montada num frame FORA da tela e trocada de uma vez
+        # no canvas; o frame antigo é destruído já desmapeado. Evita o Tk
+        # relayoutar a página a cada um dos ~300 widgets criados/destruídos
+        # (era o que deixava a troca de página lenta).
+        old_frame = self.content_frame
+        self.content_frame = tk.Frame(self.canvas)
+        self.group_frames = {}
 
-            frame = tk.LabelFrame(self.content_frame, text=f"Grupo {idx + 1}", padx=10, pady=10)
-            frame.pack(padx=10, pady=10, fill="x", expand=True)
+        total, _ = self._update_page_info()
+        visible = self._visible_groups()
+        start_idx = self.current_page * self.groups_per_page
+        end_idx = min(start_idx + self.groups_per_page, total)
 
-            # Grupos gigantes: exibe MAX_IMAGES_PER_GROUP_DISPLAY por vez, com
-            # navegação dentro do grupo (toda imagem marcada continua alcançável).
-            # As ações continuam valendo para o grupo inteiro.
-            offset = 0
-            if len(images) > MAX_IMAGES_PER_GROUP_DISPLAY:
-                offset = self.group_page_offset.get(idx, 0)
-                offset = max(0, min(offset, len(images) - 1))
-                offset -= offset % MAX_IMAGES_PER_GROUP_DISPLAY
-                self.group_page_offset[idx] = offset
-                self._render_group_nav(frame, idx, images, offset)
+        if total == 0:
+            msg = ("Todos os grupos foram verificados. Use 'Voltar aos pendentes' para revê-los."
+                   if self.view_mode == "pending" else "Nenhum grupo verificado ainda.")
+            tk.Label(self.content_frame, text=msg, fg="#555555", font=("Arial", 11),
+                     padx=20, pady=30).pack(anchor="w")
 
-            # Exibe cada imagem do grupo usando os IntVar já criados
-            for img_info in images[offset:offset + MAX_IMAGES_PER_GROUP_DISPLAY]:
-                filepath = img_info['filepath']
-                md5_val = img_info['md5']
-                var = img_info['var']
-                is_ref = img_info.get('is_reference', False)
+        # Renderiza em lotes: no Windows cada widget Tk é uma janela nativa e
+        # mapear os ~360 widgets de 20 grupos de uma vez trava a tela por ~1 s.
+        # Os primeiros grupos aparecem já; os demais entram abaixo, em lotes,
+        # enquanto o usuário revisa o topo. Um token cancela lotes pendentes se
+        # a página mudar no meio.
+        self._render_token = getattr(self, '_render_token', 0) + 1
+        token = self._render_token
+        page_groups = list(visible[start_idx:end_idx])
+        first = page_groups[:RENDER_FIRST_CHUNK]
+        rest = page_groups[RENDER_FIRST_CHUNK:]
+        for idx in first:
+            self._render_group(idx)
 
-                # Monta um frame interno para cada imagem
-                item_frame = tk.Frame(frame)
-                item_frame.pack(side="top", fill="x", pady=5)
+        self.content_frame.bind("<Configure>", self._on_content_configure)
+        self.canvas.itemconfigure(self.content_window, window=self.content_frame)
+        try:
+            old_frame.destroy()
+        except tk.TclError:
+            pass
 
-                # Miniatura
-                try:
-                    img = Image.open(filepath)
-                    img.thumbnail((100, 100))
-                    photo = ImageTk.PhotoImage(img)
-                    lbl_img = tk.Label(item_frame, image=photo)
-                    lbl_img.image = photo
-                    lbl_img.pack(side="left", padx=5)
-                except Exception as e:
-                    log.warning("Erro ao carregar miniatura %s: %s", filepath, e)
-                    lbl_img = tk.Label(item_frame, text="(Erro ao carregar)")
-                    lbl_img.pack(side="left", padx=5)
+        def apply_scroll():
+            if keep_scroll_px is None:
+                self.canvas.yview_moveto(0)
+            else:
+                self._scroll_to_px(keep_scroll_px)
 
-                # Área de texto e checkbox
-                text_frame = tk.Frame(item_frame)
-                text_frame.pack(side="left", fill="both", expand=True)
+        apply_scroll()
 
-                # Imagem da referência: rótulo destacado e checkbox desabilitado
-                # (impossível selecionar, mesmo clicando)
-                if is_ref:
-                    tk.Label(text_frame, text="REFERÊNCIA (protegida)", fg="white",
-                             bg="#2E7D32", font=("Arial", 9, "bold"), padx=4).pack(anchor="w")
+        def render_chunk():
+            if token != self._render_token or not self.content_frame.winfo_exists():
+                return
+            for idx in rest[:RENDER_CHUNK]:
+                self._render_group(idx)
+            del rest[:RENDER_CHUNK]
+            if rest:
+                self.groups_window.after(1, render_chunk)
+            elif keep_scroll_px is not None:
+                apply_scroll()   # altura final conhecida: reaplica a posição pedida
 
-                # Checkbutton usando o IntVar já existente
-                chk = tk.Checkbutton(text_frame, text="Selecionar", variable=var,
-                                     state="disabled" if is_ref else "normal")
-                chk.pack(anchor="w")
+        if rest:
+            self.groups_window.after(1, render_chunk)
 
-                # Verifica se a imagem é idêntica (MD5 duplicado) ou apenas semelhante
-                if md5_count[md5_val] > 1:
-                    status = "Idêntica"
-                else:
-                    status = "Semelhante"
+    def _scroll_to_px(self, px):
+        """Rola o canvas para a posição vertical px (após recalcular a região)."""
+        self.canvas.update_idletasks()
+        bbox = self.canvas.bbox("all")
+        self.canvas.configure(scrollregion=bbox)
+        height = (bbox[3] - bbox[1]) if bbox else 0
+        self.canvas.yview_moveto(px / height if height > 0 else 0)
 
-                # Metadados do arquivo (protegido: o arquivo pode ter sido
-                # movido/excluído por uma ação anterior nesta mesma tela)
-                origin_text = "Origem: REFERÊNCIA (protegida)\n" if is_ref else ""
-                try:
-                    st = os.stat(filepath)
-                    ctime_str = datetime.fromtimestamp(st.st_ctime).strftime("%Y-%m-%d %H:%M:%S")
-                    mtime_str = datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
-                    info_text = (
-                        origin_text +
-                        f"Caminho: {filepath}\n"
-                        f"Status: {status}\n"
-                        f"Tamanho: {st.st_size} bytes\n"
-                        f"Criado em: {ctime_str}\n"
-                        f"Modificado em: {mtime_str}\n"
-                    )
-                except OSError:
-                    info_text = (
-                        origin_text +
-                        f"Caminho: {filepath}\n"
-                        f"Status: {status}\n"
-                        f"Arquivo não encontrado (movido ou excluído)\n"
-                    )
+    def _render_group(self, idx):
+        """Cria o LabelFrame de UM grupo no fim do content_frame e o devolve.
+           Os botões de ação ficam no TOPO do grupo: assim ficam sempre na mesma
+           posição em relação ao início do grupo, não importa quantas imagens
+           ele tenha (o cursor não precisa se mover entre um grupo e o próximo)."""
+        verified_view = self.view_mode == "verified"
+        group_data = self.group_check_vars[idx]
+        group = group_data['group']
+        md5_count = group_data['md5_count']
+        images = group_data['images']
 
-                lbl_info = tk.Label(text_frame, text=info_text, justify="left", anchor="w")
-                lbl_info.pack(anchor="w")
+        title = f"Grupo {idx + 1}" + (" ✓ verificado" if verified_view else "")
+        frame = tk.LabelFrame(self.content_frame, text=title, padx=10, pady=10)
+        frame.pack(padx=10, pady=10, fill="x", expand=True)
+        self.group_frames[idx] = frame
 
-            # Repete a navegação no fim de grupos grandes (evita rolar até o topo)
-            if len(images) > MAX_IMAGES_PER_GROUP_DISPLAY:
-                self._render_group_nav(frame, idx, images, offset)
+        # Botões do grupo (no topo)
+        btn_frame = tk.Frame(frame)
+        btn_frame.pack(fill="x", pady=(0, 5))
 
-            # Botões para mover/excluir do grupo específico
-            btn_frame = tk.Frame(frame)
-            btn_frame.pack(fill="x", pady=5)
+        # Seleção automática só deste grupo: o botão aparece apenas se a
+        # regra encontrar algo para marcar aqui (grupo só de idênticas
+        # não ganha "Semelhantes", e vice-versa). Na fila de pendentes,
+        # selecionar também marca o grupo como verificado (ele sai da fila
+        # e o seguinte sobe para o mesmo lugar).
+        select_cmd = self.select_group if verified_view else self.select_and_verify
+        if plan_identical_selection(images):
+            tk.Button(btn_frame, text="Selecionar Idênticas", bg="#4CAF50", fg="white",
+                      command=lambda g=idx, c=select_cmd: c(g, "identical")).pack(side="left", padx=5)
+        if plan_similar_selection(images, md5_count):
+            tk.Button(btn_frame, text="Selecionar Semelhantes", bg="#FF9800", fg="white",
+                      command=lambda g=idx, c=select_cmd: c(g, "similar")).pack(side="left", padx=5)
+        if verified_view:
+            tk.Button(btn_frame, text="Voltar para pendentes",
+                      command=lambda g=idx: self.unverify_group(g)).pack(side="left", padx=5)
+        else:
+            tk.Button(btn_frame, text="Marcar verificado ✓",
+                      command=lambda g=idx: self.verify_group(g)).pack(side="left", padx=5)
 
-            btn_move = tk.Button(btn_frame, text="Mover Selecionadas",
-                                 command=lambda grp=group, vars=group_data['check_vars']: self.move_images(grp, vars))
-            btn_move.pack(side="left", padx=5)
+        btn_move = tk.Button(btn_frame, text="Mover Selecionadas",
+                             command=lambda grp=group, vars=group_data['check_vars']: self.move_images(grp, vars))
+        btn_move.pack(side="left", padx=5)
 
-            btn_delete = tk.Button(btn_frame, text="Excluir Selecionadas",
-                                   command=lambda grp=group, vars=group_data['check_vars']: self.delete_images(grp, vars))
-            btn_delete.pack(side="left", padx=5)
+        btn_delete = tk.Button(btn_frame, text="Excluir Selecionadas",
+                               command=lambda grp=group, vars=group_data['check_vars']: self.delete_images(grp, vars))
+        btn_delete.pack(side="left", padx=5)
 
-        # Reseta o scroll para o topo
-        self.canvas.yview_moveto(0)
+        # Grupos gigantes: exibe MAX_IMAGES_PER_GROUP_DISPLAY por vez, com
+        # navegação dentro do grupo (toda imagem marcada continua alcançável).
+        # As ações continuam valendo para o grupo inteiro.
+        offset = 0
+        if len(images) > MAX_IMAGES_PER_GROUP_DISPLAY:
+            offset = self.group_page_offset.get(idx, 0)
+            offset = max(0, min(offset, len(images) - 1))
+            offset -= offset % MAX_IMAGES_PER_GROUP_DISPLAY
+            self.group_page_offset[idx] = offset
+            self._render_group_nav(frame, idx, images, offset)
+
+        # Exibe cada imagem do grupo usando os IntVar já criados
+        for pos, img_info in enumerate(images[offset:offset + MAX_IMAGES_PER_GROUP_DISPLAY],
+                                       start=offset):
+            filepath = img_info['filepath']
+            md5_val = img_info['md5']
+            var = img_info['var']
+            is_ref = img_info.get('is_reference', False)
+
+            # Monta um frame interno para cada imagem
+            item_frame = tk.Frame(frame)
+            item_frame.pack(side="top", fill="x", pady=5)
+
+            # Clicar em qualquer ponto da linha (fora da miniatura) alterna a
+            # seleção; imagens da referência continuam bloqueadas.
+            def toggle_row(event, v=var, ref=is_ref):
+                if not ref:
+                    v.set(0 if v.get() else 1)
+            row_widgets = [item_frame]
+
+            # Miniatura (clique abre a pré-visualização grande)
+            photo = self._load_thumbnail(filepath)
+            if photo is not None:
+                lbl_img = tk.Label(item_frame, image=photo, cursor="hand2")
+                lbl_img.image = photo
+            else:
+                lbl_img = tk.Label(item_frame, text="(Erro ao carregar)", cursor="hand2")
+            lbl_img.pack(side="left", padx=5)
+            lbl_img.bind("<Button-1>",
+                         lambda e, g=idx, p=pos: self.open_preview(g, p))
+
+            # Área de texto e checkbox
+            text_frame = tk.Frame(item_frame)
+            text_frame.pack(side="left", fill="both", expand=True)
+            row_widgets.append(text_frame)
+
+            # Imagem da referência: rótulo destacado e checkbox desabilitado
+            # (impossível selecionar, mesmo clicando)
+            if is_ref:
+                lbl_ref = tk.Label(text_frame, text="REFERÊNCIA (protegida)", fg="white",
+                                   bg="#2E7D32", font=("Arial", 9, "bold"), padx=4)
+                lbl_ref.pack(anchor="w")
+                row_widgets.append(lbl_ref)
+
+            # Checkbutton usando o IntVar já existente
+            chk = tk.Checkbutton(text_frame, text="Selecionar", variable=var,
+                                 state="disabled" if is_ref else "normal")
+            chk.pack(anchor="w")
+
+            # Verifica se a imagem é idêntica (MD5 duplicado) ou apenas semelhante
+            if md5_count[md5_val] > 1:
+                status = "Idêntica"
+            else:
+                status = "Semelhante"
+
+            # Metadados do arquivo (protegido: o arquivo pode ter sido
+            # movido/excluído por uma ação anterior nesta mesma tela)
+            origin_text = "Origem: REFERÊNCIA (protegida)\n" if is_ref else ""
+            try:
+                st = os.stat(filepath)
+                ctime_str = datetime.fromtimestamp(st.st_ctime).strftime("%Y-%m-%d %H:%M:%S")
+                mtime_str = datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+                info_text = (
+                    origin_text +
+                    f"Caminho: {filepath}\n"
+                    f"Status: {status}\n"
+                    f"Tamanho: {st.st_size} bytes\n"
+                    f"Criado em: {ctime_str}\n"
+                    f"Modificado em: {mtime_str}\n"
+                )
+            except OSError:
+                info_text = (
+                    origin_text +
+                    f"Caminho: {filepath}\n"
+                    f"Status: {status}\n"
+                    f"Arquivo não encontrado (movido ou excluído)\n"
+                )
+
+            lbl_info = tk.Label(text_frame, text=info_text, justify="left", anchor="w",
+                                cursor="" if is_ref else "hand2")
+            lbl_info.pack(anchor="w")
+            row_widgets.append(lbl_info)
+            for w in row_widgets:
+                w.bind("<Button-1>", toggle_row)
+
+        # Repete a navegação no fim de grupos grandes (evita rolar até o topo)
+        if len(images) > MAX_IMAGES_PER_GROUP_DISPLAY:
+            self._render_group_nav(frame, idx, images, offset)
+        return frame
+
+    def _scroll_anchor_for(self, idx):
+        """Posição vertical (px) a manter ao remover o grupo idx da vista:
+           o menor entre o topo visível e o topo do grupo."""
+        frame = self.group_frames.get(idx)
+        try:
+            if frame is not None and frame.winfo_exists():
+                return max(0, min(self.canvas.canvasy(0), frame.winfo_y()))
+        except tk.TclError:
+            pass
+        return None
+
+    def verify_group(self, idx):
+        """Tira o grupo da fila de pendentes e o coloca em 'verificados'."""
+        if idx not in self.pending_idx:
+            return
+        self.pending_idx.remove(idx)
+        self.verified_idx.append(idx)
+        self._update_view_toggle()
+        if self.view_mode == "pending":
+            self._remove_group_from_page(idx)
+        else:
+            self.render_page()
+
+    def unverify_group(self, idx):
+        """Devolve o grupo à fila de pendentes, na posição original."""
+        if idx not in self.verified_idx:
+            return
+        self.verified_idx.remove(idx)
+        bisect.insort(self.pending_idx, idx)
+        self._update_view_toggle()
+        if self.view_mode == "verified":
+            self._remove_group_from_page(idx)
+        else:
+            self.render_page()
+
+    def _remove_group_from_page(self, idx):
+        """
+        Atualização incremental: destrói só o frame do grupo que saiu da vista
+        e puxa o próximo grupo da fila para o FIM da página. Os demais grupos
+        não são redesenhados (rápido) e o grupo seguinte ocupa exatamente o
+        lugar do removido (o cursor fica sobre o mesmo botão).
+        """
+        visible = self._visible_groups()
+        start = self.current_page * self.groups_per_page
+        end = start + self.groups_per_page
+        frame = self.group_frames.pop(idx, None)
+        if start >= len(visible) or frame is None:
+            # Página ficou vazia (volta uma página) ou frame desconhecido
+            self.render_page()
+            return
+        try:
+            top = self.canvas.canvasy(0)
+            frame.destroy()
+        except tk.TclError:
+            self.render_page()
+            return
+        if len(visible) >= end:
+            self._render_group(visible[end - 1])
+        self._update_page_info()
+        self._scroll_to_px(max(0, top))
+
+    def select_and_verify(self, idx, kind):
+        """Botão de seleção de um grupo pendente: seleciona e verifica."""
+        self.select_group(idx, kind)
+        self.verify_group(idx)
+
+    def toggle_view(self):
+        """Alterna entre a fila de pendentes e a lista de verificados."""
+        self.page_by_view[self.view_mode] = self.current_page
+        self.view_mode = "verified" if self.view_mode == "pending" else "pending"
+        self.current_page = self.page_by_view[self.view_mode]
+        self._update_view_toggle()
+        self.render_page()
+
+    def _update_view_toggle(self):
+        btn = getattr(self, 'view_toggle_btn', None)
+        if btn is None:
+            return
+        try:
+            if self.view_mode == "pending":
+                btn.config(text=f"Grupos verificados ({len(self.verified_idx)})")
+            else:
+                btn.config(text=f"← Voltar aos pendentes ({len(self.pending_idx)})")
+        except tk.TclError:
+            pass
+
+    def open_preview(self, group_idx, pos):
+        """
+        Pré-visualização grande de uma imagem do grupo. Setas esquerda/direita
+        navegam pelas imagens do MESMO grupo (todas, inclusive as fora da faixa
+        exibida), Espaço alterna a seleção, Esc ou clique fora da imagem fecha.
+        """
+        images = self.group_check_vars[group_idx]['images']
+        n = len(images)
+        if n == 0:
+            return
+        # Só uma pré-visualização por vez: fecha a anterior, se existir
+        prev = getattr(self, 'preview_window', None)
+        if prev is not None:
+            try:
+                if prev.winfo_exists():
+                    prev.grab_release()
+                    prev.destroy()
+            except tk.TclError:
+                pass
+            self.preview_window = None
+        win = tk.Toplevel(self.groups_window)
+        self.preview_window = win
+        win.configure(bg="#111111")
+        win.transient(self.groups_window)
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        w, h = int(sw * 0.85), int(sh * 0.85)
+        win.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
+
+        lbl_info = tk.Label(win, fg="white", bg="#111111", font=("Segoe UI", 10),
+                            justify="center", wraplength=w - 40)
+        lbl_info.pack(side="bottom", fill="x", pady=(0, 8))
+        lbl_hint = tk.Label(win, fg="#AAAAAA", bg="#111111", font=("Segoe UI", 9),
+                            text="← → navegar no grupo   |   Espaço selecionar/desmarcar   |   Esc ou clique fora fecha")
+        lbl_hint.pack(side="bottom", fill="x", pady=(0, 6))
+        lbl_img = tk.Label(win, bg="#111111")
+        lbl_img.pack(expand=True)
+
+        state = {'pos': pos % n}
+
+        def refresh():
+            info = images[state['pos']]
+            fp = info['filepath']
+            try:
+                with Image.open(fp) as im:
+                    im.load()
+                    im.thumbnail((w - 40, h - 90))
+                    photo = ImageTk.PhotoImage(im)
+                lbl_img.config(image=photo, text="")
+                lbl_img.image = photo
+            except Exception as e:
+                log.warning("Erro ao carregar pré-visualização %s: %s", fp, e)
+                lbl_img.config(image="", text="(Erro ao carregar a imagem)", fg="white")
+                lbl_img.image = None
+            sel = "SELECIONADA" if info['var'].get() == 1 else "não selecionada"
+            ref = "   |   REFERÊNCIA (protegida)" if info.get('is_reference') else ""
+            lbl_info.config(text=f"Grupo {group_idx + 1}: imagem {state['pos'] + 1} de {n}   |   "
+                                 f"{sel}{ref}\n{fp}")
+            win.title(f"Pré-visualização: {os.path.basename(fp)}")
+
+        def go(delta):
+            state['pos'] = (state['pos'] + delta) % n
+            refresh()
+
+        def toggle(event=None):
+            info = images[state['pos']]
+            if not info.get('is_reference'):
+                info['var'].set(0 if info['var'].get() else 1)
+                refresh()
+
+        def close(event=None):
+            if self.preview_window is win:
+                self.preview_window = None
+            try:
+                win.grab_release()
+                win.destroy()
+            except tk.TclError:
+                pass
+
+        def click(event):
+            # Clique fora da imagem fecha; na imagem, não faz nada
+            if event.widget is not lbl_img:
+                close()
+
+        win.bind("<Left>", lambda e: go(-1))
+        win.bind("<Right>", lambda e: go(1))
+        win.bind("<space>", toggle)
+        win.bind("<Escape>", close)
+        win.bind("<Button-1>", click)
+        win.protocol("WM_DELETE_WINDOW", close)
+        refresh()
+        win.focus_force()
+        # Modal: enquanto aberta, cliques na lista de grupos não passam
+        try:
+            win.grab_set()
+        except tk.TclError:
+            pass
 
     def _render_group_nav(self, frame, idx, images, offset):
         """Barra de navegação interna de um grupo grande: mostra a faixa exibida,
@@ -2396,11 +2753,7 @@ class ImageCleaner:
             self.group_page_offset[group_idx] = new_offset
             # Preserva a posição de rolagem: trocar de faixa dentro de um grupo
             # não deve jogar o usuário de volta ao topo da página.
-            scroll_pos = self.canvas.yview()[0]
-            self.render_page()
-            self.canvas.update_idletasks()
-            self.canvas.configure(scrollregion=self.canvas.bbox("all"))
-            self.canvas.yview_moveto(scroll_pos)
+            self.render_page(keep_scroll_px=max(0, self.canvas.canvasy(0)))
 
         btn_next = tk.Button(nav, text=f"{MAX_IMAGES_PER_GROUP_DISPLAY} seguintes ▶",
                              command=lambda: go(offset + MAX_IMAGES_PER_GROUP_DISPLAY),
@@ -2419,47 +2772,60 @@ class ImageCleaner:
 
     def next_page(self):
         """Navega para a próxima página"""
-        total_pages = (len(self.groups) + self.groups_per_page - 1) // self.groups_per_page
+        total_pages = (len(self._visible_groups()) + self.groups_per_page - 1) // self.groups_per_page
         if self.current_page < total_pages - 1:
             self.current_page += 1
             self.render_page()
 
-    def select_identical_images(self):
-        """Seleciona automaticamente imagens idênticas (mesmo MD5).
-           Sem pasta de referência: mantém a mais antiga de cada subgrupo.
-           Com referência: mantém a cópia do acervo (a lógica de decisão está
-           em plan_identical_selection, testável sem interface)."""
-        selected_count = 0
+    def _plan_for_group(self, group_data, kind):
+        """Índices a selecionar num grupo: kind = "identical" | "similar"."""
+        images = group_data['images']
+        if kind == "identical":
+            return plan_identical_selection(images)
+        return plan_similar_selection(images, group_data['md5_count'])
 
-        # Itera sobre todos os grupos
-        for group_idx, group_data in self.group_check_vars.items():
-            images = group_data['images']
-            for i in plan_identical_selection(images):
-                images[i]['var'].set(1)
+    def select_group(self, group_idx, kind):
+        """Seleção automática (idênticas ou semelhantes) só de UM grupo,
+           sem diálogo: as caixas refletem na hora."""
+        group_data = self.group_check_vars[group_idx]
+        for i in self._plan_for_group(group_data, kind):
+            group_data['images'][i]['var'].set(1)
+
+    def select_identical_images(self):
+        """Seleciona automaticamente imagens idênticas (mesmo MD5) em todos os
+           grupos PENDENTES (os já verificados são decisão tomada). Sem pasta de referência: mantém a mais antiga de cada
+           subgrupo. Com referência: mantém a cópia do acervo (a lógica de
+           decisão está em plan_identical_selection, testável sem interface)."""
+        selected_count = 0
+        for idx in self.pending_idx:
+            group_data = self.group_check_vars[idx]
+            for i in self._plan_for_group(group_data, "identical"):
+                group_data['images'][i]['var'].set(1)
                 selected_count += 1
 
         messagebox.showinfo("Seleção Concluída",
                            f"{selected_count} imagens idênticas foram selecionadas (mantendo a mais antiga de cada grupo)."
-                           + self._reference_selection_note())
+                           + self._verified_note() + self._reference_selection_note())
 
     def select_similar_images(self):
-        """Seleciona automaticamente imagens semelhantes (MD5 diferente).
-           Sem pasta de referência: mantém a mais antiga de cada grupo.
-           Com referência: mantém a versão do acervo (a lógica de decisão está
-           em plan_similar_selection, testável sem interface)."""
+        """Seleciona automaticamente imagens semelhantes (MD5 diferente) em
+           todos os grupos PENDENTES (os já verificados são decisão tomada). Sem pasta de referência: mantém a mais antiga de
+           cada grupo. Com referência: mantém a versão do acervo (a lógica de
+           decisão está em plan_similar_selection, testável sem interface)."""
         selected_count = 0
-
-        # Itera sobre todos os grupos
-        for group_idx, group_data in self.group_check_vars.items():
-            images = group_data['images']
-            md5_count = group_data['md5_count']
-            for i in plan_similar_selection(images, md5_count):
-                images[i]['var'].set(1)
+        for idx in self.pending_idx:
+            group_data = self.group_check_vars[idx]
+            for i in self._plan_for_group(group_data, "similar"):
+                group_data['images'][i]['var'].set(1)
                 selected_count += 1
 
         messagebox.showinfo("Seleção Concluída",
                            f"{selected_count} imagens semelhantes foram selecionadas (mantendo a mais antiga de cada grupo)."
-                           + self._reference_selection_note())
+                           + self._verified_note() + self._reference_selection_note())
+
+    def _verified_note(self):
+        n = len(getattr(self, 'verified_idx', []))
+        return f"\n\n{n} grupo(s) já verificados não foram alterados." if n else ""
 
     def _reference_selection_note(self):
         """Complemento das mensagens de seleção no modo comparação
