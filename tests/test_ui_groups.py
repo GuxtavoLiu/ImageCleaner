@@ -231,3 +231,49 @@ def test_badges_e_contadores(app_with_groups):
     app.verify_group(0); root.update()
     assert app.review_label.cget("text") == "Verificados 1 / 2"
     assert float(app.review_progress.cget("value")) == 1.0
+
+
+def _rows_of(app, idx):
+    return sorted(pos for (g, pos) in app.row_widgets if g == idx)
+
+
+def test_grupo_grande_colapsa_e_expande(tk_root, tmp_path, monkeypatch):
+    import shutil
+    root = tk_root
+    for w in root.winfo_children():
+        w.destroy()
+    fx = build_single_fixture(str(tmp_path / "fx"))
+    for i in range(12):                       # 12 cópias de c.jpg: grupo grande só de idênticas
+        shutil.copyfile(os.path.join(fx, "c.jpg"), os.path.join(fx, f"c_{i:02d}.jpg"))
+    for name in ("showinfo", "showerror", "showwarning"):
+        monkeypatch.setattr(messagebox, name, lambda *a, **k: None)
+    monkeypatch.setattr(filedialog, "askdirectory", lambda **k: fx)
+    app = ic.ImageCleaner(root)
+    app.select_folder(); app.use_cache_var.set(0); app.start_scan()
+    t0 = time.time()
+    while time.time() - t0 < 60 and getattr(app, "groups_window", None) is None:
+        root.update(); time.sleep(0.02)
+    root.update()
+    big = next(i for i, g in enumerate(app.groups) if len(g) > ic.COLLAPSE_THRESHOLD)
+    assert len(app.groups[big]) == 13
+    assert _rows_of(app, big) == list(range(ic.COLLAPSE_SHOW))
+    strip_texts = [str(c.cget("text")) for c in app.group_frames[big].winfo_children()
+                   for c in c.winfo_children() if isinstance(c, (tk.Label, tk.Button))]
+    assert any("e mais 9 imagem(ns)" in t for t in strip_texts)
+    assert "Expandir (13)" in strip_texts
+    # seleção automática vale para o grupo inteiro mesmo recolhido
+    app.select_group(big, "identical"); root.update()
+    assert sum(1 for im in app.group_check_vars[big]['images'] if im['var'].get()) == 12
+    # expandir redesenha só o grupo, com todas as linhas e o botão Recolher
+    app.set_group_expanded(big, True); root.update()
+    assert _rows_of(app, big) == list(range(13))
+    buttons = _buttons(app.group_frames[big], [])
+    assert "Recolher" in buttons and not any(b.startswith("Expandir") for b in buttons)
+    app.set_group_expanded(big, False); root.update()
+    assert _rows_of(app, big) == list(range(ic.COLLAPSE_SHOW))
+    # teclas de rolagem não estouram
+    for key in ("<Next>", "<Prior>", "<End>", "<Home>", "<Down>", "<Up>"):
+        app.groups_window.event_generate(key)
+    root.update()
+    for w in root.winfo_children():
+        w.destroy()

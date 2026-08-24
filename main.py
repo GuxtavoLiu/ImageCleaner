@@ -71,6 +71,11 @@ THUMB_CACHE_SIZE = max(500, int(4000 * (100 / THUMB_SIZE) ** 2))
 RENDER_FIRST_CHUNK = 4
 RENDER_CHUNK = 3
 
+# Grupos com mais de COLLAPSE_THRESHOLD imagens (rajadas, dezenas de cópias)
+# aparecem recolhidos: só as COLLAPSE_SHOW primeiras + "e mais N [Expandir]".
+COLLAPSE_THRESHOLD = 8
+COLLAPSE_SHOW = 4
+
 # ---------------------------------------------------------------------------
 # Aparência: uma paleta e um único helper de botões para toda a interface.
 # Tema ttk "vista" (nativo do Windows) para caixas, barras e scrollbars.
@@ -2298,6 +2303,7 @@ class ImageCleaner:
         self.row_widgets = {}               # (idx, pos) -> widgets da linha (para pintar a seleção)
         self.badge_frames = {}              # (idx, pos) -> frame dos rótulos de diferença
         self._counter_pending = False
+        self.group_expanded = {}            # idx -> True quando o usuário expandiu um grupo grande
 
         # Cria janela de progresso
         self.create_groups_progress_window()
@@ -2380,8 +2386,18 @@ class ImageCleaner:
         scroll_container.pack(fill="both", expand=True)
 
         # --- Cria o Canvas ---
-        self.canvas = tk.Canvas(scroll_container)
+        self.canvas = tk.Canvas(scroll_container, highlightthickness=0)
         self.canvas.pack(side="left", fill="both", expand=True)
+        # Rolagem: passo de 40 px (roda do mouse e setas) e teclas de página.
+        # Espaço/Enter ficam livres (alternam a caixa de seleção com foco).
+        self.canvas.configure(yscrollincrement=40)
+        gw = self.groups_window
+        gw.bind("<Next>", lambda e: self.canvas.yview_scroll(1, "pages"))
+        gw.bind("<Prior>", lambda e: self.canvas.yview_scroll(-1, "pages"))
+        gw.bind("<Home>", lambda e: self.canvas.yview_moveto(0))
+        gw.bind("<End>", lambda e: self.canvas.yview_moveto(1))
+        gw.bind("<Down>", lambda e: self.canvas.yview_scroll(3, "units"))
+        gw.bind("<Up>", lambda e: self.canvas.yview_scroll(-3, "units"))
 
         # --- Cria a Scrollbar e vincula ao Canvas ---
         scrollbar = tk.Scrollbar(scroll_container, orient="vertical", command=self.canvas.yview)
@@ -2587,11 +2603,20 @@ class ImageCleaner:
                                  command=lambda grp=group, vars=group_data['check_vars']: self.delete_images(grp, vars))
         btn_delete.pack(side="left", padx=5)
 
+        # Grupos grandes começam recolhidos (só as primeiras imagens)
+        collapsible = len(images) > COLLAPSE_THRESHOLD
+        collapsed = collapsible and not self.group_expanded.get(idx, False)
+        if collapsible and not collapsed:
+            make_button(btn_frame, "Recolher", "light",
+                        command=lambda g=idx: self.set_group_expanded(g, False)).pack(side="left", padx=5)
+
         # Grupos gigantes: exibe MAX_IMAGES_PER_GROUP_DISPLAY por vez, com
         # navegação dentro do grupo (toda imagem marcada continua alcançável).
         # As ações continuam valendo para o grupo inteiro.
         offset = 0
-        if len(images) > MAX_IMAGES_PER_GROUP_DISPLAY:
+        if collapsed:
+            pass
+        elif len(images) > MAX_IMAGES_PER_GROUP_DISPLAY:
             offset = self.group_page_offset.get(idx, 0)
             offset = max(0, min(offset, len(images) - 1))
             offset -= offset % MAX_IMAGES_PER_GROUP_DISPLAY
@@ -2599,8 +2624,8 @@ class ImageCleaner:
             self._render_group_nav(frame, idx, images, offset)
 
         # Exibe cada imagem do grupo usando os IntVar já criados
-        for pos, img_info in enumerate(images[offset:offset + MAX_IMAGES_PER_GROUP_DISPLAY],
-                                       start=offset):
+        rows = images[:COLLAPSE_SHOW] if collapsed else images[offset:offset + MAX_IMAGES_PER_GROUP_DISPLAY]
+        for pos, img_info in enumerate(rows, start=offset):
             filepath = img_info['filepath']
             md5_val = img_info['md5']
             var = img_info['var']
@@ -2708,10 +2733,47 @@ class ImageCleaner:
         # dimensões já lidas pelas miniaturas das linhas renderizadas.
         self._render_badges(idx, images)
 
-        # Repete a navegação no fim de grupos grandes (evita rolar até o topo)
-        if len(images) > MAX_IMAGES_PER_GROUP_DISPLAY:
+        if collapsed:
+            hidden = len(images) - COLLAPSE_SHOW
+            selected = sum(1 for im in images if im['var'].get() == 1)
+            strip = tk.Frame(frame, bg="#FFF8E1", padx=8, pady=6)
+            strip.pack(fill="x", pady=(4, 0))
+            tk.Label(strip, bg="#FFF8E1", fg="#6D4C00", anchor="w", justify="left",
+                     text=(f"… e mais {hidden} imagem(ns) neste grupo ({selected} selecionada(s) no total). "
+                           "As ações de selecionar, mover e excluir valem para o grupo inteiro.")
+                     ).pack(side="left", fill="x", expand=True)
+            make_button(strip, f"Expandir ({len(images)})", "light",
+                        command=lambda g=idx: self.set_group_expanded(g, True)).pack(side="right")
+        elif len(images) > MAX_IMAGES_PER_GROUP_DISPLAY:
+            # Repete a navegação no fim de grupos grandes (evita rolar até o topo)
             self._render_group_nav(frame, idx, images, offset)
         return frame
+
+    def set_group_expanded(self, idx, expanded):
+        """Expande/recolhe um grupo grande, redesenhando só ele (no lugar)."""
+        self.group_expanded[idx] = expanded
+        self._rerender_group(idx)
+
+    def _forget_group_widgets(self, idx):
+        """Descarta as referências de widgets (linhas, badges) de um grupo que
+           vai ser destruído ou redesenhado."""
+        for d in (self.row_widgets, self.badge_frames):
+            for key in [k for k in d if k[0] == idx]:
+                del d[key]
+
+    def _rerender_group(self, idx):
+        """Redesenha um único grupo na mesma posição da página."""
+        old = self.group_frames.get(idx)
+        self._forget_group_widgets(idx)
+        try:
+            top = self.canvas.canvasy(0)
+            new = self._render_group(idx)
+            if old is not None and old.winfo_exists():
+                new.pack_configure(after=old)
+                old.destroy()
+            self._scroll_to_px(max(0, top))
+        except tk.TclError:
+            self.render_page()
 
     def _render_badges(self, idx, images):
         metas = []
@@ -2890,6 +2952,7 @@ class ImageCleaner:
         start = self.current_page * self.groups_per_page
         end = start + self.groups_per_page
         frame = self.group_frames.pop(idx, None)
+        self._forget_group_widgets(idx)
         if start >= len(visible) or frame is None:
             # Página ficou vazia (volta uma página) ou frame desconhecido
             self.render_page()
