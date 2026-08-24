@@ -148,8 +148,8 @@ def test_linha_resolucao_caminho_curto_e_cor(app_with_groups):
     idx, pos, widgets = _row_labels(app, "a_copy.jpg")
     textos = [str(w.cget("text")) for w in widgets if isinstance(w, tk.Label)]
     assert "a_copy.jpg" in textos                       # nome em destaque
-    assert "[ALVO] (raiz)" in textos                    # caminho curto com a tag
-    info_text = next(t for t in textos if t.startswith("Status:"))
+    info_text = next(t for t in textos if "Status:" in t)
+    assert info_text.startswith("[ALVO] (raiz)")        # caminho curto com a tag
     assert "Resolução: 128 x 128 (0,0 MP)" in info_text
     assert "Idêntica" in info_text and "bytes)" in info_text
     # cor da linha acompanha a seleção
@@ -166,7 +166,7 @@ def test_linha_resolucao_caminho_curto_e_cor(app_with_groups):
     assert widgets2[0].cget("bg") == ic.PALETTE["selected_row"]
     # caminho em subpasta
     _, _, w_b = _row_labels(app, "b_copy.png")
-    assert "[ALVO] sub" in [str(w.cget("text")) for w in w_b if isinstance(w, tk.Label)]
+    assert any(str(w.cget("text")).startswith("[ALVO] sub") for w in w_b if isinstance(w, tk.Label))
 
 
 def test_menu_de_contexto_handlers(app_with_groups, monkeypatch):
@@ -190,8 +190,8 @@ def test_menu_de_contexto_handlers(app_with_groups, monkeypatch):
 
 def _badges_of(app, name):
     idx, pos, _ = _row_labels(app, name)
-    frame = app.badge_frames[(idx, pos)]
-    return [str(c.cget("text")) for c in frame.winfo_children()]
+    frame = app.badge_frames.get((idx, pos))       # linhas sem rótulo não têm frame
+    return [str(c.cget("text")) for c in frame.winfo_children()] if frame else []
 
 
 def test_badges_e_contadores(app_with_groups):

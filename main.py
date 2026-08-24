@@ -2814,6 +2814,11 @@ class ImageCleaner:
 
         # Exibe cada imagem do grupo usando os IntVar já criados
         rows = images[:COLLAPSE_SHOW] if collapsed else images[offset:offset + MAX_IMAGES_PER_GROUP_DISPLAY]
+        # Miniaturas primeiro (preenche image_dims), badges depois: assim as
+        # linhas sem rótulo não criam widgets extras.
+        for img_info in rows:
+            self._load_thumbnail(img_info['filepath'])
+        badges = self._badges_for_group(images)
         for pos, img_info in enumerate(rows, start=offset):
             filepath = img_info['filepath']
             md5_val = img_info['md5']
@@ -2856,27 +2861,34 @@ class ImageCleaner:
                 row_widgets.append(lbl_ref)
 
             # Checkbutton usando o IntVar já existente
-            head = tk.Frame(text_frame)
-            head.pack(anchor="w", fill="x")
+            row_badges = badges.get(pos, [])
+            # Sem badges: o checkbox vai direto no text_frame (menos widgets;
+            # no Windows cada widget é uma janela nativa e custa caro)
+            head = tk.Frame(text_frame) if row_badges else text_frame
+            if row_badges:
+                head.pack(anchor="w", fill="x")
             chk = tk.Checkbutton(head, text="Selecionar", variable=var,
                                  state="disabled" if is_ref else "normal")
-            chk.pack(side="left")
-            badge_frame = tk.Frame(head)     # preenchido no fim do grupo (plan_badges)
-            badge_frame.pack(side="left", padx=(10, 0))
-            self.badge_frames[(idx, pos)] = badge_frame
+            chk.pack(side="left" if row_badges else "top", anchor="w")
+            badge_widgets = []
+            if row_badges:
+                badge_frame = tk.Frame(head)
+                badge_frame.pack(side="left", padx=(10, 0))
+                self.badge_frames[(idx, pos)] = badge_frame
+                badge_widgets = [head, badge_frame]
+                for text in row_badges:
+                    bfg, bbg = BADGE_STYLES[text]
+                    tk.Label(badge_frame, text=text, fg=bfg, bg=bbg, font=("Segoe UI", 8),
+                             padx=6, pady=1).pack(side="left", padx=(0, 4))
 
-            # Nome do arquivo em destaque + pasta curta; caminho completo no
-            # tooltip e no menu de contexto
+            # Nome do arquivo em destaque; a pasta curta vai na primeira linha do
+            # bloco de texto; caminho completo no tooltip e no menu de contexto
             tag, rel_dir, name = shorten_path(filepath, self._path_roots())
             lbl_name = tk.Label(text_frame, text=name, font=FONT_BOLD, anchor="w",
                                 cursor="" if is_ref else "hand2")
             lbl_name.pack(anchor="w")
             where = (f"[{tag}] " if tag else "") + (rel_dir or "(raiz)")
-            lbl_path = tk.Label(text_frame, text=where, fg=PALETTE["muted"], anchor="w",
-                                cursor="" if is_ref else "hand2")
-            lbl_path.pack(anchor="w")
             self.create_tooltip(lbl_name, filepath)
-            self.create_tooltip(lbl_path, filepath)
 
             # Verifica se a imagem é idêntica (MD5 duplicado) ou apenas semelhante
             if md5_count[md5_val] > 1:
@@ -2892,12 +2904,14 @@ class ImageCleaner:
                 ctime_str = datetime.fromtimestamp(st.st_ctime).strftime("%Y-%m-%d %H:%M:%S")
                 mtime_str = datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
                 info_text = (
+                    f"{where}\n"
                     f"Status: {status}   |   Resolução: {resolution}\n"
                     f"Tamanho: {format_bytes(st.st_size)} ({st.st_size} bytes)\n"
                     f"Criado em: {ctime_str}   |   Modificado em: {mtime_str}"
                 )
             except OSError:
                 info_text = (
+                    f"{where}\n"
                     f"Status: {status}   |   Resolução: {resolution}\n"
                     f"Arquivo não encontrado (movido ou excluído)"
                 )
@@ -2905,7 +2919,7 @@ class ImageCleaner:
             lbl_info = tk.Label(text_frame, text=info_text, justify="left", anchor="w",
                                 cursor="" if is_ref else "hand2")
             lbl_info.pack(anchor="w")
-            row_widgets.extend([lbl_name, lbl_path, lbl_info])
+            row_widgets.extend([lbl_name, lbl_info])
             for w in row_widgets:
                 w.bind("<Button-1>", toggle_row)
             # Menu de contexto (botão direito) na linha inteira e na miniatura
@@ -2914,13 +2928,9 @@ class ImageCleaner:
                        lambda e, fp=filepath, g=idx, p=pos: self._show_row_menu(e, fp, g, p))
 
             # Cor de fundo da linha conforme a seleção (pintada pelo trace do var)
-            self.row_widgets[(idx, pos)] = [item_frame, text_frame, head, badge_frame, chk,
-                                            lbl_img, lbl_name, lbl_path, lbl_info]
+            self.row_widgets[(idx, pos)] = [item_frame, text_frame, chk, lbl_img,
+                                            lbl_name, lbl_info] + badge_widgets
             self._paint_row(idx, pos)
-
-        # Badges (o que difere entre as imagens): calculados agora, com as
-        # dimensões já lidas pelas miniaturas das linhas renderizadas.
-        self._render_badges(idx, images)
 
         if collapsed:
             hidden = len(images) - COLLAPSE_SHOW
@@ -2964,7 +2974,8 @@ class ImageCleaner:
         except tk.TclError:
             self.render_page()
 
-    def _render_badges(self, idx, images):
+    def _badges_for_group(self, images):
+        """Rótulos de diferença por posição (plan_badges sobre dims/tamanho/mtime)."""
         metas = []
         for info in images:
             fp = info['filepath']
@@ -2976,18 +2987,7 @@ class ImageCleaner:
                 'size': size,
                 'mtime': None if mtime in (None, float("inf")) else mtime,
             })
-        badges = plan_badges(metas)
-        for pos, labels in badges.items():
-            frame = self.badge_frames.get((idx, pos))
-            if frame is None:
-                continue
-            try:
-                for text in labels:
-                    fg, bg = BADGE_STYLES[text]
-                    tk.Label(frame, text=text, fg=fg, bg=bg, font=("Segoe UI", 8),
-                             padx=6, pady=1).pack(side="left", padx=(0, 4))
-            except tk.TclError:
-                pass
+        return plan_badges(metas)
 
     def _path_roots(self):
         """Raízes para encurtar caminhos na tela: alvo e (se houver) referência."""
