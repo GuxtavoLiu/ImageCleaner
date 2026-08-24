@@ -265,6 +265,34 @@ automática mantém a cópia do acervo em vez da mais antiga. Grupos só com
 imagens da referência não são exibidos; a checkbox "Mostrar duplicatas
 internas da pasta alvo" controla os grupos sem par no acervo.
 
+### Tela de grupos: como revisar rápido
+- **Fila de revisão**: "Selecionar Idênticas/Semelhantes" ou "Marcar verificado ✓" de
+  um grupo tira o grupo dos pendentes; o próximo sobe para o mesmo lugar. Os
+  verificados ficam em "Grupos verificados (N)" (com "Voltar para pendentes").
+  "Selecionar Todas ..." age só nos pendentes; "Mover/Excluir Todas Selecionadas"
+  valem para tudo.
+- **Linha da imagem**: nome em destaque, pasta curta `[ALVO]/[REF]` (caminho completo
+  no tooltip), resolução, tamanho, datas e rótulos "maior resolução", "mais antiga",
+  "maior arquivo" (só quando há diferença). Clique na linha alterna a seleção
+  (linha fica verde-clara); clique na miniatura abre a pré-visualização; botão direito
+  abre/copia caminho ou abre a pasta no Explorer.
+- **Pré-visualização lado a lado**: até 3 imagens do grupo com metadados;
+  ← → mudam a coluna atual, Espaço seleciona/desmarca, Enter = "Manter esta
+  (selecionar as outras)", Esc fecha. Nunca seleciona a referência.
+- **Barra de status**: progresso "Verificados x / N" e "Selecionadas: n (GB)".
+- **Teclado**: F1/F2 páginas, PageUp/PageDown/Home/End/↑/↓ rolagem.
+- **Grupos grandes** (mais de 8 imagens) aparecem recolhidos: "Expandir" mostra tudo;
+  as ações valem sempre para o grupo inteiro.
+- **Segurança**: "Excluir" envia para a **Lixeira do Windows** (`send2trash`; sem ela o
+  app recusa excluir). Cada sessão com ações gera um CSV em
+  `%LOCALAPPDATA%\ImageCleaner\relatorios\`. Menu "Mais ▾": "Desfazer último lote
+  (mover)" devolve os arquivos movidos e os re-seleciona; exclusões se restauram pela
+  Lixeira.
+- **Lembrança**: últimas pastas (menus "Recentes ▾") e opções ficam em
+  `%LOCALAPPDATA%\ImageCleaner\settings.json`.
+- Ajustes no topo do `main.py`: `THUMB_SIZE` (miniaturas, padrão 200 px),
+  `COLLAPSE_THRESHOLD`, `PREVIEW_COLUMNS`, paleta `PALETTE`/`BUTTON_KINDS`.
+
 ### Diagnóstico sem interface (útil para validar o `.exe`)
 ```bash
 ImageCleaner.exe --selftest PASTA
