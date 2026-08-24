@@ -1,5 +1,6 @@
 import bisect
 import csv
+import json
 import os
 import subprocess
 import hashlib
@@ -251,6 +252,56 @@ def get_hash_cache_path():
 
 def get_log_path():
     return os.path.join(get_app_data_dir(), "imagecleaner.log")
+
+
+def get_settings_path():
+    return os.path.join(get_app_data_dir(), "settings.json")
+
+
+DEFAULT_SETTINGS = {
+    "recent_targets": [],        # últimas pastas alvo (mais recente primeiro)
+    "recent_references": [],     # últimas pastas de referência
+    "scan_subfolders": 1,
+    "use_cache": 1,
+    "confirm_similar": 1,
+    "show_target_only": 1,
+}
+RECENT_LIMIT = 5
+
+
+def load_settings(path=None):
+    """Lê o settings.json; arquivo ausente/corrompido => padrões (com log)."""
+    settings = dict(DEFAULT_SETTINGS)
+    path = path or get_settings_path()
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            for key in DEFAULT_SETTINGS:
+                if key in data and type(data[key]) is type(DEFAULT_SETTINGS[key]):
+                    settings[key] = data[key]
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log.warning("Configurações: %s ilegível (%s); usando padrões", path, e)
+    return settings
+
+
+def save_settings(settings, path=None):
+    """Grava o settings.json (erro só vai para o log)."""
+    path = path or get_settings_path()
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(settings, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log.warning("Configurações: falha ao gravar %s: %s", path, e)
+
+
+def push_recent(items, folder, limit=RECENT_LIMIT):
+    """Nova lista de recentes com `folder` na frente (sem duplicar, limitada)."""
+    key = cache_key(folder)
+    rest = [f for f in items if cache_key(f) != key]
+    return [folder] + rest[:limit - 1]
 
 
 def get_reports_dir():
@@ -1415,7 +1466,45 @@ class ImageCleaner:
         self.confirm_stats = None       # estatísticas da confirmação por dhash (se ligada)
         self.session_report = SessionReport()   # CSV criado no primeiro registro
         self.action_log = []            # lotes de ações desta sessão (para "Desfazer")
+        self.settings = load_settings()
         self.create_widgets()
+        self._apply_settings()
+
+    def _apply_settings(self):
+        """Opções e últimas pastas da sessão anterior (se ainda existirem)."""
+        st = self.settings
+        self.scan_subfolders_var.set(st["scan_subfolders"])
+        self.use_cache_var.set(st["use_cache"])
+        self.confirm_similar_var.set(st["confirm_similar"] if CONFIRM_SIMILAR else 0)
+        self.show_target_only_var.set(st["show_target_only"])
+        targets = [f for f in st["recent_targets"] if os.path.isdir(f)]
+        refs = [f for f in st["recent_references"] if os.path.isdir(f)]
+        if targets:
+            self._apply_target_folder(targets[0])
+            if refs and not folder_conflict(targets[0], refs[0]):
+                self._apply_reference_folder(refs[0])
+
+    def _save_settings(self):
+        """Grava opções e pastas atuais (chamado ao iniciar o escaneamento)."""
+        st = self.settings
+        st["scan_subfolders"] = self.scan_subfolders_var.get()
+        st["use_cache"] = self.use_cache_var.get()
+        st["confirm_similar"] = self.confirm_similar_var.get()
+        st["show_target_only"] = self.show_target_only_var.get()
+        if self.selected_folder:
+            st["recent_targets"] = push_recent(st["recent_targets"], self.selected_folder)
+        if self.reference_folder:
+            st["recent_references"] = push_recent(st["recent_references"], self.reference_folder)
+        save_settings(st)
+
+    def _fill_recent_menu(self, menu, key, apply):
+        """Preenche um menu 'Recentes' com as pastas que ainda existem."""
+        menu.delete(0, "end")
+        folders = [f for f in self.settings.get(key, []) if os.path.isdir(f)]
+        if not folders:
+            menu.add_command(label="(nenhuma pasta recente)", state="disabled")
+        for f in folders:
+            menu.add_command(label=f, command=lambda p=f: apply(p))
 
     def create_widgets(self):
         # Janela inicial: tamanho decente e centralizada (só aparência; o
@@ -1444,10 +1533,15 @@ class ImageCleaner:
         )
         steps.pack(anchor="w", padx=20, pady=(14, 6))
 
-        self.select_btn = make_button(self.master, "Selecionar Pasta", "primary",
+        folder_row = tk.Frame(self.master)
+        folder_row.pack(pady=10)
+        self.select_btn = make_button(folder_row, "Selecionar Pasta", "primary",
                                       command=self.select_folder,
                                       font=("Segoe UI", 10, "bold"), padx=18, pady=6)
-        self.select_btn.pack(pady=10)
+        self.select_btn.pack(side="left")
+        self.recent_targets_mb = self._make_recent_menubutton(
+            folder_row, "recent_targets", self._apply_target_folder)
+        self.recent_targets_mb.pack(side="left", padx=(6, 0))
 
         # Label para exibir o caminho selecionado
         self.path_label = tk.Label(self.master, text="", fg="blue", wraplength=600)
@@ -1520,6 +1614,9 @@ class ImageCleaner:
             command=self.select_reference_folder
         )
         self.reference_btn.pack(side="left")
+        self.recent_refs_mb = self._make_recent_menubutton(
+            ref_row, "recent_references", self._apply_reference_folder)
+        self.recent_refs_mb.pack(side="left", padx=(4, 0))
         self.reference_clear_btn = make_button(
             ref_row, "Remover referência", "light", command=self.clear_reference_folder,
             state="disabled"
@@ -1553,6 +1650,14 @@ class ImageCleaner:
                                      font=("Segoe UI", 10, "bold"), padx=18, pady=6)
         # Não exibe o botão nem o frame de subpastas inicialmente
 
+    def _make_recent_menubutton(self, parent, key, apply):
+        mb = tk.Menubutton(parent, text="Recentes ▾", relief="flat", bg="#E0E0E0",
+                           activebackground="#BDBDBD", padx=8, pady=4, cursor="hand2")
+        menu = tk.Menu(mb, tearoff=0)
+        menu.configure(postcommand=lambda m=menu: self._fill_recent_menu(m, key, apply))
+        mb["menu"] = menu
+        return mb
+
     def create_tooltip(self, widget, text):
         """Cria um tooltip para um widget"""
         def on_enter(event):
@@ -1578,28 +1683,34 @@ class ImageCleaner:
     def select_folder(self):
         folder = filedialog.askdirectory(title="Selecione a pasta com imagens")
         if folder:
-            self.selected_folder = folder
-            self.path_label.config(text=f"Pasta selecionada: {folder}")
-            self.subfolder_frame.pack(pady=5)
-            self.reference_container.pack(pady=5)
-            self.start_btn.pack(pady=10)
-            # O alvo pode ter sido trocado por uma pasta que engloba (ou está
-            # dentro) da referência já escolhida: nesse caso a referência cai.
-            if self.reference_folder:
-                reason = folder_conflict(folder, self.reference_folder)
-                if reason:
-                    messagebox.showerror(
-                        "Pastas em conflito",
-                        f"A pasta de referência foi removida: {reason}.\n"
-                        "Escolha pastas separadas (uma não pode conter a outra)."
-                    )
-                    self.clear_reference_folder()
+            self._apply_target_folder(folder)
+
+    def _apply_target_folder(self, folder):
+        """Define a pasta alvo (pelo diálogo, pelos recentes ou pelas configurações)."""
+        self.selected_folder = folder
+        self.path_label.config(text=f"Pasta selecionada: {folder}")
+        self.subfolder_frame.pack(pady=5)
+        self.reference_container.pack(pady=5)
+        self.start_btn.pack(pady=10)
+        # O alvo pode ter sido trocado por uma pasta que engloba (ou está
+        # dentro) da referência já escolhida: nesse caso a referência cai.
+        if self.reference_folder:
+            reason = folder_conflict(folder, self.reference_folder)
+            if reason:
+                messagebox.showerror(
+                    "Pastas em conflito",
+                    f"A pasta de referência foi removida: {reason}.\n"
+                    "Escolha pastas separadas (uma não pode conter a outra)."
+                )
+                self.clear_reference_folder()
 
     def select_reference_folder(self):
         """Escolhe a pasta de referência (protegida) do modo de comparação."""
         folder = filedialog.askdirectory(title="Selecione a pasta de referência (protegida)")
-        if not folder:
-            return
+        if folder:
+            self._apply_reference_folder(folder)
+
+    def _apply_reference_folder(self, folder):
         reason = folder_conflict(self.selected_folder, folder) if self.selected_folder else None
         if reason:
             messagebox.showerror(
@@ -1631,6 +1742,7 @@ class ImageCleaner:
                     messagebox.showerror("Pastas em conflito",
                                          f"Não é possível iniciar: {reason}.")
                     return
+            self._save_settings()
             self.scan_cancelled = False
             self.close_requested = False
             self.create_progress_window()

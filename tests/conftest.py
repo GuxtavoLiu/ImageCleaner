@@ -18,6 +18,7 @@ import shutil
 import sys
 
 import numpy as np
+import pytest
 from PIL import Image
 
 # Permite importar o main.py da raiz do projeto
@@ -278,3 +279,10 @@ def generate_golden(tmp_root, confirm=False, path=GOLDEN_PATH, builder=build_sin
     with open(path, "w", encoding="utf-8") as f:
         json.dump(snap, f, indent=2, ensure_ascii=False)
     return snap
+
+
+@pytest.fixture(autouse=True)
+def _isolated_app_data(tmp_path, monkeypatch):
+    """Nenhum teste lê ou grava o settings.json/relatórios reais do usuário."""
+    monkeypatch.setattr(ic, "get_settings_path", lambda: str(tmp_path / "settings_test.json"))
+    monkeypatch.setattr(ic, "get_reports_dir", lambda: str(tmp_path / "relatorios_test"))
