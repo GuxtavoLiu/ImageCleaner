@@ -1,0 +1,38 @@
+"""
+Regressão do modo de uma pasta: o resultado completo (grupos, ordem, rótulos
+Idêntica/Semelhante e seleções automáticas) tem que ser idêntico ao snapshot
+dourado gerado com o main.py ANTES do modo de comparação existir.
+
+Para regenerar o snapshot (só se uma mudança de comportamento for
+intencional e validada): python -c "import sys; sys.path.insert(0,'tests');
+import conftest, tempfile; conftest.generate_golden(tempfile.mkdtemp())"
+"""
+import json
+
+import main as ic
+from conftest import GOLDEN_PATH, build_single_fixture, snapshot_single_mode
+
+
+def test_fixture_distancias(tmp_path):
+    import os
+    root = build_single_fixture(str(tmp_path / "fix"))
+    h = lambda n: ic.compute_phash(os.path.join(root, n))
+    assert abs(h("a.jpg") - h("a_q30.jpg")) <= ic.SIMILARITY_THRESHOLD
+    assert abs(h("a.jpg") - h("a_q60.jpg")) <= ic.SIMILARITY_THRESHOLD
+    assert abs(h("a.jpg") - h("c.jpg")) > ic.SIMILARITY_THRESHOLD
+    assert abs(h("a.jpg") - h(os.path.join("sub", "b.png"))) > ic.SIMILARITY_THRESHOLD
+    assert abs(h("c.jpg") - h(os.path.join("sub", "b.png"))) > ic.SIMILARITY_THRESHOLD
+
+
+def test_modo_uma_pasta_igual_ao_snapshot_dourado(tmp_path):
+    root = build_single_fixture(str(tmp_path / "fix"))
+    atual = snapshot_single_mode(root)
+    with open(GOLDEN_PATH, encoding="utf-8") as f:
+        dourado = json.load(f)
+    assert atual == dourado
+
+
+def test_selftest_uma_pasta(tmp_path):
+    root = build_single_fixture(str(tmp_path / "fix"))
+    summary = ic.run_selftest(root)
+    assert summary.startswith("SELFTEST OK: 7 arquivos, 7 hashes, 0 erros, 2 grupos, 4 idênticas")

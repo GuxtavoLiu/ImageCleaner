@@ -36,6 +36,10 @@ Escolha UMA das opções abaixo:
    Resultado: Uma pasta com o programa
    Local: dist\ImageCleaner\
    ⚠️  Copie a PASTA INTEIRA para o pendrive
+   💡 Para bases muito grandes (dezenas de GB), prefira esta opção:
+      abre mais rápido que o .exe único.
+      Cache de hashes e log ficam em %LOCALAPPDATA%\ImageCleaner\
+      (detalhes em README_BUILD.md, seção "bases muito grandes").
 
 
 PASSO 3: Teste o executável

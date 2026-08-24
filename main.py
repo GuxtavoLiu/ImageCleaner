@@ -1,13 +1,281 @@
 import os
 import hashlib
+import logging
+import logging.handlers
+import shutil
+import sqlite3
+import stat
+import sys
+import time
+import traceback
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from PIL import Image, ImageTk, ImageFile
 import imagehash
+import numpy as np
 from datetime import datetime
 
 # Permite carregar imagens truncadas/corrompidas parcialmente
 ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+# ---------------------------------------------------------------------------
+# Configurações de desempenho (pensadas para volumes grandes, ex: 100 GB)
+# ---------------------------------------------------------------------------
+
+# Número de threads usadas para calcular os hashes das imagens.
+# O Pillow libera o GIL durante a decodificação, então threads escalam bem.
+# 8 é um bom equilíbrio: em SSD já é quase o máximo; em HDD externo mais do
+# que isso vira "tempestade de seeks" e piora a leitura sequencial.
+HASH_WORKERS = max(2, min(8, os.cpu_count() or 4))
+
+# JPEGs podem ser decodificados diretamente em escala reduzida (1/2, 1/4, 1/8),
+# o que deixa o cálculo do phash de 2 a 4x mais rápido. O phash já reduz a
+# imagem para 32x32, então o resultado é praticamente o mesmo (em testes com
+# fotos reais, 98% dos hashes ficaram idênticos e o restante variou 2 bits).
+# DESLIGADO por padrão para manter os hashes bit a bit iguais aos da versão
+# anterior. Hashes calculados com e sem esta opção ficam em tabelas de cache
+# separadas, então nunca se misturam.
+USE_FAST_JPEG_DECODE = False
+
+# Tamanho de bloco para leitura de arquivos no cálculo do MD5.
+MD5_CHUNK_SIZE = 1024 * 1024
+
+# Versão do cache de hashes. Se o algoritmo de hash mudar, incremente este
+# número para invalidar caches antigos.
+HASH_CACHE_VERSION = 1
+
+# Extensões de imagem consideradas no escaneamento (comparação case-insensitive).
+VALID_EXTENSIONS = [".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".tif", ".tiff"]
+
+# Quantidade de miniaturas exibidas por vez dentro de um grupo. Grupos maiores
+# ganham botões "anteriores/seguintes" dentro do próprio grupo (para grupos com
+# milhares de imagens não travarem a interface). As ações (selecionar, mover,
+# excluir) continuam valendo para TODAS as imagens do grupo.
+MAX_IMAGES_PER_GROUP_DISPLAY = 200
+
+# Threshold de similaridade (distância de Hamming máxima entre phashes).
+SIMILARITY_THRESHOLD = 10
+
+
+def get_app_data_dir():
+    """Pasta de dados do app (cache e log) em %LOCALAPPDATA%/ImageCleaner."""
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    app_dir = os.path.join(base, "ImageCleaner")
+    os.makedirs(app_dir, exist_ok=True)
+    return app_dir
+
+
+def get_hash_cache_path():
+    """Retorna o caminho do arquivo de cache de hashes."""
+    return os.path.join(get_app_data_dir(), "hash_cache.sqlite")
+
+
+def get_log_path():
+    return os.path.join(get_app_data_dir(), "imagecleaner.log")
+
+
+log = logging.getLogger("imagecleaner")
+
+
+def setup_logging():
+    """
+    Log rotativo em %LOCALAPPDATA%/ImageCleaner/imagecleaner.log (2 MB x 3).
+    Indispensável no .exe (--windowed não tem console): qualquer erro
+    inesperado fica registrado ali. Se não der para criar o arquivo, o
+    programa segue sem log.
+    """
+    if log.handlers:
+        return
+    log.setLevel(logging.INFO)
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    try:
+        handler = logging.handlers.RotatingFileHandler(
+            get_log_path(), maxBytes=2 * 1024 * 1024, backupCount=3, encoding="utf-8"
+        )
+        handler.setFormatter(fmt)
+        log.addHandler(handler)
+    except Exception:
+        pass
+    if sys.stderr is not None:
+        try:
+            console = logging.StreamHandler()
+            console.setFormatter(fmt)
+            log.addHandler(console)
+        except Exception:
+            pass
+
+
+def cache_key(filepath):
+    """Chave normalizada do cache (não altera o caminho usado na interface)."""
+    return os.path.normcase(os.path.abspath(filepath))
+
+
+class HashCache:
+    """
+    Cache persistente (SQLite) de hashes já calculados.
+
+    A chave é (caminho normalizado, tamanho, mtime). Se qualquer um mudar, o
+    cache é ignorado e o hash é recalculado. Isso permite re-escanear pastas
+    enormes quase instantaneamente e retomar escaneamentos cancelados.
+
+    Qualquer erro no cache é tratado silenciosamente: o programa continua
+    funcionando normalmente, apenas sem cache. Só a thread principal usa o cache.
+    """
+    def __init__(self, path=None):
+        self.conn = None
+        self.pending = []
+        self.loaded = {}
+        self.loaded_prefixes = []
+        self.path = path or get_hash_cache_path()
+        mode = "draft" if USE_FAST_JPEG_DECODE else "full"
+        self.table = f"hashes_v{HASH_CACHE_VERSION}_{mode}"
+        try:
+            self.conn = sqlite3.connect(self.path, timeout=5)
+            try:
+                self.conn.execute("PRAGMA journal_mode=WAL")
+                self.conn.execute("PRAGMA busy_timeout=5000")
+            except Exception as e:
+                log.warning("Cache: PRAGMA falhou (%s): %s", self.path, e)
+            self.conn.execute(
+                f"CREATE TABLE IF NOT EXISTS {self.table} ("
+                "path TEXT PRIMARY KEY, size INTEGER, mtime_ns INTEGER, "
+                "phash TEXT, md5 TEXT)"
+            )
+            self.conn.commit()
+        except Exception as e:
+            log.warning("Cache desativado: não foi possível abrir %s: %s", self.path, e)
+            self.conn = None
+
+    @property
+    def active(self):
+        """True se o cache está realmente funcionando (arquivo aberto)."""
+        return self.conn is not None
+
+    def load_prefix(self, root, merge=False):
+        """
+        Carrega em memória, de uma vez, todos os registros sob a pasta `root`
+        (uma consulta por faixa na chave primária, muito mais rápido do que
+        consultar arquivo por arquivo).
+
+        Com merge=True, soma os registros aos já carregados em vez de
+        substituí-los (modo de comparação de duas pastas: uma chamada por raiz).
+        """
+        if not merge:
+            self.loaded = {}
+            self.loaded_prefixes = []
+        if self.conn is None:
+            return
+        try:
+            prefix = cache_key(root).rstrip("\\/") + os.sep
+            # Limite superior da faixa: prefixo com o último caractere incrementado.
+            # (prefixo + "\uffff" perderia caminhos com caracteres fora do BMP,
+            # como emojis, na ordenação binária UTF-8 do SQLite.)
+            upper = prefix[:-1] + chr(ord(prefix[-1]) + 1)
+            rows = self.conn.execute(
+                f"SELECT path, size, mtime_ns, phash, md5 FROM {self.table} "
+                "WHERE path >= ? AND path < ?",
+                (prefix, upper)
+            ).fetchall()
+            self.loaded.update({r[0]: (r[1], r[2], r[3], r[4]) for r in rows})
+            self.loaded_prefixes.append(prefix)
+            log.info("Cache: %d registros carregados para %s", len(rows), root)
+        except Exception as e:
+            # Falha em UMA raiz não invalida as já carregadas: apenas não
+            # registra o prefixo desta (seus arquivos caem na consulta
+            # individual do lookup, que continua funcionando).
+            log.warning("Cache: falha ao carregar registros de %s: %s", root, e)
+
+    def lookup(self, filepath, size, mtime_ns):
+        """Retorna (phash_str, md5_ou_None) se houver cache válido, senão None."""
+        if self.conn is None:
+            return None
+        key = cache_key(filepath)
+        row = self.loaded.get(key)
+        if row is None:
+            # Se a pasta já foi carregada em memória, ausência no dict é ausência
+            # no banco: não vale a pena consultar o SQLite arquivo por arquivo.
+            if any(key.startswith(p) for p in self.loaded_prefixes):
+                return None
+            try:
+                row = self.conn.execute(
+                    f"SELECT size, mtime_ns, phash, md5 FROM {self.table} WHERE path = ?",
+                    (key,)
+                ).fetchone()
+            except Exception as e:
+                log.warning("Cache: falha na consulta de %s: %s", filepath, e)
+                return None
+        if row and row[0] == size and row[1] == mtime_ns:
+            return row[2], row[3]
+        return None
+
+    def store(self, filepath, size, mtime_ns, phash_str, md5=None):
+        """Agenda a gravação de um registro (gravado em lote no flush)."""
+        if self.conn is None:
+            return
+        self.pending.append(("insert", (cache_key(filepath), size, mtime_ns, phash_str, md5)))
+        if len(self.pending) >= 500:
+            self.flush()
+
+    def update_md5(self, filepath, md5):
+        """Agenda a gravação do MD5 de um arquivo já cacheado."""
+        if self.conn is None:
+            return
+        self.pending.append(("md5", (md5, cache_key(filepath))))
+        if len(self.pending) >= 500:
+            self.flush()
+
+    def flush(self):
+        if self.conn is None or not self.pending:
+            return
+        inserts = [args for kind, args in self.pending if kind == "insert"]
+        md5s = [args for kind, args in self.pending if kind == "md5"]
+        self.pending = []
+        insert_sql = (f"INSERT OR REPLACE INTO {self.table} "
+                      "(path, size, mtime_ns, phash, md5) VALUES (?, ?, ?, ?, ?)")
+        update_sql = f"UPDATE {self.table} SET md5 = ? WHERE path = ?"
+        try:
+            if inserts:
+                self.conn.executemany(insert_sql, inserts)
+            if md5s:
+                self.conn.executemany(update_sql, md5s)
+            self.conn.commit()
+        except Exception as e:
+            # Um único registro inválido (ex.: nome de arquivo com surrogate
+            # UTF-16) não pode derrubar o lote inteiro: regrava um a um e
+            # descarta apenas os problemáticos.
+            log.warning("Cache: falha no lote de %d registros (%s); regravando um a um",
+                        len(inserts) + len(md5s), e)
+            dropped = 0
+            for sql, rows in ((insert_sql, inserts), (update_sql, md5s)):
+                for row in rows:
+                    try:
+                        self.conn.execute(sql, row)
+                    except Exception:
+                        dropped += 1
+            try:
+                self.conn.commit()
+            except Exception as e2:
+                log.warning("Cache: commit do lote falhou: %s", e2)
+                return
+            if dropped:
+                log.warning("Cache: %d registro(s) descartado(s) no lote", dropped)
+
+    def close(self):
+        self.flush()
+        if self.conn is not None:
+            try:
+                self.conn.close()
+            except Exception as e:
+                log.warning("Cache: falha ao fechar: %s", e)
+            self.conn = None
+        self.loaded = {}
+        self.loaded_prefixes = []
+
+
+class ScanCancelled(Exception):
+    """Levantada quando o usuário cancela durante o agrupamento."""
+
 
 class UnionFind:
     """Classe simples de Union-Find (Disjoint Set)."""
@@ -39,9 +307,564 @@ def get_file_md5(filepath):
     """
     hash_md5 = hashlib.md5()
     with open(filepath, "rb") as f:
-        for chunk in iter(lambda: f.read(4096), b""):
+        for chunk in iter(lambda: f.read(MD5_CHUNK_SIZE), b""):
             hash_md5.update(chunk)
     return hash_md5.hexdigest()
+
+
+def compute_phash(filepath):
+    """
+    Calcula o perceptual hash (phash) de uma imagem.
+    Para JPEGs, usa decodificação em escala reduzida (muito mais rápida).
+    """
+    with Image.open(filepath) as img:
+        if USE_FAST_JPEG_DECODE and img.format == "JPEG":
+            # O phash trabalha com a imagem em tons de cinza reduzida a 32x32.
+            # Pedimos ao decoder JPEG algo >= 64x64 em modo "L": ele escolhe a
+            # maior redução DCT possível (1/2, 1/4 ou 1/8) sem ficar abaixo disso.
+            img.draft("L", (64, 64))
+        return imagehash.phash(img)
+
+
+def hash_to_int(h):
+    """Converte um ImageHash (matriz de bits) em inteiro Python."""
+    bits = np.asarray(h.hash, dtype=bool).flatten()
+    return int.from_bytes(np.packbits(bits).tobytes(), "big")
+
+
+_POPCOUNT_TABLE = np.array([bin(i).count("1") for i in range(256)], dtype=np.uint8)
+
+
+def _popcount_u64(arr):
+    """Conta bits 1 em cada elemento de um array uint64 (vetorizado)."""
+    if hasattr(np, "bitwise_count"):
+        return np.bitwise_count(arr)
+    # Fallback para numpy antigo: tabela de 8 bits
+    arr = np.ascontiguousarray(arr)
+    return _POPCOUNT_TABLE[arr.view(np.uint8)].reshape(arr.shape + (8,)).sum(axis=-1)
+
+
+def find_similar_groups(hashes, threshold, progress_cb=None, cancel_check=None):
+    """
+    Agrupa índices de imagens cujos hashes têm distância de Hamming <= threshold
+    (fechamento transitivo, via Union-Find), exatamente como a comparação par a
+    par original, porém vetorizada com numpy.
+
+    Retorna a lista de grupos (listas de índices) com mais de 1 elemento,
+    na ordem de aparição do primeiro índice de cada grupo.
+
+    Complexidade: ainda compara todos os pares, mas em blocos numpy
+    (~100k imagens em segundos, contra horas na versão em Python puro).
+
+    progress_cb(feitos, total) é chamado a cada bloco; se cancel_check()
+    retornar True, a função levanta ScanCancelled.
+    """
+    n = len(hashes)
+    uf = UnionFind(n)
+    if n == 0:
+        return []
+
+    # 1) Imagens com hash exatamente igual são unidas diretamente (O(n)).
+    #    Só um representante de cada hash distinto vai para a comparação vetorizada.
+    hash_ints = [hash_to_int(h) for h in hashes]
+    first_index_of_hash = {}
+    unique_indices = []
+    for i, key in enumerate(hash_ints):
+        if key in first_index_of_hash:
+            uf.union(first_index_of_hash[key], i)
+        else:
+            first_index_of_hash[key] = i
+            unique_indices.append(i)
+
+    m = len(unique_indices)
+    if m > 1:
+        bit_length = np.asarray(hashes[0].hash).size
+        if bit_length <= 64:
+            H = np.array([hash_ints[i] for i in unique_indices], dtype=np.uint64)
+            # Tamanho de bloco limitado para manter o uso de memória previsível
+            # (cada bloco compara `block` linhas contra todas as colunas seguintes).
+            block = int(max(16, min(512, 8_000_000 // m)))
+            total_pairs = m * (m - 1) / 2
+            for start in range(0, m, block):
+                if cancel_check and cancel_check():
+                    raise ScanCancelled()
+                if progress_cb:
+                    # progresso em % de pares comparados (o custo por bloco diminui
+                    # ao longo do laço, então contar linhas superestimaria o restante)
+                    done_pairs = start * m - start * (start + 1) / 2
+                    progress_cb(int(100 * done_pairs / total_pairs), 100)
+                end = min(start + block, m)
+                cols = H[start + 1:]
+                if cols.size == 0:
+                    break
+                rows = H[start:end]
+                dist = _popcount_u64(rows[:, None] ^ cols[None, :])
+                rr, cc = np.nonzero(dist <= threshold)
+                gi_all = rr + start
+                gj_all = cc + (start + 1)
+                keep = gj_all > gi_all  # só pares (i < j), evita comparar consigo mesmo
+                gi_all = gi_all[keep]
+                gj_all = gj_all[keep]
+                # Converte em sub-lotes: um bloco pode gerar milhões de pares
+                # (muitas quase-duplicatas); materializar tudo de uma vez
+                # estouraria a memória e deixaria o Cancelar morto.
+                CHUNK = 200_000
+                for k in range(0, gi_all.size, CHUNK):
+                    if k and cancel_check and cancel_check():
+                        raise ScanCancelled()
+                    for gi, gj in zip(gi_all[k:k + CHUNK].tolist(),
+                                      gj_all[k:k + CHUNK].tolist()):
+                        uf.union(unique_indices[gi], unique_indices[gj])
+        else:
+            # Hashes maiores que 64 bits: comparação par a par tradicional
+            for a in range(m):
+                for b in range(a + 1, m):
+                    ia, ib = unique_indices[a], unique_indices[b]
+                    if abs(hashes[ia] - hashes[ib]) <= threshold:
+                        uf.union(ia, ib)
+
+    if progress_cb:
+        progress_cb(100, 100)
+    root_to_group = {}
+    for i in range(n):
+        root_to_group.setdefault(uf.find(i), []).append(i)
+    return [g for g in root_to_group.values() if len(g) > 1]
+
+
+# ---------------------------------------------------------------------------
+# Pipeline de escaneamento (funções puras, sem interface): usadas pela classe
+# ImageCleaner e também pelos testes de regressão.
+# ---------------------------------------------------------------------------
+
+def categorize_scan_error(filepath, e):
+    """Categoriza um erro de processamento de imagem (mesma lógica da versão original)."""
+    error_type = "Desconhecido"
+    error_msg = str(e)
+
+    if "truncated" in error_msg.lower():
+        error_type = "Arquivo Truncado"
+        error_msg = "Imagem incompleta ou corrompida (dados faltando)"
+    elif "broken data stream" in error_msg.lower():
+        error_type = "Dados Corrompidos"
+        error_msg = "Fluxo de dados da imagem está quebrado"
+    elif "cannot identify image file" in error_msg.lower():
+        error_type = "Formato Inválido"
+        error_msg = "Arquivo não é uma imagem válida ou formato não suportado"
+    elif "permission" in error_msg.lower():
+        error_type = "Sem Permissão"
+        error_msg = "Sem permissão para ler o arquivo"
+    else:
+        error_msg = str(e)
+
+    return {
+        'filepath': filepath,
+        'type': error_type,
+        'message': error_msg
+    }
+
+
+def list_image_files(root, recursive, extensions=None, progress_cb=None, cancel_check=None):
+    """
+    Lista as imagens de `root` na MESMA ordem que os.walk (top-down: arquivos da
+    pasta, depois cada subpasta na ordem do sistema), já capturando tamanho e
+    mtime pelo os.scandir (no Windows isso não custa uma chamada extra ao disco).
+
+    Retorna lista de tuplas (filepath, size, mtime_ns). Se o stat falhar,
+    size/mtime ficam None (o arquivo ainda será processado normalmente).
+    Pastas sem permissão são ignoradas, como no os.walk.
+    """
+    exts = set(e.lower() for e in (extensions or VALID_EXTENSIONS))
+    entries = []
+
+    def add_entry(entry):
+        try:
+            st = entry.stat()
+            entries.append((entry.path, st.st_size, st.st_mtime_ns))
+        except OSError:
+            entries.append((entry.path, None, None))
+        if len(entries) % 1000 == 0:
+            if progress_cb:
+                progress_cb(len(entries))
+            if cancel_check and cancel_check():
+                raise ScanCancelled()
+
+    def is_reparse_point(entry):
+        """Junctions/pontos de reparse do Windows: não descer (evita ciclos).
+           No Python 3.12+ is_symlink() não cobre junctions."""
+        try:
+            st = entry.stat(follow_symlinks=False)
+            return bool(getattr(st, "st_file_attributes", 0)
+                        & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
+        except OSError:
+            return True
+
+    def walk(top):
+        # Iterativo (pilha explícita) para não estourar o limite de recursão em
+        # árvores muito profundas; mesma ordem do os.walk top-down.
+        pending = [top]
+        while pending:
+            if cancel_check and cancel_check():
+                return
+            directory = pending.pop()
+            try:
+                with os.scandir(directory) as it:
+                    children = list(it)
+            except OSError:
+                continue
+            subdirs = []
+            for entry in children:
+                try:
+                    if entry.is_dir():
+                        if not entry.is_symlink() and not is_reparse_point(entry):
+                            subdirs.append(entry.path)
+                        continue
+                    if entry.is_file() and os.path.splitext(entry.name)[1].lower() in exts:
+                        add_entry(entry)
+                except OSError:
+                    continue
+            # Empilha em ordem inversa: o primeiro subdiretório é processado primeiro
+            pending.extend(reversed(subdirs))
+
+    try:
+        if recursive:
+            walk(root)
+        else:
+            with os.scandir(root) as it:
+                for entry in it:
+                    try:
+                        if entry.is_file() and os.path.splitext(entry.name)[1].lower() in exts:
+                            add_entry(entry)
+                    except OSError:
+                        continue
+    except ScanCancelled:
+        pass  # cancelado: retorna o que já foi listado (o chamador checa a flag)
+    return entries
+
+
+def _run_parallel_bounded(items, worker, on_result, workers, cancel_check=None):
+    """
+    Executa worker(item) em um ThreadPoolExecutor mantendo no máximo
+    `workers * 4` tarefas em voo (evita criar centenas de milhares de futures
+    de uma vez e permite cancelar quase imediatamente). on_result(retorno) é
+    chamado na thread principal a cada conclusão. Retorna True se cancelado.
+    """
+    cancelled = False
+    executor = ThreadPoolExecutor(max_workers=workers)
+    in_flight = set()
+    next_pos = 0
+    max_in_flight = workers * 4
+    try:
+        while next_pos < len(items) or in_flight:
+            while next_pos < len(items) and len(in_flight) < max_in_flight:
+                in_flight.add(executor.submit(worker, items[next_pos]))
+                next_pos += 1
+            for future in as_completed(list(in_flight)):
+                in_flight.discard(future)
+                on_result(future.result())
+                if cancel_check and cancel_check():
+                    cancelled = True
+                    break
+                # volta a encher a fila assim que houver espaço
+                if len(in_flight) < workers * 2 and next_pos < len(items):
+                    break
+            if cancelled:
+                break
+    except BaseException:
+        cancelled = True
+        raise
+    finally:
+        # Cancelado (ou erro): descarta o que não começou e não espera o resto
+        executor.shutdown(wait=not cancelled, cancel_futures=True)
+    return cancelled
+
+
+def hash_files(entries, cache, workers, progress_cb=None, cancel_check=None):
+    """
+    Calcula o phash de cada arquivo (em paralelo), consultando o cache antes.
+
+    entries: lista de (filepath, size, mtime_ns).
+    Retorna (results, errors_by_idx, cancelled):
+      results[idx]     = (filepath, ImageHash, md5_ou_None) ou None se deu erro
+      errors_by_idx    = {idx: dict de erro}
+      cancelled        = True se o cancelamento foi acionado
+    A ordem dos resultados é a de `entries`, independentemente das threads.
+    """
+    total = len(entries)
+    results = [None] * total
+    errors_by_idx = {}
+    processed = 0
+    cancelled = False
+
+    def report(filepath):
+        if progress_cb:
+            progress_cb(processed, total, filepath)
+
+    # 1) Cache: separa o que ainda precisa ser calculado
+    to_compute = []
+    for idx, (filepath, size, mtime_ns) in enumerate(entries):
+        if idx % 500 == 0:
+            if cancel_check and cancel_check():
+                return results, errors_by_idx, True
+            if progress_cb:
+                progress_cb(processed, total, "(verificando cache)")
+        cached = None
+        if cache is not None and size is not None:
+            cached = cache.lookup(filepath, size, mtime_ns)
+        if cached is not None:
+            try:
+                results[idx] = (filepath, imagehash.hex_to_hash(cached[0]), cached[1])
+                processed += 1
+                continue
+            except Exception:
+                pass  # cache inválido: recalcula
+        to_compute.append(idx)
+    report("(cache)")
+
+    if not to_compute:
+        return results, errors_by_idx, False
+
+    # 2) Hash em paralelo (pool limitado; ver _run_parallel_bounded)
+    def worker(idx):
+        filepath = entries[idx][0]
+        try:
+            return idx, compute_phash(filepath), None
+        except Exception as e:
+            return idx, None, e
+
+    def on_result(result):
+        nonlocal processed
+        idx, hash_val, err = result
+        filepath, size, mtime_ns = entries[idx]
+        if err is None:
+            results[idx] = (filepath, hash_val, None)
+            if cache is not None and size is not None:
+                cache.store(filepath, size, mtime_ns, str(hash_val), None)
+        else:
+            errors_by_idx[idx] = categorize_scan_error(filepath, err)
+        processed += 1
+        report(filepath)
+
+    try:
+        cancelled = _run_parallel_bounded(to_compute, worker, on_result, workers, cancel_check)
+    finally:
+        if cache is not None:
+            cache.flush()
+
+    return results, errors_by_idx, cancelled
+
+
+def md5_for_groups(images_data, stats, groups_idx, cache, workers, progress_cb=None, cancel_check=None):
+    """
+    Calcula o MD5 apenas das imagens que caíram em grupos E que têm pelo menos
+    outra imagem do MESMO tamanho no grupo (MD5 igual implica tamanho igual;
+    tamanho único já garante "Semelhante", sem precisar ler o arquivo).
+
+    images_data: lista de (filepath, ImageHash, md5_ou_None)
+    stats:       lista alinhada de (size, mtime_ns) (ou (None, None))
+    groups_idx:  lista de grupos (listas de índices em images_data)
+    Retorna (md5_by_idx, cancelled). md5_by_idx tem uma string para TODO índice
+    que aparece em groups_idx: MD5 real, ou sentinela única quando não é preciso
+    (tamanho único) ou não foi possível (erro) calcular.
+    """
+    md5_by_idx = {}
+    to_compute = []
+
+    for group in groups_idx:
+        size_count = {}
+        for i in group:
+            size = stats[i][0] if stats[i] else None
+            size_count[size] = size_count.get(size, 0) + 1
+        # Se algum membro está sem tamanho conhecido (stat falhou na listagem),
+        # não dá para usar o pré-filtro nesse grupo: calcula MD5 de todos.
+        unknown_size = None in size_count
+        for i in group:
+            filepath, _, md5_val = images_data[i]
+            size = stats[i][0] if stats[i] else None
+            if md5_val:
+                md5_by_idx[i] = md5_val            # já veio do cache
+            elif not unknown_size and size_count[size] == 1:
+                md5_by_idx[i] = f"SIZE:{size}:{i}"  # único no tamanho => não pode ser idêntica
+            else:
+                to_compute.append(i)
+
+    total = len(to_compute)
+    processed = 0
+    cancelled = False
+    if total == 0:
+        return md5_by_idx, False
+
+    def worker(idx):
+        filepath = images_data[idx][0]
+        try:
+            return idx, get_file_md5(filepath), None
+        except Exception as e:
+            return idx, None, e
+
+    def on_result(result):
+        nonlocal processed
+        idx, md5_val, err = result
+        filepath = images_data[idx][0]
+        if err is None:
+            md5_by_idx[idx] = md5_val
+            if cache is not None:
+                cache.update_md5(filepath, md5_val)
+        else:
+            # Sem MD5 não dá para afirmar que é idêntica: fica "Semelhante"
+            log.warning("MD5 falhou para %s (tratada como Semelhante): %s", filepath, err)
+            md5_by_idx[idx] = f"ERR:{filepath}"
+        processed += 1
+        if progress_cb:
+            progress_cb(processed, total, filepath)
+
+    try:
+        cancelled = _run_parallel_bounded(to_compute, worker, on_result, workers, cancel_check)
+    finally:
+        if cache is not None:
+            cache.flush()
+
+    return md5_by_idx, cancelled
+
+
+def build_groups(images_data, groups_idx, md5_by_idx):
+    """
+    Monta os grupos no formato usado pela interface: lista de listas de tuplas
+    (filepath, ImageHash, md5), na ordem dos índices (mesma ordem de sempre).
+    """
+    groups = []
+    for group in groups_idx:
+        items = []
+        for i in group:
+            filepath, hash_val, md5_val = images_data[i]
+            items.append((filepath, hash_val, md5_by_idx.get(i, md5_val)))
+        groups.append(items)
+    return groups
+
+
+def plan_identical_selection(images):
+    """
+    Decide quais imagens de UM grupo selecionar no botão "Selecionar Idênticas".
+    images: lista de dicts com 'md5', 'mtime' e 'is_reference' (bool).
+    Retorna a lista de índices (posições em `images`) a selecionar.
+
+    Regra por subgrupo de MD5 com 2+ imagens (subgrupos percorridos na ordem
+    de primeira aparição, como sempre foi):
+      - se alguma cópia é da pasta de referência: seleciona TODAS as do alvo
+        (a cópia preservada é a do acervo, independentemente de data);
+      - senão: ordena as do alvo por mtime (sort estável: empate mantém a
+        ordem original) e seleciona todas exceto a primeira (a mais antiga).
+    Índices de imagens da referência nunca aparecem no retorno.
+    """
+    selected = []
+    md5_groups = {}
+    for i, img in enumerate(images):
+        md5_groups.setdefault(img['md5'], []).append(i)
+    for idxs in md5_groups.values():
+        if len(idxs) <= 1:
+            continue
+        targets = [i for i in idxs if not images[i].get('is_reference')]
+        if len(targets) < len(idxs):
+            selected.extend(targets)
+        else:
+            targets.sort(key=lambda i: images[i]['mtime'])
+            selected.extend(targets[1:])
+    return selected
+
+
+def plan_similar_selection(images, md5_count):
+    """
+    Decide a seleção do botão "Selecionar Semelhantes" para UM grupo.
+    images: como em plan_identical_selection; md5_count: contagem de cada MD5
+    no grupo inteiro (inclui as imagens da referência).
+    Candidatas: MD5 único no grupo (não é "Idêntica") e não é da referência.
+      - se o grupo contém ALGUMA imagem da referência: seleciona todas as
+        candidatas (a versão do acervo é a preservada);
+      - senão: com 2+ candidatas, ordena por mtime e seleciona todas exceto a
+        mais antiga; com 0 ou 1 candidata, não seleciona nada.
+    Retorna lista de índices em `images`; nunca inclui referência.
+    """
+    candidates = [i for i, img in enumerate(images)
+                  if md5_count[img['md5']] == 1 and not img.get('is_reference')]
+    if any(img.get('is_reference') for img in images):
+        return candidates
+    if len(candidates) > 1:
+        candidates.sort(key=lambda i: images[i]['mtime'])
+        return candidates[1:]
+    return []
+
+
+# ---------------------------------------------------------------------------
+# Modo de comparação de duas pastas (pasta alvo x pasta de referência protegida)
+# ---------------------------------------------------------------------------
+
+def folder_prefix(folder):
+    """Chave normalizada da pasta com separador final (para teste de prefixo
+       sem confundir 'E:\\Fotos' com 'E:\\Fotos2')."""
+    return cache_key(folder).rstrip("\\/") + os.sep
+
+
+def folder_conflict(target, reference):
+    """
+    Verifica se a pasta alvo e a pasta de referência podem ser comparadas.
+    Retorna uma string com o motivo do conflito, ou None se são disjuntas.
+    """
+    kt = folder_prefix(target)
+    kr = folder_prefix(reference)
+    if kt == kr:
+        return "as duas pastas são a mesma"
+    if kt.startswith(kr):
+        return "a pasta alvo está dentro da pasta de referência"
+    if kr.startswith(kt):
+        return "a pasta de referência está dentro da pasta alvo"
+    return None
+
+
+def merge_scan_entries(target_entries, reference_entries):
+    """
+    Concatena as listagens (alvo primeiro, para os grupos saírem na ordem de
+    caminhada da pasta alvo) e devolve (entries, reference_keys), onde
+    reference_keys é o set de cache_key de TODOS os arquivos listados na
+    referência: a origem é definida por construção (veio da listagem da
+    referência), não por teste de string no caminho.
+    """
+    reference_keys = {cache_key(fp) for (fp, _, _) in reference_entries}
+    overlap = sum(1 for (fp, _, _) in target_entries if cache_key(fp) in reference_keys)
+    if overlap:
+        # Só acontece com junction/atalho escondido: não deduplica (mudaria
+        # índices e ordem), apenas avisa.
+        log.warning("Modo referência: %d arquivo(s) aparecem nas DUAS listagens", overlap)
+    return list(target_entries) + list(reference_entries), reference_keys
+
+
+def filter_groups_for_reference(groups_idx, images_data, reference_keys, hide_target_only=False):
+    """
+    Remove grupos compostos SÓ por imagens da referência (nada a limpar ali).
+    Com hide_target_only=True remove também grupos sem nenhuma imagem da
+    referência (duplicatas internas da pasta alvo). Preserva a ordem dos
+    grupos e a ordem interna dos índices. Deve ser chamada ANTES do MD5,
+    para não ler do disco arquivos de grupos descartados.
+    """
+    out = []
+    for group in groups_idx:
+        in_ref = [cache_key(images_data[i][0]) in reference_keys for i in group]
+        if all(in_ref):
+            continue
+        if hide_target_only and not any(in_ref):
+            continue
+        out.append(group)
+    return out
+
+
+def is_protected_path(filepath, reference_keys, reference_prefix):
+    """
+    Defesa em profundidade para mover/excluir: True se o arquivo veio da
+    listagem da referência (set) OU está sob a raiz da referência (prefixo),
+    mesmo que por algum motivo não esteja no set.
+    """
+    key = cache_key(filepath)
+    if reference_keys and key in reference_keys:
+        return True
+    return bool(reference_prefix) and key.startswith(reference_prefix)
+
 
 class ImageCleaner:
     def __init__(self, master):
@@ -54,6 +877,10 @@ class ImageCleaner:
         self.groups_per_page = 10
         self.group_check_vars = {}  # Armazena check_vars por grupo
         self.scan_errors = []  # Armazena erros de escaneamento
+        # Modo de comparação de duas pastas (vazio = modo normal de uma pasta)
+        self.reference_folder = ""
+        self.reference_keys = set()     # cache_key dos arquivos listados na referência
+        self.reference_prefix = None    # folder_prefix(reference_folder) durante o scan
         self.create_widgets()
 
     def create_widgets(self):
@@ -85,6 +912,60 @@ class ImageCleaner:
                            "Se marcado, o programa irá escanear a pasta selecionada\n"
                            "e todas as suas subpastas recursivamente.\n"
                            "Se desmarcado, apenas a pasta raiz será escaneada.")
+
+        # Checkbox para usar cache de hashes (marcada por padrão)
+        self.use_cache_var = tk.IntVar(value=1)
+        self.cache_check = tk.Checkbutton(
+            self.subfolder_frame,
+            text="Usar cache de hashes",
+            variable=self.use_cache_var
+        )
+        self.cache_check.pack(side="left", padx=(15, 0))
+
+        self.cache_info_label = tk.Label(self.subfolder_frame, text="ℹ️", fg="blue", cursor="hand2")
+        self.cache_info_label.pack(side="left", padx=5)
+        self.create_tooltip(self.cache_info_label,
+                            "Guarda os hashes já calculados em um cache local\n"
+                            "(chave: caminho + tamanho + data de modificação).\n"
+                            "Re-escanear a mesma pasta fica quase instantâneo e\n"
+                            "um escaneamento cancelado pode ser retomado depois.\n"
+                            "Arquivos alterados são sempre recalculados.")
+
+        # Área da pasta de referência (modo comparação; inicialmente oculta)
+        self.reference_container = tk.Frame(self.master)
+        ref_row = tk.Frame(self.reference_container)
+        ref_row.pack(fill="x")
+        self.reference_btn = tk.Button(
+            ref_row, text="Selecionar Pasta de Referência (protegida)...",
+            command=self.select_reference_folder
+        )
+        self.reference_btn.pack(side="left")
+        self.reference_clear_btn = tk.Button(
+            ref_row, text="Remover referência", command=self.clear_reference_folder,
+            state="disabled"
+        )
+        self.reference_clear_btn.pack(side="left", padx=(5, 0))
+        self.reference_info_label = tk.Label(ref_row, text="ℹ️", fg="blue", cursor="hand2")
+        self.reference_info_label.pack(side="left", padx=5)
+        self.create_tooltip(self.reference_info_label,
+                            "Opcional. Compara a pasta selecionada acima (ALVO) com um\n"
+                            "acervo de REFERÊNCIA já organizado.\n"
+                            "Imagens da referência NUNCA são selecionadas, movidas ou\n"
+                            "excluídas: as duplicatas são removidas somente da pasta alvo.\n"
+                            "A referência é sempre escaneada com subpastas.\n"
+                            "Sem referência, o programa funciona no modo normal.")
+        self.reference_path_label = tk.Label(
+            self.reference_container, text="Nenhuma pasta de referência (modo normal)",
+            fg="#2E7D32", wraplength=400
+        )
+        self.reference_path_label.pack(pady=(3, 0))
+        self.show_target_only_var = tk.IntVar(value=1)
+        self.show_target_only_check = tk.Checkbutton(
+            self.reference_container,
+            text="Mostrar duplicatas internas da pasta alvo (sem par na referência)",
+            variable=self.show_target_only_var
+        )
+        # (exibido só quando há referência selecionada; ver select_reference_folder)
 
         # Botão Iniciar (inicialmente oculto)
         self.start_btn = tk.Button(self.master, text="Iniciar", command=self.start_scan)
@@ -118,25 +999,86 @@ class ImageCleaner:
             self.selected_folder = folder
             self.path_label.config(text=f"Pasta selecionada: {folder}")
             self.subfolder_frame.pack(pady=5)
+            self.reference_container.pack(pady=5)
             self.start_btn.pack(pady=10)
+            # O alvo pode ter sido trocado por uma pasta que engloba (ou está
+            # dentro) da referência já escolhida: nesse caso a referência cai.
+            if self.reference_folder:
+                reason = folder_conflict(folder, self.reference_folder)
+                if reason:
+                    messagebox.showerror(
+                        "Pastas em conflito",
+                        f"A pasta de referência foi removida: {reason}.\n"
+                        "Escolha pastas separadas (uma não pode conter a outra)."
+                    )
+                    self.clear_reference_folder()
+
+    def select_reference_folder(self):
+        """Escolhe a pasta de referência (protegida) do modo de comparação."""
+        folder = filedialog.askdirectory(title="Selecione a pasta de referência (protegida)")
+        if not folder:
+            return
+        reason = folder_conflict(self.selected_folder, folder) if self.selected_folder else None
+        if reason:
+            messagebox.showerror(
+                "Pastas em conflito",
+                f"Não é possível usar esta referência: {reason}.\n"
+                "Escolha pastas separadas (uma não pode conter a outra)."
+            )
+            return
+        self.reference_folder = folder
+        self.reference_path_label.config(text=f"Referência (protegida): {folder}")
+        self.reference_clear_btn.config(state="normal")
+        self.show_target_only_check.pack(pady=(3, 0))
+
+    def clear_reference_folder(self):
+        """Volta ao modo normal de uma pasta."""
+        self.reference_folder = ""
+        self.reference_path_label.config(text="Nenhuma pasta de referência (modo normal)")
+        self.reference_clear_btn.config(state="disabled")
+        self.show_target_only_check.pack_forget()
 
     def start_scan(self):
         """Inicia o escaneamento quando o usuário clicar no botão Iniciar"""
         if self.selected_folder:
+            if self.reference_folder:
+                # Cinto de segurança: as pastas podem ter sido escolhidas em
+                # qualquer ordem; revalida antes de tocar em qualquer arquivo.
+                reason = folder_conflict(self.selected_folder, self.reference_folder)
+                if reason:
+                    messagebox.showerror("Pastas em conflito",
+                                         f"Não é possível iniciar: {reason}.")
+                    return
+            self.scan_cancelled = False
+            self.close_requested = False
             self.create_progress_window()
             # Agenda o scan para depois que a janela for criada
             self.master.after(100, self.scan_folder)
+
+    def _on_main_window_close(self):
+        """Fechar a janela principal durante um escaneamento: cancela o scan
+           primeiro (para não deixar threads/janelas órfãs) e fecha em seguida."""
+        if getattr(self, 'scan_in_progress', False):
+            self.close_requested = True
+            self.cancel_scan()
+        else:
+            self.master.destroy()
 
     def create_progress_window(self):
         """Cria janela de progresso"""
         self.progress_window = tk.Toplevel(self.master)
         self.progress_window.title("Escaneando Imagens")
-        self.progress_window.geometry("500x150")
+        self.progress_window.geometry("500x200")
         self.progress_window.resizable(False, False)
 
         # Centraliza a janela
         self.progress_window.transient(self.master)
         self.progress_window.grab_set()
+
+        # Fechar a janela pelo "X" equivale a cancelar
+        # (a flag scan_cancelled é zerada em start_scan, não aqui: um pedido de
+        # cancelamento feito entre duas fases não pode ser perdido)
+        self.progress_window.protocol("WM_DELETE_WINDOW", self.cancel_scan)
 
         # Frame principal
         main_frame = tk.Frame(self.progress_window, padx=20, pady=20)
@@ -154,126 +1096,277 @@ class ImageCleaner:
         self.progress_count_label = tk.Label(main_frame, text="0 / 0 imagens", font=("Arial", 9))
         self.progress_count_label.pack(pady=(5, 0))
 
-    def update_progress(self, current, total, filename):
-        """Atualiza a barra de progresso"""
+        # Label de tempo (decorrido / estimado)
+        self.progress_time_label = tk.Label(main_frame, text="", font=("Arial", 9), fg="#555555")
+        self.progress_time_label.pack(pady=(2, 0))
+
+        # Botão cancelar
+        self.progress_cancel_btn = tk.Button(main_frame, text="Cancelar", command=self.cancel_scan)
+        self.progress_cancel_btn.pack(pady=(8, 0))
+
+        self.progress_started_at = time.time()
+        self._last_progress_update = 0.0
+
+    def cancel_scan(self):
+        """Marca o escaneamento atual para ser cancelado"""
+        self.scan_cancelled = True
+        try:
+            if hasattr(self, 'progress_label') and self.progress_window.winfo_exists():
+                self.progress_label.config(text="Cancelando...")
+                self.progress_cancel_btn.config(state="disabled")
+        except tk.TclError:
+            pass
+
+    @staticmethod
+    def _format_seconds(seconds):
+        seconds = int(max(0, seconds))
+        h, rem = divmod(seconds, 3600)
+        m, s = divmod(rem, 60)
+        if h:
+            return f"{h}h {m:02d}m {s:02d}s"
+        return f"{m:02d}m {s:02d}s"
+
+    def update_progress(self, current, total, filename, force=False, unit="imagens"):
+        """Atualiza a barra de progresso (no máximo ~10x por segundo, para não
+           deixar a interface lenta com centenas de milhares de arquivos).
+           Se a janela tiver sido destruída (ex.: app fechado), pede cancelamento."""
+        try:
+            self._update_progress_widgets(current, total, filename, force, unit)
+        except tk.TclError:
+            self.scan_cancelled = True
+
+    def _update_progress_widgets(self, current, total, filename, force, unit):
         if hasattr(self, 'progress_window') and self.progress_window.winfo_exists():
+            now = time.time()
+            if not force and (now - self._last_progress_update) < 0.1 and current != total:
+                return
+            self._last_progress_update = now
+
             # Atualiza o progresso
             progress_percent = (current / total * 100) if total > 0 else 0
             self.progress_bar['value'] = progress_percent
 
             # Atualiza labels
-            self.progress_label.config(text=f"Processando: {os.path.basename(filename)}")
-            self.progress_count_label.config(text=f"{current} / {total} imagens")
+            if not self.scan_cancelled:
+                self.progress_label.config(text=f"Processando: {os.path.basename(filename)}")
+            self.progress_count_label.config(text=f"{current} / {total} {unit}")
 
-            # Força atualização da interface
+            elapsed = now - self.progress_started_at
+            if current > 0 and elapsed > 1:
+                remaining = elapsed * (total - current) / current
+                self.progress_time_label.config(
+                    text=f"Decorrido: {self._format_seconds(elapsed)}   |   "
+                         f"Restante (estimado): {self._format_seconds(remaining)}"
+                )
+            else:
+                self.progress_time_label.config(text=f"Decorrido: {self._format_seconds(elapsed)}")
+
+            # Força atualização da interface (também processa o clique em Cancelar)
             self.progress_window.update()
 
+    def _main_window_alive(self):
+        try:
+            return bool(self.master.winfo_exists())
+        except tk.TclError:
+            return False
+
     def scan_folder(self):
+        """Lista os arquivos e calcula os hashes (em paralelo, com cache e cancelamento)."""
+        self.scan_in_progress = True
+        try:
+            self._scan_folder_impl()
+        except (tk.TclError, RuntimeError) as e:
+            # RuntimeError: tkinter levanta "no default root" (não TclError)
+            # quando a janela principal é destruída no meio da preparação
+            if self.close_requested or not self._main_window_alive():
+                # Janela fechada no meio do processo: encerra em silêncio
+                log.warning("Escaneamento interrompido: janela fechada")
+            else:
+                log.exception("Erro de interface (Tk) durante o escaneamento")
+                if isinstance(e, RuntimeError):
+                    raise
+                self._close_progress_window()
+                try:
+                    messagebox.showerror(
+                        "Erro inesperado",
+                        f"Erro de interface durante o escaneamento: {e}\n\n"
+                        f"Detalhes no log: {get_log_path()}"
+                    )
+                except tk.TclError:
+                    pass
+        except Exception:
+            log.exception("Erro inesperado durante o escaneamento")
+            self._close_progress_window()
+            try:
+                messagebox.showerror(
+                    "Erro inesperado",
+                    "Ocorreu um erro inesperado durante o escaneamento.\n\n"
+                    f"Detalhes no log: {get_log_path()}"
+                )
+            except tk.TclError:
+                pass
+        finally:
+            self.scan_in_progress = False
+            if getattr(self, 'close_requested', False):
+                try:
+                    self.master.destroy()
+                except tk.TclError:
+                    pass
+
+    def _scan_folder_impl(self):
         self.images_data = []
         self.scan_errors = []  # Reseta lista de erros
-        valid_extensions = [".jpg", ".jpeg", ".png", ".bmp", ".gif"]
-
-        total_files = 0
-        processed_files = 0
+        self.file_stats = {}   # filepath -> (size, mtime_ns), reaproveitado depois
+        self.reference_keys = set()
+        self.reference_prefix = None
+        self.scan_origin_counts = None  # (n_alvo, n_referência) no modo comparação
+        ref = self.reference_folder
+        scan_started = time.time()
+        log.info("Iniciando escaneamento de: %s (subpastas=%s, cache=%s, threads=%d)",
+                 self.selected_folder, self.scan_subfolders_var.get() == 1,
+                 self.use_cache_var.get() == 1, HASH_WORKERS)
+        if ref:
+            log.info("Modo referência: pasta protegida = %s (duplicatas internas do alvo: %s)",
+                     ref, "exibidas" if self.show_target_only_var.get() == 1 else "ocultas")
 
         # Verifica se deve escanear subpastas
         scan_subfolders = self.scan_subfolders_var.get() == 1
 
-        # Primeira passagem: contar total de arquivos
-        self.progress_label.config(text="Contando arquivos...")
-        self.progress_window.update()
+        # Cache de hashes (opcional)
+        use_cache = self.use_cache_var.get() == 1
+        self.hash_cache = None
+        if use_cache:
+            self.hash_cache = HashCache()
+            self.hash_cache.load_prefix(self.selected_folder)
+            if ref:
+                self.hash_cache.load_prefix(ref, merge=True)
 
-        file_list = []
-        if scan_subfolders:
-            for root, dirs, files in os.walk(self.selected_folder):
-                for file in files:
-                    if os.path.splitext(file)[1].lower() in valid_extensions:
-                        file_list.append(os.path.join(root, file))
-        else:
+        cancel_check = lambda: self.scan_cancelled
+
+        try:
+            # Primeira passagem: listar arquivos (com feedback, pode demorar em rede/HDD)
+            self.progress_label.config(text="Contando arquivos...")
+            self.progress_window.update()
+
+            def on_listing_progress(count):
+                if self.progress_window.winfo_exists():
+                    self.progress_label.config(text=f"Contando arquivos... {count}")
+                    self.progress_window.update()
+
             try:
-                files = os.listdir(self.selected_folder)
-                for file in files:
-                    filepath = os.path.join(self.selected_folder, file)
-                    if os.path.isfile(filepath) and os.path.splitext(file)[1].lower() in valid_extensions:
-                        file_list.append(filepath)
+                entries = list_image_files(self.selected_folder, scan_subfolders,
+                                           VALID_EXTENSIONS, on_listing_progress, cancel_check)
+                if ref and not self.scan_cancelled:
+                    # A referência é sempre listada com subpastas (é um acervo).
+                    def on_ref_listing_progress(count):
+                        if self.progress_window.winfo_exists():
+                            self.progress_label.config(
+                                text=f"Contando arquivos da referência... {count}")
+                            self.progress_window.update()
+
+                    self.progress_label.config(text="Contando arquivos da referência...")
+                    self.progress_window.update()
+                    ref_entries = list_image_files(ref, True, VALID_EXTENSIONS,
+                                                   on_ref_listing_progress, cancel_check)
+                    n_target = len(entries)
+                    entries, self.reference_keys = merge_scan_entries(entries, ref_entries)
+                    self.reference_prefix = folder_prefix(ref)
+                    self.scan_origin_counts = (n_target, len(ref_entries))
+                    log.info("Modo referência: %d arquivos no alvo, %d na referência",
+                             n_target, len(ref_entries))
             except Exception as e:
-                if hasattr(self, 'progress_window'):
-                    self.progress_window.destroy()
+                self._close_progress_window()
                 messagebox.showerror("Erro", f"Erro ao listar arquivos: {e}")
                 return
 
-        total_files = len(file_list)
+            if self.scan_cancelled:
+                self._close_progress_window()
+                log.info("Escaneamento cancelado durante a listagem")
+                if not self.close_requested:
+                    messagebox.showinfo("Escaneamento Cancelado", "Escaneamento cancelado durante a listagem de arquivos.")
+                return
 
-        if total_files == 0:
-            if hasattr(self, 'progress_window'):
+            total_files = len(entries)
+            log.info("%d arquivos de imagem listados em %.1fs", total_files, time.time() - scan_started)
+            if total_files == 0:
+                self._close_progress_window()
+                messagebox.showinfo("Resultado", "Nenhuma imagem encontrada.")
+                return
+
+            self.file_stats = {fp: (size, mtime_ns) for (fp, size, mtime_ns) in entries}
+
+            # Segunda passagem: hashes (threads), consultando o cache antes.
+            # O MD5 NÃO é calculado aqui: só é necessário para as imagens que
+            # caírem em algum grupo (ver group_images), evitando ler o acervo 2x.
+            self.progress_started_at = time.time()
+            results, errors_by_idx, cancelled = hash_files(
+                entries, self.hash_cache, HASH_WORKERS,
+                progress_cb=self.update_progress, cancel_check=cancel_check
+            )
+
+            self._close_progress_window()
+
+            if cancelled or self.scan_cancelled:
+                processed = sum(1 for r in results if r is not None) + len(errors_by_idx)
+                self.scan_errors = [errors_by_idx[i] for i in sorted(errors_by_idx)]
+                log.info("Escaneamento cancelado: %d de %d processados, %d com erro",
+                         processed, total_files, len(self.scan_errors))
+                for err in self.scan_errors[:200]:
+                    log.info("  erro [%s] %s: %s", err['type'], err['filepath'], err['message'])
+                if self.close_requested:
+                    return
+                cache_ok = self.hash_cache is not None and self.hash_cache.active
+                messagebox.showinfo(
+                    "Escaneamento Cancelado",
+                    f"Escaneamento cancelado. {processed} de {total_files} arquivos foram processados"
+                    + (f" ({len(self.scan_errors)} com erro, listados no log)." if self.scan_errors else ".")
+                    + ("\n\nOs hashes já calculados ficaram no cache: ao escanear novamente,\n"
+                       "o programa continua de onde parou." if cache_ok else "")
+                )
+                return
+
+            # Monta as listas finais na ordem original dos arquivos
+            self.images_data = [r for r in results if r is not None]
+            self.scan_errors = [errors_by_idx[i] for i in sorted(errors_by_idx)]
+            log.info("Hashes concluídos em %.1fs: %d ok, %d com erro",
+                     time.time() - scan_started, len(self.images_data), len(self.scan_errors))
+            for err in self.scan_errors[:200]:
+                log.info("  erro [%s] %s: %s", err['type'], err['filepath'], err['message'])
+
+            # Exibe resumo do escaneamento (processadas = sem erro)
+            self.show_scan_summary(total_files, len(self.images_data))
+
+            # Agrupa (o cache é fechado dentro de group_images)
+            self.group_images(threshold=SIMILARITY_THRESHOLD)
+        finally:
+            self._close_progress_window()
+            if self.hash_cache is not None:
+                self.hash_cache.close()
+                self.hash_cache = None
+
+    def _close_progress_window(self):
+        """Fecha a janela de progresso, se existir"""
+        try:
+            if hasattr(self, 'progress_window') and self.progress_window.winfo_exists():
                 self.progress_window.destroy()
-            messagebox.showinfo("Resultado", "Nenhuma imagem encontrada.")
-            return
-
-        # Segunda passagem: processar arquivos
-        def process_image(filepath):
-            """Processa uma imagem e categoriza erros se houver"""
-            nonlocal processed_files
-            try:
-                # Calcula perceptual hash
-                with Image.open(filepath) as img:
-                    hash_val = imagehash.phash(img)
-                # Calcula MD5 para detectar arquivos idênticos
-                md5_val = get_file_md5(filepath)
-                # Armazena tupla com (caminho, p-hash, md5)
-                self.images_data.append((filepath, hash_val, md5_val))
-                processed_files += 1
-                return True
-            except Exception as e:
-                # Categoriza o erro
-                error_type = "Desconhecido"
-                error_msg = str(e)
-
-                if "truncated" in error_msg.lower():
-                    error_type = "Arquivo Truncado"
-                    error_msg = "Imagem incompleta ou corrompida (dados faltando)"
-                elif "broken data stream" in error_msg.lower():
-                    error_type = "Dados Corrompidos"
-                    error_msg = "Fluxo de dados da imagem está quebrado"
-                elif "cannot identify image file" in error_msg.lower():
-                    error_type = "Formato Inválido"
-                    error_msg = "Arquivo não é uma imagem válida ou formato não suportado"
-                elif "permission" in error_msg.lower():
-                    error_type = "Sem Permissão"
-                    error_msg = "Sem permissão para ler o arquivo"
-                else:
-                    error_msg = str(e)
-
-                self.scan_errors.append({
-                    'filepath': filepath,
-                    'type': error_type,
-                    'message': error_msg
-                })
-                processed_files += 1  # Conta mesmo com erro
-                return False
-
-        # Processa cada arquivo com atualização de progresso
-        for idx, filepath in enumerate(file_list, 1):
-            process_image(filepath)
-            self.update_progress(idx, total_files, filepath)
-
-        # Fecha janela de progresso
-        if hasattr(self, 'progress_window') and self.progress_window.winfo_exists():
-            self.progress_window.destroy()
-
-        # Exibe resumo do escaneamento
-        self.show_scan_summary(total_files, processed_files)
-
-        # Ajuste o threshold conforme necessário
-        self.group_images(threshold=10)
+        except tk.TclError:
+            pass
 
     def show_scan_summary(self, total_files, processed_files):
         """Exibe resumo do escaneamento com detalhes de erros"""
+        # Linha extra só no modo de comparação (modo normal: mensagem intocada)
+        origin_line = ""
+        if self.reference_folder and self.scan_origin_counts:
+            n_target, n_ref = self.scan_origin_counts
+            origin_line = (f"Sendo {n_target} da pasta alvo e {n_ref} da referência "
+                           f"(protegida).\n")
+
         if not self.scan_errors:
             # Sem erros
             message = (
-                f"✓ {processed_files} de {total_files} imagens processadas com sucesso!\n\n"
-                f"⚠️ Ao clicar em OK, o carregamento pode demorar alguns minutos.\n"
+                f"✓ {processed_files} de {total_files} imagens processadas com sucesso!\n"
+                + origin_line +
+                f"\n⚠️ Ao clicar em OK, o carregamento pode demorar alguns minutos.\n"
                 f"Por favor, aguarde."
             )
             messagebox.showinfo("Escaneamento Concluído", message)
@@ -299,6 +1392,7 @@ class ImageCleaner:
             f"✓ Imagens processadas: {success_count}\n"
             f"✗ Imagens com erro: {error_count}\n"
             f"📊 Total encontrado: {total_files}"
+            + (f"\n{origin_line.rstrip()}" if origin_line else "")
         )
 
         tk.Label(summary_frame, text=summary_text, font=("Arial", 10, "bold"),
@@ -376,40 +1470,109 @@ class ImageCleaner:
         # Aguarda o usuário fechar a janela antes de continuar
         error_window.wait_window()
 
-    def group_images(self, threshold=10):
+    def group_images(self, threshold=SIMILARITY_THRESHOLD):
         """
-        Cria um grafo de similaridade usando o Union-Find.
-        Cada imagem é um nó e há uma aresta se diff <= threshold.
+        Agrupa imagens cuja distância de phash é <= threshold (fechamento
+        transitivo via Union-Find, igual à versão original, porém vetorizado),
+        depois calcula o MD5 só das imagens agrupadas para rotular
+        Idêntica/Semelhante, e exibe os grupos.
         """
         n = len(self.images_data)
         if n == 0:
             messagebox.showinfo("Resultado", "Nenhuma imagem encontrada.")
             return
 
-        uf = UnionFind(n)
+        if self.close_requested:
+            return
 
-        # Compara todos os pares de imagens (O(n^2))
-        for i in range(n):
-            for j in range(i+1, n):
-                diff = abs(self.images_data[i][1] - self.images_data[j][1])
-                if diff <= threshold:
-                    uf.union(i, j)
+        hashes = [h for (_, h, _) in self.images_data]
+        t0 = time.time()
+        self.create_progress_window()
+        self.progress_window.title("Agrupando Imagens")
+        self.progress_label.config(text="Comparando imagens (agrupamento por similaridade)...")
+        self.progress_window.update()
+        try:
+            groups_idx = find_similar_groups(
+                hashes, threshold,
+                progress_cb=lambda c, t: self.update_progress(c, t, "comparando pares de imagens", unit="% concluído"),
+                cancel_check=lambda: self.scan_cancelled
+            )
+        except ScanCancelled:
+            self._close_progress_window()
+            log.info("Agrupamento cancelado")
+            if not self.close_requested:
+                messagebox.showinfo("Cancelado", "Agrupamento cancelado.")
+            return
+        finally:
+            self._close_progress_window()
+        log.info("Agrupamento de %d imagens em %.1fs: %d grupos", n, time.time() - t0, len(groups_idx))
 
-        # Agrupa de acordo com o root
-        root_to_group = {}
-        for i in range(n):
-            root_i = uf.find(i)
-            if root_i not in root_to_group:
-                root_to_group[root_i] = []
-            root_to_group[root_i].append(self.images_data[i])
-
-        # Filtra grupos que tenham mais de 1 imagem
-        self.groups = [group for group in root_to_group.values() if len(group) > 1]
-
-        if not self.groups:
+        if self.close_requested:
+            return
+        if self.reference_folder and groups_idx:
+            # Modo comparação: descarta grupos só da referência (nada a limpar)
+            # ANTES do MD5, para não ler do disco arquivos que serão descartados.
+            hide_target_only = self.show_target_only_var.get() == 0
+            before = len(groups_idx)
+            groups_idx = filter_groups_for_reference(
+                groups_idx, self.images_data, self.reference_keys,
+                hide_target_only=hide_target_only)
+            log.info("Modo referência: %d grupos descartados (só referência%s), %d restantes",
+                     before - len(groups_idx),
+                     " ou só alvo" if hide_target_only else "", len(groups_idx))
+            if not groups_idx:
+                messagebox.showinfo(
+                    "Resultado",
+                    "Nenhuma imagem da pasta alvo é duplicata do acervo de referência"
+                    + ("" if hide_target_only else " nem de outra imagem da pasta alvo") + "."
+                )
+                return
+        if not groups_idx:
             messagebox.showinfo("Resultado", "Nenhuma imagem similar encontrada.")
-        else:
-            self.show_groups()
+            return
+
+        # MD5 apenas para as imagens agrupadas (com pré-filtro por tamanho)
+        stats = [self.file_stats.get(fp, (None, None)) for (fp, _, _) in self.images_data]
+        self.create_progress_window()
+        self.progress_window.title("Verificando Imagens Idênticas")
+        self.progress_label.config(text="Verificando arquivos idênticos (MD5)...")
+        self.progress_window.update()
+        try:
+            md5_by_idx, cancelled = md5_for_groups(
+                self.images_data, stats, groups_idx, self.hash_cache, HASH_WORKERS,
+                progress_cb=lambda c, t, f: self.update_progress(c, t, f, unit="arquivos"),
+                cancel_check=lambda: self.scan_cancelled
+            )
+        finally:
+            self._close_progress_window()
+
+        if cancelled or self.scan_cancelled or self.close_requested:
+            log.info("Verificação de MD5 cancelada")
+            if not self.close_requested:
+                messagebox.showinfo("Cancelado", "Verificação de imagens idênticas cancelada.")
+            return
+
+        self.groups = build_groups(self.images_data, groups_idx, md5_by_idx)
+        n_ident = 0
+        for g in self.groups:
+            counts = {}
+            for (_, _, m) in g:
+                counts[m] = counts.get(m, 0) + 1
+            n_ident += sum(1 for (_, _, m) in g if counts[m] > 1)
+        log.info("MD5 concluído em %.1fs: %d imagens idênticas em %d grupos",
+                 time.time() - t0, n_ident, len(self.groups))
+        md5_failures = sum(1 for m in md5_by_idx.values() if m.startswith("ERR:"))
+        if md5_failures:
+            messagebox.showwarning(
+                "Verificação incompleta",
+                f"{md5_failures} arquivo(s) não puderam ser lidos na verificação de "
+                f"idênticas (MD5) e serão exibidos como 'Semelhante'.\n\n"
+                f"Os caminhos estão no log: {get_log_path()}"
+            )
+        # A partir daqui não há mais processamento em lote: o "X" da janela
+        # principal volta a fechar o app imediatamente.
+        self.scan_in_progress = False
+        self.show_groups()
 
     def create_groups_progress_window(self):
         """Cria janela de progresso para inicialização de grupos"""
@@ -455,13 +1618,50 @@ class ImageCleaner:
             # Força atualização da interface
             self.groups_progress_window.update()
 
+    def _get_mtime(self, filepath):
+        """Data de modificação em segundos: usa o valor já lido no escaneamento
+           (evita reler dezenas de milhares de arquivos em disco/rede); se não
+           houver, consulta o disco; se o arquivo sumiu, retorna 0."""
+        stats = getattr(self, 'file_stats', {}).get(filepath)
+        if stats and stats[1] is not None:
+            return stats[1] / 1e9
+        try:
+            return os.path.getmtime(filepath)
+        except OSError:
+            # Data desconhecida (arquivo ilegível/sumido): trata como "mais
+            # recente" para nunca virar o exemplar mantido na seleção
+            # automática no lugar das cópias legíveis.
+            return float("inf")
+
+    def _is_reference(self, filepath):
+        """True se o arquivo veio da listagem da pasta de referência."""
+        return bool(self.reference_keys) and cache_key(filepath) in self.reference_keys
+
+    def _is_protected(self, filepath):
+        """Trava de mover/excluir: nunca tocar em arquivo da referência."""
+        if not self.reference_folder:
+            return False
+        return is_protected_path(filepath, self.reference_keys, self.reference_prefix)
+
+    def _dest_under_reference(self, dest_folder):
+        """True se a pasta de destino de um "Mover" é (ou está dentro de) a
+           pasta de referência: mover para lá alteraria o acervo protegido."""
+        if not self.reference_folder:
+            return False
+        return folder_prefix(dest_folder).startswith(folder_prefix(self.reference_folder))
+
     def initialize_all_groups(self):
         """Inicializa estrutura de dados para todos os grupos antes de renderizar"""
         total_groups = len(self.groups)
 
+        last_update = 0.0
         for idx, group in enumerate(self.groups):
-            # Atualiza progresso
-            self.update_groups_progress(idx + 1, total_groups)
+            # Atualiza progresso (no máximo ~10x por segundo; com dezenas de
+            # milhares de grupos, atualizar a cada grupo deixaria a UI lenta)
+            now = time.time()
+            if idx == 0 or idx + 1 == total_groups or (now - last_update) >= 0.1:
+                self.update_groups_progress(idx + 1, total_groups)
+                last_update = now
 
             check_vars = []
             image_info_list = []
@@ -480,7 +1680,10 @@ class ImageCleaner:
                     'filepath': filepath,
                     'md5': md5_val,
                     'var': var,
-                    'mtime': os.path.getmtime(filepath)
+                    'mtime': self._get_mtime(filepath),
+                    # True só no modo comparação, para arquivos vindos da
+                    # listagem da referência (set vazio no modo normal)
+                    'is_reference': self._is_reference(filepath),
                 })
 
             # Armazena dados do grupo
@@ -496,6 +1699,7 @@ class ImageCleaner:
            dentro de um canvas com scrollbar e paginação."""
         self.current_page = 0
         self.group_check_vars = {}  # Reseta a estrutura
+        self.group_page_offset = {}  # idx do grupo -> primeira imagem exibida (grupos grandes)
 
         # Cria janela de progresso
         self.create_groups_progress_window()
@@ -618,11 +1822,23 @@ class ImageCleaner:
             frame = tk.LabelFrame(self.content_frame, text=f"Grupo {idx + 1}", padx=10, pady=10)
             frame.pack(padx=10, pady=10, fill="x", expand=True)
 
+            # Grupos gigantes: exibe MAX_IMAGES_PER_GROUP_DISPLAY por vez, com
+            # navegação dentro do grupo (toda imagem marcada continua alcançável).
+            # As ações continuam valendo para o grupo inteiro.
+            offset = 0
+            if len(images) > MAX_IMAGES_PER_GROUP_DISPLAY:
+                offset = self.group_page_offset.get(idx, 0)
+                offset = max(0, min(offset, len(images) - 1))
+                offset -= offset % MAX_IMAGES_PER_GROUP_DISPLAY
+                self.group_page_offset[idx] = offset
+                self._render_group_nav(frame, idx, images, offset)
+
             # Exibe cada imagem do grupo usando os IntVar já criados
-            for img_info in images:
+            for img_info in images[offset:offset + MAX_IMAGES_PER_GROUP_DISPLAY]:
                 filepath = img_info['filepath']
                 md5_val = img_info['md5']
                 var = img_info['var']
+                is_ref = img_info.get('is_reference', False)
 
                 # Monta um frame interno para cada imagem
                 item_frame = tk.Frame(frame)
@@ -637,7 +1853,7 @@ class ImageCleaner:
                     lbl_img.image = photo
                     lbl_img.pack(side="left", padx=5)
                 except Exception as e:
-                    print(f"Erro ao carregar imagem {filepath}: {e}")
+                    log.warning("Erro ao carregar miniatura %s: %s", filepath, e)
                     lbl_img = tk.Label(item_frame, text="(Erro ao carregar)")
                     lbl_img.pack(side="left", padx=5)
 
@@ -645,8 +1861,15 @@ class ImageCleaner:
                 text_frame = tk.Frame(item_frame)
                 text_frame.pack(side="left", fill="both", expand=True)
 
+                # Imagem da referência: rótulo destacado e checkbox desabilitado
+                # (impossível selecionar, mesmo clicando)
+                if is_ref:
+                    tk.Label(text_frame, text="REFERÊNCIA (protegida)", fg="white",
+                             bg="#2E7D32", font=("Arial", 9, "bold"), padx=4).pack(anchor="w")
+
                 # Checkbutton usando o IntVar já existente
-                chk = tk.Checkbutton(text_frame, text="Selecionar", variable=var)
+                chk = tk.Checkbutton(text_frame, text="Selecionar", variable=var,
+                                     state="disabled" if is_ref else "normal")
                 chk.pack(anchor="w")
 
                 # Verifica se a imagem é idêntica (MD5 duplicado) ou apenas semelhante
@@ -655,24 +1878,35 @@ class ImageCleaner:
                 else:
                     status = "Semelhante"
 
-                # Metadados do arquivo
-                size_bytes = os.path.getsize(filepath)
-                ctime = os.path.getctime(filepath)
-                mtime = os.path.getmtime(filepath)
-
-                ctime_str = datetime.fromtimestamp(ctime).strftime("%Y-%m-%d %H:%M:%S")
-                mtime_str = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
-
-                info_text = (
-                    f"Caminho: {filepath}\n"
-                    f"Status: {status}\n"
-                    f"Tamanho: {size_bytes} bytes\n"
-                    f"Criado em: {ctime_str}\n"
-                    f"Modificado em: {mtime_str}\n"
-                )
+                # Metadados do arquivo (protegido: o arquivo pode ter sido
+                # movido/excluído por uma ação anterior nesta mesma tela)
+                origin_text = "Origem: REFERÊNCIA (protegida)\n" if is_ref else ""
+                try:
+                    st = os.stat(filepath)
+                    ctime_str = datetime.fromtimestamp(st.st_ctime).strftime("%Y-%m-%d %H:%M:%S")
+                    mtime_str = datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+                    info_text = (
+                        origin_text +
+                        f"Caminho: {filepath}\n"
+                        f"Status: {status}\n"
+                        f"Tamanho: {st.st_size} bytes\n"
+                        f"Criado em: {ctime_str}\n"
+                        f"Modificado em: {mtime_str}\n"
+                    )
+                except OSError:
+                    info_text = (
+                        origin_text +
+                        f"Caminho: {filepath}\n"
+                        f"Status: {status}\n"
+                        f"Arquivo não encontrado (movido ou excluído)\n"
+                    )
 
                 lbl_info = tk.Label(text_frame, text=info_text, justify="left", anchor="w")
                 lbl_info.pack(anchor="w")
+
+            # Repete a navegação no fim de grupos grandes (evita rolar até o topo)
+            if len(images) > MAX_IMAGES_PER_GROUP_DISPLAY:
+                self._render_group_nav(frame, idx, images, offset)
 
             # Botões para mover/excluir do grupo específico
             btn_frame = tk.Frame(frame)
@@ -689,6 +1923,42 @@ class ImageCleaner:
         # Reseta o scroll para o topo
         self.canvas.yview_moveto(0)
 
+    def _render_group_nav(self, frame, idx, images, offset):
+        """Barra de navegação interna de um grupo grande: mostra a faixa exibida,
+           quantas imagens do grupo estão selecionadas (inclusive as fora da faixa)
+           e botões para avançar/voltar dentro do grupo."""
+        total = len(images)
+        end = min(offset + MAX_IMAGES_PER_GROUP_DISPLAY, total)
+        selected = sum(1 for im in images if im['var'].get() == 1)
+
+        nav = tk.Frame(frame, bg="#fff3cd", padx=5, pady=4)
+        nav.pack(fill="x", pady=(0, 5))
+
+        info = (f"⚠️ Grupo com {total} imagens: exibindo {offset + 1} a {end}. "
+                f"Selecionadas neste grupo: {selected} (as ações de selecionar, mover e "
+                f"excluir valem para o grupo inteiro; use os botões para ver as demais).")
+        tk.Label(nav, text=info, fg="#856404", bg="#fff3cd", justify="left",
+                 anchor="w", wraplength=800).pack(side="left", fill="x", expand=True)
+
+        def go(new_offset, group_idx=idx):
+            self.group_page_offset[group_idx] = new_offset
+            # Preserva a posição de rolagem: trocar de faixa dentro de um grupo
+            # não deve jogar o usuário de volta ao topo da página.
+            scroll_pos = self.canvas.yview()[0]
+            self.render_page()
+            self.canvas.update_idletasks()
+            self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+            self.canvas.yview_moveto(scroll_pos)
+
+        btn_next = tk.Button(nav, text=f"{MAX_IMAGES_PER_GROUP_DISPLAY} seguintes ▶",
+                             command=lambda: go(offset + MAX_IMAGES_PER_GROUP_DISPLAY),
+                             state="normal" if end < total else "disabled")
+        btn_next.pack(side="right", padx=3)
+        btn_prev = tk.Button(nav, text=f"◀ {MAX_IMAGES_PER_GROUP_DISPLAY} anteriores",
+                             command=lambda: go(offset - MAX_IMAGES_PER_GROUP_DISPLAY),
+                             state="normal" if offset > 0 else "disabled")
+        btn_prev.pack(side="right", padx=3)
+
     def prev_page(self):
         """Navega para a página anterior"""
         if self.current_page > 0:
@@ -703,70 +1973,72 @@ class ImageCleaner:
             self.render_page()
 
     def select_identical_images(self):
-        """Seleciona automaticamente imagens idênticas (mesmo MD5),
-           deixando apenas a mais antiga de cada grupo não selecionada."""
+        """Seleciona automaticamente imagens idênticas (mesmo MD5).
+           Sem pasta de referência: mantém a mais antiga de cada subgrupo.
+           Com referência: mantém a cópia do acervo (a lógica de decisão está
+           em plan_identical_selection, testável sem interface)."""
         selected_count = 0
 
-        # Itera sobre todos os grupos da página atual
+        # Itera sobre todos os grupos
         for group_idx, group_data in self.group_check_vars.items():
             images = group_data['images']
-            md5_count = group_data['md5_count']
-
-            # Agrupa imagens por MD5
-            md5_groups = {}
-            for img_info in images:
-                md5 = img_info['md5']
-                if md5 not in md5_groups:
-                    md5_groups[md5] = []
-                md5_groups[md5].append(img_info)
-
-            # Para cada MD5 que aparece mais de uma vez (idênticas)
-            for md5, identical_images in md5_groups.items():
-                if len(identical_images) > 1:
-                    # Ordena por data de modificação (mais antiga primeiro)
-                    identical_images.sort(key=lambda x: x['mtime'])
-
-                    # Seleciona todas exceto a primeira (mais antiga)
-                    for img_info in identical_images[1:]:
-                        img_info['var'].set(1)
-                        selected_count += 1
+            for i in plan_identical_selection(images):
+                images[i]['var'].set(1)
+                selected_count += 1
 
         messagebox.showinfo("Seleção Concluída",
-                           f"{selected_count} imagens idênticas foram selecionadas (mantendo a mais antiga de cada grupo).")
+                           f"{selected_count} imagens idênticas foram selecionadas (mantendo a mais antiga de cada grupo)."
+                           + self._reference_selection_note())
 
     def select_similar_images(self):
-        """Seleciona automaticamente imagens semelhantes (MD5 diferente),
-           deixando apenas a mais antiga de cada grupo não selecionada."""
+        """Seleciona automaticamente imagens semelhantes (MD5 diferente).
+           Sem pasta de referência: mantém a mais antiga de cada grupo.
+           Com referência: mantém a versão do acervo (a lógica de decisão está
+           em plan_similar_selection, testável sem interface)."""
         selected_count = 0
 
         # Itera sobre todos os grupos
         for group_idx, group_data in self.group_check_vars.items():
             images = group_data['images']
             md5_count = group_data['md5_count']
-
-            # Filtra apenas imagens semelhantes (MD5 único, ou seja, não duplicado)
-            similar_images = [img_info for img_info in images if md5_count[img_info['md5']] == 1]
-
-            # Se há pelo menos 2 imagens semelhantes no grupo
-            if len(similar_images) > 1:
-                # Ordena por data de modificação (mais antiga primeiro)
-                similar_images.sort(key=lambda x: x['mtime'])
-
-                # Seleciona todas exceto a primeira (mais antiga)
-                for img_info in similar_images[1:]:
-                    img_info['var'].set(1)
-                    selected_count += 1
+            for i in plan_similar_selection(images, md5_count):
+                images[i]['var'].set(1)
+                selected_count += 1
 
         messagebox.showinfo("Seleção Concluída",
-                           f"{selected_count} imagens semelhantes foram selecionadas (mantendo a mais antiga de cada grupo).")
+                           f"{selected_count} imagens semelhantes foram selecionadas (mantendo a mais antiga de cada grupo)."
+                           + self._reference_selection_note())
+
+    def _reference_selection_note(self):
+        """Complemento das mensagens de seleção no modo comparação
+           (string vazia no modo normal: mensagens intocadas)."""
+        if not self.reference_folder:
+            return ""
+        return ("\n\nModo comparação: quando existe cópia no acervo de referência, todas as "
+                "cópias da pasta alvo são selecionadas. Imagens da referência nunca são "
+                "selecionadas.")
+
+    @staticmethod
+    def _protected_note(protected):
+        return (f"\n{protected} imagem(ns) da referência foram ignoradas (protegidas)."
+                if protected else "")
 
     def move_all_selected(self):
         """Move todas as imagens selecionadas de todos os grupos"""
         dest_folder = filedialog.askdirectory(title="Selecione a pasta de destino")
         if not dest_folder:
             return
+        if self._dest_under_reference(dest_folder):
+            messagebox.showerror(
+                "Destino protegido",
+                "A pasta de destino é (ou está dentro de) a pasta de referência protegida.\n"
+                "Escolha outro destino."
+            )
+            return
 
         moved_count = 0
+        skipped_count = 0
+        protected = 0
         errors = []
 
         # Itera sobre todos os grupos
@@ -777,48 +2049,57 @@ class ImageCleaner:
             for img_info in images:
                 if img_info['var'].get() == 1:
                     filepath = img_info['filepath']
+                    if self._is_protected(filepath):
+                        protected += 1
+                        img_info['var'].set(0)
+                        log.warning("Bloqueado: tentativa de mover arquivo da referência: %s", filepath)
+                        continue
                     try:
-                        basename = os.path.basename(filepath)
-                        new_path = os.path.join(dest_folder, basename)
-
-                        # Se arquivo já existe no destino, adiciona sufixo
-                        if os.path.exists(new_path):
-                            name, ext = os.path.splitext(basename)
-                            counter = 1
-                            while os.path.exists(new_path):
-                                new_path = os.path.join(dest_folder, f"{name}_{counter}{ext}")
-                                counter += 1
-
-                        os.rename(filepath, new_path)
-                        moved_count += 1
-                        img_info['var'].set(0)  # Desmarca após mover
+                        if self._move_file(filepath, dest_folder) is None:
+                            skipped_count += 1  # já estava na pasta de destino
+                        else:
+                            moved_count += 1
+                            img_info['var'].set(0)  # Desmarca após mover
                     except Exception as e:
                         errors.append(f"{filepath}: {str(e)}")
 
         # Recarrega a página atual para atualizar a visualização
         self.render_page()
 
+        skipped_msg = (f"\n{skipped_count} imagem(ns) ignorada(s): já estavam na pasta de destino "
+                       f"(continuam selecionadas)." if skipped_count else "")
+        skipped_msg += self._protected_note(protected)
         if errors:
-            error_msg = f"{moved_count} imagens movidas.\n\nErros:\n" + "\n".join(errors[:5])
+            error_msg = (f"{moved_count} imagens movidas.{skipped_msg}\n\nErros:\n"
+                         + "\n".join(errors[:5]))
             if len(errors) > 5:
                 error_msg += f"\n... e mais {len(errors) - 5} erros."
             messagebox.showwarning("Mover - Concluído com Erros", error_msg)
         else:
-            messagebox.showinfo("Mover", f"{moved_count} imagens movidas com sucesso!")
+            messagebox.showinfo("Mover", f"{moved_count} imagens movidas com sucesso!{skipped_msg}")
 
     def delete_all_selected(self):
         """Exclui todas as imagens selecionadas de todos os grupos"""
-        # Conta quantas imagens estão selecionadas
-        selected_count = sum(1 for group_data in self.group_check_vars.values()
-                           for img_info in group_data['images']
-                           if img_info['var'].get() == 1)
+        # Conta quantas imagens estão selecionadas (as protegidas não contam:
+        # o número prometido na confirmação tem que ser o número executado)
+        selected_count = 0
+        protected = 0
+        for group_data in self.group_check_vars.values():
+            for img_info in group_data['images']:
+                if img_info['var'].get() == 1:
+                    if self._is_protected(img_info['filepath']):
+                        protected += 1
+                    else:
+                        selected_count += 1
 
         if selected_count == 0:
-            messagebox.showinfo("Excluir", "Nenhuma imagem selecionada.")
+            messagebox.showinfo("Excluir", "Nenhuma imagem selecionada."
+                                + self._protected_note(protected))
             return
 
         confirm = messagebox.askyesno("Excluir",
-                                     f"Tem certeza que deseja excluir {selected_count} imagens selecionadas?")
+                                     f"Tem certeza que deseja excluir {selected_count} imagens selecionadas?"
+                                     + self._protected_note(protected))
         if not confirm:
             return
 
@@ -833,6 +2114,10 @@ class ImageCleaner:
             for img_info in images:
                 if img_info['var'].get() == 1:
                     filepath = img_info['filepath']
+                    if self._is_protected(filepath):
+                        img_info['var'].set(0)
+                        log.warning("Bloqueado: tentativa de excluir arquivo da referência: %s", filepath)
+                        continue
                     try:
                         os.remove(filepath)
                         deleted_count += 1
@@ -849,35 +2134,224 @@ class ImageCleaner:
                 error_msg += f"\n... e mais {len(errors) - 5} erros."
             messagebox.showwarning("Excluir - Concluído com Erros", error_msg)
         else:
-            messagebox.showinfo("Excluir", f"{deleted_count} imagens excluídas com sucesso!")
+            messagebox.showinfo("Excluir", f"{deleted_count} imagens excluídas com sucesso!"
+                                + self._protected_note(protected))
+
+    @staticmethod
+    def _move_file(filepath, dest_folder):
+        """Move um arquivo para a pasta de destino. Se já existir um arquivo com
+           o mesmo nome, adiciona sufixo _1, _2, ... Funciona entre unidades
+           diferentes (shutil.move), ao contrário do os.rename."""
+        basename = os.path.basename(filepath)
+        new_path = os.path.join(dest_folder, basename)
+        # Destino é o próprio arquivo (mover para a pasta onde já está):
+        # nada a fazer; retorna None para o chamador não contar como movida.
+        if cache_key(new_path) == cache_key(filepath):
+            return None
+        if os.path.exists(new_path):
+            name, ext = os.path.splitext(basename)
+            counter = 1
+            while os.path.exists(new_path):
+                new_path = os.path.join(dest_folder, f"{name}_{counter}{ext}")
+                counter += 1
+        try:
+            shutil.move(filepath, new_path)
+        except Exception:
+            # Entre unidades o shutil.move copia e depois apaga a origem. Se a
+            # origem ainda existe, a cópia no destino é descartável (completa,
+            # se só o apagar falhou; parcial, se a cópia foi interrompida):
+            # remove para não deixar duplicata nem arquivo truncado para trás.
+            if os.path.exists(filepath) and os.path.exists(new_path):
+                try:
+                    os.remove(new_path)
+                except OSError:
+                    pass
+            raise
+        return new_path
 
     def move_images(self, group, check_vars):
         dest_folder = filedialog.askdirectory(title="Selecione a pasta de destino")
         if not dest_folder:
             return
+        if self._dest_under_reference(dest_folder):
+            messagebox.showerror(
+                "Destino protegido",
+                "A pasta de destino é (ou está dentro de) a pasta de referência protegida.\n"
+                "Escolha outro destino."
+            )
+            return
+        moved = skipped = failed = protected = 0
         for (filepath, _, _), var in zip(group, check_vars):
             if var.get() == 1:
+                if self._is_protected(filepath):
+                    protected += 1
+                    var.set(0)
+                    log.warning("Bloqueado: tentativa de mover arquivo da referência: %s", filepath)
+                    continue
                 try:
-                    basename = os.path.basename(filepath)
-                    new_path = os.path.join(dest_folder, basename)
-                    os.rename(filepath, new_path)
+                    if self._move_file(filepath, dest_folder) is None:
+                        skipped += 1  # já estava na pasta de destino
+                    else:
+                        moved += 1
                 except Exception as e:
-                    print(f"Erro ao mover {filepath}: {e}")
-        messagebox.showinfo("Mover", "Operação de mover concluída!")
+                    failed += 1
+                    log.warning("Erro ao mover %s: %s", filepath, e)
+        msg = f"{moved} imagem(ns) movida(s)."
+        if skipped:
+            msg += f"\n{skipped} ignorada(s): já estavam na pasta de destino."
+        if failed:
+            msg += f"\n{failed} com erro (detalhes no log)."
+        msg += self._protected_note(protected)
+        messagebox.showinfo("Mover", msg)
 
     def delete_images(self, group, check_vars):
-        confirm = messagebox.askyesno("Excluir", "Tem certeza que deseja excluir as imagens selecionadas?")
+        selected_count = 0
+        protected = 0
+        for (filepath, _, _), var in zip(group, check_vars):
+            if var.get() == 1:
+                if self._is_protected(filepath):
+                    protected += 1
+                else:
+                    selected_count += 1
+        if selected_count == 0:
+            messagebox.showinfo("Excluir", "Nenhuma imagem selecionada neste grupo."
+                                + self._protected_note(protected))
+            return
+        # A contagem importa: em grupos grandes a seleção pode incluir imagens
+        # que não estão na faixa exibida no momento.
+        confirm = messagebox.askyesno(
+            "Excluir",
+            f"Tem certeza que deseja excluir {selected_count} imagem(ns) selecionada(s) deste grupo?"
+            + self._protected_note(protected)
+        )
         if not confirm:
             return
         for (filepath, _, _), var in zip(group, check_vars):
             if var.get() == 1:
+                if self._is_protected(filepath):
+                    var.set(0)
+                    log.warning("Bloqueado: tentativa de excluir arquivo da referência: %s", filepath)
+                    continue
                 try:
                     os.remove(filepath)
                 except Exception as e:
-                    print(f"Erro ao excluir {filepath}: {e}")
-        messagebox.showinfo("Excluir", "Operação de exclusão concluída!")
+                    log.warning("Erro ao excluir %s: %s", filepath, e)
+        messagebox.showinfo("Excluir", "Operação de exclusão concluída!"
+                            + self._protected_note(protected))
+
+def _report_callback_exception(exc_type, exc_value, exc_tb):
+    """Erros dentro de callbacks do Tk (cliques de botão etc.) iam para o stderr,
+       que não existe no .exe: agora vão para o log e para uma mensagem."""
+    log.error("Erro inesperado na interface:\n%s",
+              "".join(traceback.format_exception(exc_type, exc_value, exc_tb)))
+    try:
+        messagebox.showerror(
+            "Erro inesperado",
+            f"{exc_type.__name__}: {exc_value}\n\n"
+            f"Detalhes no log: {get_log_path()}"
+        )
+    except Exception:
+        pass
+
+
+def run_selftest(folder, reference=None):
+    """
+    Modo de diagnóstico sem interface: `ImageCleaner.exe --selftest PASTA`
+    ou `--selftest PASTA --ref REFERENCIA` (modo de comparação).
+    Roda o pipeline completo (listar, hash, agrupar, MD5) e escreve o resumo
+    no log (e no console, quando houver). Útil para validar o executável e
+    para diagnosticar problemas em campo. Não usa o cache e não altera nada.
+
+    No modo de comparação também simula a seleção automática e verifica, com
+    assert, que nenhuma imagem da referência seria selecionada.
+    """
+    setup_logging()
+    if not os.path.isdir(folder):
+        raise FileNotFoundError(f"Pasta não encontrada ou inacessível: {folder}")
+    if reference is not None:
+        if not os.path.isdir(reference):
+            raise FileNotFoundError(f"Pasta de referência não encontrada ou inacessível: {reference}")
+        reason = folder_conflict(folder, reference)
+        if reason:
+            raise ValueError(f"Pastas em conflito: {reason}")
+    t0 = time.time()
+    log.info("SELFTEST em %s (threads=%d, draft=%s)", folder, HASH_WORKERS, USE_FAST_JPEG_DECODE)
+    entries = list_image_files(folder, True, VALID_EXTENSIONS)
+    ref_keys = set()
+    if reference is not None:
+        ref_entries = list_image_files(reference, True, VALID_EXTENSIONS)
+        log.info("SELFTEST referência %s: %d arquivos", reference, len(ref_entries))
+        entries, ref_keys = merge_scan_entries(entries, ref_entries)
+    log.info("SELFTEST listagem: %d arquivos em %.1fs", len(entries), time.time() - t0)
+    results, errors_by_idx, _ = hash_files(entries, None, HASH_WORKERS)
+    images_data = [r for r in results if r is not None]
+    log.info("SELFTEST hash: %d ok, %d erros em %.1fs", len(images_data), len(errors_by_idx), time.time() - t0)
+    groups_idx = find_similar_groups([h for (_, h, _) in images_data], SIMILARITY_THRESHOLD)
+    if reference is not None:
+        groups_idx = filter_groups_for_reference(groups_idx, images_data, ref_keys)
+    stats = [entries[i][1:] for i, r in enumerate(results) if r is not None]
+    md5_by_idx, _ = md5_for_groups(images_data, stats, groups_idx, None, HASH_WORKERS)
+    groups = build_groups(images_data, groups_idx, md5_by_idx)
+    n_ident = 0
+    for g in groups:
+        counts = {}
+        for (_, _, m) in g:
+            counts[m] = counts.get(m, 0) + 1
+        n_ident += sum(1 for (_, _, m) in g if counts[m] > 1)
+    summary = (f"SELFTEST OK: {len(entries)} arquivos, {len(images_data)} hashes, "
+               f"{len(errors_by_idx)} erros, {len(groups)} grupos, {n_ident} idênticas, "
+               f"{time.time() - t0:.1f}s")
+    if reference is not None:
+        # Simula a seleção automática (mesmas funções puras da interface)
+        mtime_by_path = {fp: (mt / 1e9 if mt is not None else float("inf"))
+                         for (fp, _, mt) in entries}
+        n_protected = n_sel_ident = n_sel_simil = 0
+        for g in groups:
+            counts = {}
+            for (_, _, m) in g:
+                counts[m] = counts.get(m, 0) + 1
+            images = [{'filepath': fp, 'md5': m, 'mtime': mtime_by_path.get(fp, float("inf")),
+                       'is_reference': cache_key(fp) in ref_keys} for (fp, _, m) in g]
+            n_protected += sum(1 for im in images if im['is_reference'])
+            sel_i = plan_identical_selection(images)
+            sel_s = plan_similar_selection(images, counts)
+            for i in sel_i + sel_s:
+                assert not images[i]['is_reference'], \
+                    f"BUG: imagem da referência selecionada: {images[i]['filepath']}"
+            n_sel_ident += len(sel_i)
+            n_sel_simil += len(sel_s)
+        summary += (f" | REF: {len(groups)} grupos, {n_protected} protegidas, "
+                    f"{n_sel_ident} selecionáveis (idênticas), {n_sel_simil} (semelhantes)")
+    log.info(summary)
+    return summary
+
 
 if __name__ == "__main__":
+    if len(sys.argv) >= 3 and sys.argv[1] == "--selftest":
+        try:
+            reference = None
+            if len(sys.argv) >= 5 and sys.argv[3] == "--ref":
+                reference = sys.argv[4]
+            result = run_selftest(sys.argv[2], reference)
+            code = 0
+        except (FileNotFoundError, ValueError) as e:
+            log.error("SELFTEST: %s", e)
+            result = f"SELFTEST FALHOU: {e}"
+            code = 2
+        except Exception:
+            log.exception("SELFTEST FALHOU")
+            result = "SELFTEST FALHOU (veja o log)"
+            code = 1
+        try:
+            print(result)
+        except Exception:
+            pass
+        sys.exit(code)
+
+    setup_logging()
+    log.info("ImageCleaner iniciado (Python %s)", sys.version.split()[0])
     root = tk.Tk()
+    root.report_callback_exception = _report_callback_exception
     app = ImageCleaner(root)
+    root.protocol("WM_DELETE_WINDOW", app._on_main_window_close)
     root.mainloop()

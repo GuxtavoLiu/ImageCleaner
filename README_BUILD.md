@@ -8,7 +8,7 @@ Este guia explica o passo a passo para transformar o código Python em um execut
 
 Antes de começar, certifique-se de ter:
 
-1. **Python 3.7 ou superior** instalado no Windows
+1. **Python 3.9 ou superior** instalado no Windows
    - Verifique com: `python --version`
    - Download: https://www.python.org/downloads/
 
@@ -86,6 +86,10 @@ pyinstaller --onefile --windowed --name "ImageCleaner" --icon="icon.ico" main.py
 ```
 
 #### Opção C: Com arquivo de configuração .spec
+⚠️ Atenção: rodar o PyInstaller pela linha de comando (ou pelos .bat) REGENERA
+o `ImageCleaner.spec`, descartando os ajustes feitos à mão (hiddenimports,
+excludes, datas). Se usar o spec, builde sempre com `pyinstaller ImageCleaner.spec`.
+
 ```bash
 pyinstaller ImageCleaner.spec
 ```
@@ -214,9 +218,32 @@ Antes de distribuir o executável, verifique:
 ```bash
 pyinstaller --onefile --windowed --name "ImageCleaner" ^
     --exclude-module matplotlib ^
-    --exclude-module numpy ^
+    --exclude-module pandas ^
     main.py
 ```
+⚠️ NÃO exclua `numpy`, `scipy` ou `pywt`: o `imagehash` depende deles e o
+executável não abre sem eles.
+
+### Para bases muito grandes (dezenas/centenas de GB):
+- Prefira o build em pasta (`build_pasta.bat`): o `.exe` único precisa
+  descompactar ~150 MB em `%TEMP%` a cada abertura.
+- O programa guarda um **cache de hashes** e um **log** em
+  `%LOCALAPPDATA%\ImageCleaner\` (`hash_cache.sqlite` e `imagecleaner.log`).
+  - Cache: re-escanear a mesma pasta fica quase instantâneo e um escaneamento
+    cancelado é retomado de onde parou. Pode ser desligado pela checkbox
+    "Usar cache de hashes" na tela inicial ou apagando o arquivo.
+  - Log: se algo der errado no `.exe` (que não tem console), os detalhes
+    estão nesse arquivo.
+- Ajustes disponíveis no topo do `main.py`:
+  - `HASH_WORKERS` (padrão 8): threads de leitura/hash. Em HDD externo não
+    aumente; em NVMe pode subir para 16. Memória: com a decodificação completa
+    (padrão), cada thread usa ~120 MB em fotos de 24 MP (8 threads = ~1 GB de
+    pico durante o hash); com `USE_FAST_JPEG_DECODE = True` cai para poucos MB.
+  - `USE_FAST_JPEG_DECODE` (padrão `False`): decodifica JPEG em escala
+    reduzida (2-3x mais rápido). Altera minimamente o hash, por isso vem
+    desligado; hashes com e sem essa opção usam caches separados.
+  - `MAX_IMAGES_PER_GROUP_DISPLAY` (padrão 200): miniaturas exibidas por
+    grupo (as ações continuam valendo para o grupo inteiro).
 
 ### Para incluir um README junto:
 ```bash

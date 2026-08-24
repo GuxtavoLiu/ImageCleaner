@@ -7,22 +7,23 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[
-        ('README.md', '.'),  # Inclui o README no executável
+        ('README_BUILD.md', '.'),  # Inclui o README no executável
     ],
     hiddenimports=[
         'PIL._tkinter_finder',  # Necessário para Pillow + Tkinter
         'imagehash',
+        'numpy',
+        'sqlite3',
     ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
         'matplotlib',  # Exclui módulos não utilizados para reduzir tamanho
-        'numpy',
         'pandas',
-        'scipy',
         'pytest',
         'IPython',
+        # NÃO excluir numpy/scipy/pywt: o imagehash depende deles.
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
