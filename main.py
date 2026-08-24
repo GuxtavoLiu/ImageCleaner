@@ -1,4 +1,5 @@
 import bisect
+import csv
 import os
 import subprocess
 import hashlib
@@ -17,6 +18,13 @@ from PIL import Image, ImageTk, ImageFile
 import imagehash
 import numpy as np
 from datetime import datetime
+
+# Exclusão só pela Lixeira do Windows. Sem o send2trash o app RECUSA excluir
+# (nunca cai para exclusão definitiva).
+try:
+    from send2trash import send2trash as _send2trash
+except Exception:  # pragma: no cover - depende do ambiente
+    _send2trash = None
 
 # Permite carregar imagens truncadas/corrompidas parcialmente
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -243,6 +251,57 @@ def get_hash_cache_path():
 
 def get_log_path():
     return os.path.join(get_app_data_dir(), "imagecleaner.log")
+
+
+def get_reports_dir():
+    """Pasta dos relatórios CSV de sessão."""
+    path = os.path.join(get_app_data_dir(), "relatorios")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+class SessionReport:
+    """
+    Relatório CSV da sessão: uma linha por arquivo movido, enviado à Lixeira
+    ou devolvido pelo "Desfazer". O arquivo só é criado no primeiro registro
+    (sessões sem ação não deixam relatório). Erros são logados, nunca
+    interrompem a ação que estava sendo registrada.
+    """
+    COLUMNS = ["data_hora", "acao", "grupo", "status", "origem", "caminho", "destino", "tamanho"]
+
+    def __init__(self, directory=None):
+        self.directory = directory
+        self.path = None
+
+    def record(self, rows):
+        if not rows:
+            return
+        try:
+            if self.path is None:
+                directory = self.directory or get_reports_dir()
+                os.makedirs(directory, exist_ok=True)
+                stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                self.path = os.path.join(directory, f"sessao_{stamp}.csv")
+                with open(self.path, "w", newline="", encoding="utf-8-sig") as f:
+                    csv.DictWriter(f, fieldnames=self.COLUMNS, delimiter=";").writeheader()
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            with open(self.path, "a", newline="", encoding="utf-8-sig") as f:
+                writer = csv.DictWriter(f, fieldnames=self.COLUMNS, delimiter=";", extrasaction="ignore")
+                for row in rows:
+                    writer.writerow({"data_hora": now, **row})
+        except Exception as e:
+            log.warning("Relatório: falha ao gravar %s: %s", self.path, e)
+
+
+def trash_available():
+    return _send2trash is not None
+
+
+def trash_file(filepath):
+    """Envia o arquivo para a Lixeira do Windows. Levanta exceção se não der."""
+    if _send2trash is None:
+        raise RuntimeError("send2trash indisponível: exclusão recusada")
+    _send2trash(os.path.normpath(filepath))
 
 
 log = logging.getLogger("imagecleaner")
@@ -1354,6 +1413,8 @@ class ImageCleaner:
         self.reference_keys = set()     # cache_key dos arquivos listados na referência
         self.reference_prefix = None    # folder_prefix(reference_folder) durante o scan
         self.confirm_stats = None       # estatísticas da confirmação por dhash (se ligada)
+        self.session_report = SessionReport()   # CSV criado no primeiro registro
+        self.action_log = []            # lotes de ações desta sessão (para "Desfazer")
         self.create_widgets()
 
     def create_widgets(self):
@@ -2349,6 +2410,19 @@ class ImageCleaner:
         # Alterna entre a fila de pendentes e a lista de grupos já verificados
         self.view_toggle_btn = make_button(top_frame, "", "neutral", command=self.toggle_view)
         self.view_toggle_btn.pack(side="left", padx=(20, 5))
+
+        # Menu "Mais": desfazer, relatórios, log
+        more = tk.Menubutton(top_frame, text="Mais ▾", relief="flat", bg="#E0E0E0",
+                             activebackground="#BDBDBD", padx=10, pady=4, cursor="hand2")
+        more_menu = tk.Menu(more, tearoff=0)
+        more_menu.add_command(label="Desfazer último lote (mover)", command=self.undo_last_action)
+        more_menu.add_separator()
+        more_menu.add_command(label="Abrir pasta de relatórios (CSV da sessão)",
+                              command=lambda: self.open_folder(get_reports_dir()))
+        more_menu.add_command(label="Abrir pasta do log e do cache",
+                              command=lambda: self.open_folder(get_app_data_dir()))
+        more["menu"] = more_menu
+        more.pack(side="left", padx=5)
         self.create_tooltip(self.view_toggle_btn,
                             "Ao usar 'Selecionar Idênticas/Semelhantes' ou 'Marcar verificado' de um\n"
                             "grupo, ele sai da fila de pendentes e vai para 'Grupos verificados'.\n"
@@ -3199,6 +3273,113 @@ class ImageCleaner:
         return (f"\n{protected} imagem(ns) da referência foram ignoradas (protegidas)."
                 if protected else "")
 
+    def open_folder(self, path):
+        try:
+            os.startfile(path)
+        except OSError as e:
+            messagebox.showerror("Abrir pasta", f"Não foi possível abrir:\n{path}\n\n{e}")
+
+    def _group_index_of(self, group):
+        """Índice original do grupo (lista de tuplas) dentro de self.groups."""
+        for idx, data in self.group_check_vars.items():
+            if data['group'] is group:
+                return idx
+        return None
+
+    def _image_meta(self, group_idx, filepath):
+        """(status, origem, tamanho) de uma imagem, para o relatório."""
+        status = origem = ""
+        size = self.file_stats.get(filepath, (None, None))[0]
+        data = self.group_check_vars.get(group_idx)
+        if data:
+            for info in data['images']:
+                if info['filepath'] == filepath:
+                    status = "Idêntica" if data['md5_count'].get(info['md5'], 0) > 1 else "Semelhante"
+                    origem = "REF" if info.get('is_reference') else "ALVO"
+                    break
+        return status, origem, size
+
+    def _record_batch(self, action, items):
+        """Registra um lote no relatório CSV e, se for reversível, no log de
+           ações. items: lista de (group_idx, caminho, destino)."""
+        if not items:
+            return
+        rows = []
+        for group_idx, src, dst in items:
+            status, origem, size = self._image_meta(group_idx, src)
+            rows.append({"acao": action, "grupo": (group_idx + 1) if group_idx is not None else "",
+                         "status": status, "origem": origem, "caminho": src,
+                         "destino": dst or "", "tamanho": size if size is not None else ""})
+        self.session_report.record(rows)
+        if action == "mover":
+            self.action_log.append({"type": "move", "items": [(src, dst) for _, src, dst in items]})
+        elif action == "lixeira":
+            self.action_log.append({"type": "trash", "items": [(src, None) for _, src, _ in items]})
+
+    def _report_note(self):
+        path = self.session_report.path
+        return f"\n\nRelatório da sessão: {path}" if path else ""
+
+    def undo_last_action(self):
+        """Desfaz o último lote de movimentos (devolve os arquivos à origem e
+           os re-seleciona). Exclusões foram para a Lixeira: restaure por lá."""
+        if not self.action_log:
+            messagebox.showinfo("Desfazer", "Nenhuma ação para desfazer nesta sessão.")
+            return
+        last = self.action_log[-1]
+        if last["type"] == "trash":
+            messagebox.showinfo(
+                "Desfazer",
+                f"O último lote enviou {len(last['items'])} imagem(ns) para a Lixeira do Windows.\n"
+                "Para restaurá-las, abra a Lixeira, selecione os arquivos e use 'Restaurar'."
+            )
+            return
+        if not messagebox.askyesno(
+                "Desfazer",
+                f"Devolver {len(last['items'])} imagem(ns) movida(s) para a pasta de origem?"):
+            return
+        self.action_log.pop()
+        by_path = {info['filepath']: info for data in self.group_check_vars.values()
+                   for info in data['images']}
+        restored, conflicts, errors = 0, 0, []
+        report_items = []
+        for src, dst in last["items"]:
+            if not os.path.exists(dst) or os.path.exists(src):
+                conflicts += 1
+                continue
+            try:
+                os.makedirs(os.path.dirname(src), exist_ok=True)
+                shutil.move(dst, src)
+                restored += 1
+                if src in by_path:
+                    by_path[src]['var'].set(1)
+                report_items.append((None, src, dst))
+            except Exception as e:
+                errors.append(f"{src}: {e}")
+        rows = [{"acao": "desfazer_mover", "grupo": "", "status": "", "origem": "",
+                 "caminho": src, "destino": dst, "tamanho": ""} for _, src, dst in report_items]
+        self.session_report.record(rows)
+        self.render_page()
+        msg = f"{restored} imagem(ns) devolvida(s) à origem (e selecionada(s) de novo)."
+        if conflicts:
+            msg += f"\n{conflicts} não puderam ser devolvidas (arquivo já existe na origem ou sumiu do destino)."
+        if errors:
+            msg += "\n\nErros:\n" + "\n".join(errors[:5])
+        messagebox.showinfo("Desfazer", msg + self._report_note())
+
+    def _trash_refused(self):
+        """Sem send2trash: recusa excluir (nunca exclui definitivamente)."""
+        if trash_available():
+            return False
+        messagebox.showerror(
+            "Lixeira indisponível",
+            "A exclusão usa a Lixeira do Windows (biblioteca send2trash), que não está\n"
+            "disponível nesta instalação. Nada foi excluído.\n\n"
+            "Instale com: python -m pip install send2trash\n"
+            "Ou use 'Mover Selecionadas' para uma pasta temporária."
+        )
+        return True
+
     def move_all_selected(self):
         """Move todas as imagens selecionadas de todos os grupos"""
         dest_folder = filedialog.askdirectory(title="Selecione a pasta de destino")
@@ -3216,6 +3397,7 @@ class ImageCleaner:
         skipped_count = 0
         protected = 0
         errors = []
+        batch = []
 
         # Itera sobre todos os grupos
         for group_idx, group_data in self.group_check_vars.items():
@@ -3231,28 +3413,33 @@ class ImageCleaner:
                         log.warning("Bloqueado: tentativa de mover arquivo da referência: %s", filepath)
                         continue
                     try:
-                        if self._move_file(filepath, dest_folder) is None:
+                        new_path = self._move_file(filepath, dest_folder)
+                        if new_path is None:
                             skipped_count += 1  # já estava na pasta de destino
                         else:
                             moved_count += 1
+                            batch.append((group_idx, filepath, new_path))
                             img_info['var'].set(0)  # Desmarca após mover
                     except Exception as e:
                         errors.append(f"{filepath}: {str(e)}")
 
+        self._record_batch("mover", batch)
         # Recarrega a página atual para atualizar a visualização
         self.render_page()
 
         skipped_msg = (f"\n{skipped_count} imagem(ns) ignorada(s): já estavam na pasta de destino "
                        f"(continuam selecionadas)." if skipped_count else "")
         skipped_msg += self._protected_note(protected)
+        undo_msg = "\n\nPara devolver: menu 'Mais' > 'Desfazer último lote'." if batch else ""
         if errors:
             error_msg = (f"{moved_count} imagens movidas.{skipped_msg}\n\nErros:\n"
                          + "\n".join(errors[:5]))
             if len(errors) > 5:
                 error_msg += f"\n... e mais {len(errors) - 5} erros."
-            messagebox.showwarning("Mover - Concluído com Erros", error_msg)
+            messagebox.showwarning("Mover - Concluído com Erros", error_msg + undo_msg + self._report_note())
         else:
-            messagebox.showinfo("Mover", f"{moved_count} imagens movidas com sucesso!{skipped_msg}")
+            messagebox.showinfo("Mover", f"{moved_count} imagens movidas com sucesso!{skipped_msg}"
+                                + undo_msg + self._report_note())
 
     def delete_all_selected(self):
         """Exclui todas as imagens selecionadas de todos os grupos"""
@@ -3272,15 +3459,18 @@ class ImageCleaner:
             messagebox.showinfo("Excluir", "Nenhuma imagem selecionada."
                                 + self._protected_note(protected))
             return
+        if self._trash_refused():
+            return
 
         confirm = messagebox.askyesno("Excluir",
-                                     f"Tem certeza que deseja excluir {selected_count} imagens selecionadas?"
+                                     f"Enviar {selected_count} imagens selecionadas para a Lixeira do Windows?"
                                      + self._protected_note(protected))
         if not confirm:
             return
 
         deleted_count = 0
         errors = []
+        batch = []
 
         # Itera sobre todos os grupos
         for group_idx, group_data in self.group_check_vars.items():
@@ -3295,23 +3485,26 @@ class ImageCleaner:
                         log.warning("Bloqueado: tentativa de excluir arquivo da referência: %s", filepath)
                         continue
                     try:
-                        os.remove(filepath)
+                        trash_file(filepath)
                         deleted_count += 1
+                        batch.append((group_idx, filepath, None))
                         img_info['var'].set(0)  # Desmarca após excluir
                     except Exception as e:
                         errors.append(f"{filepath}: {str(e)}")
 
+        self._record_batch("lixeira", batch)
         # Recarrega a página atual para atualizar a visualização
         self.render_page()
 
         if errors:
-            error_msg = f"{deleted_count} imagens excluídas.\n\nErros:\n" + "\n".join(errors[:5])
+            error_msg = (f"{deleted_count} imagens enviadas para a Lixeira.\n\nErros:\n"
+                         + "\n".join(errors[:5]))
             if len(errors) > 5:
                 error_msg += f"\n... e mais {len(errors) - 5} erros."
-            messagebox.showwarning("Excluir - Concluído com Erros", error_msg)
+            messagebox.showwarning("Excluir - Concluído com Erros", error_msg + self._report_note())
         else:
-            messagebox.showinfo("Excluir", f"{deleted_count} imagens excluídas com sucesso!"
-                                + self._protected_note(protected))
+            messagebox.showinfo("Excluir", f"{deleted_count} imagens enviadas para a Lixeira do Windows!"
+                                + self._protected_note(protected) + self._report_note())
 
     @staticmethod
     def _move_file(filepath, dest_folder):
@@ -3357,6 +3550,8 @@ class ImageCleaner:
             )
             return
         moved = skipped = failed = protected = 0
+        batch = []
+        group_idx = self._group_index_of(group)
         for (filepath, _, _), var in zip(group, check_vars):
             if var.get() == 1:
                 if self._is_protected(filepath):
@@ -3365,20 +3560,25 @@ class ImageCleaner:
                     log.warning("Bloqueado: tentativa de mover arquivo da referência: %s", filepath)
                     continue
                 try:
-                    if self._move_file(filepath, dest_folder) is None:
+                    new_path = self._move_file(filepath, dest_folder)
+                    if new_path is None:
                         skipped += 1  # já estava na pasta de destino
                     else:
                         moved += 1
+                        batch.append((group_idx, filepath, new_path))
                 except Exception as e:
                     failed += 1
                     log.warning("Erro ao mover %s: %s", filepath, e)
+        self._record_batch("mover", batch)
         msg = f"{moved} imagem(ns) movida(s)."
         if skipped:
             msg += f"\n{skipped} ignorada(s): já estavam na pasta de destino."
         if failed:
             msg += f"\n{failed} com erro (detalhes no log)."
         msg += self._protected_note(protected)
-        messagebox.showinfo("Mover", msg)
+        if batch:
+            msg += "\n\nPara devolver: menu 'Mais' > 'Desfazer último lote'."
+        messagebox.showinfo("Mover", msg + self._report_note())
 
     def delete_images(self, group, check_vars):
         selected_count = 0
@@ -3393,15 +3593,20 @@ class ImageCleaner:
             messagebox.showinfo("Excluir", "Nenhuma imagem selecionada neste grupo."
                                 + self._protected_note(protected))
             return
+        if self._trash_refused():
+            return
         # A contagem importa: em grupos grandes a seleção pode incluir imagens
         # que não estão na faixa exibida no momento.
         confirm = messagebox.askyesno(
             "Excluir",
-            f"Tem certeza que deseja excluir {selected_count} imagem(ns) selecionada(s) deste grupo?"
+            f"Enviar {selected_count} imagem(ns) selecionada(s) deste grupo para a Lixeira do Windows?"
             + self._protected_note(protected)
         )
         if not confirm:
             return
+        deleted = failed = 0
+        batch = []
+        group_idx = self._group_index_of(group)
         for (filepath, _, _), var in zip(group, check_vars):
             if var.get() == 1:
                 if self._is_protected(filepath):
@@ -3409,11 +3614,18 @@ class ImageCleaner:
                     log.warning("Bloqueado: tentativa de excluir arquivo da referência: %s", filepath)
                     continue
                 try:
-                    os.remove(filepath)
+                    trash_file(filepath)
+                    deleted += 1
+                    batch.append((group_idx, filepath, None))
+                    var.set(0)
                 except Exception as e:
+                    failed += 1
                     log.warning("Erro ao excluir %s: %s", filepath, e)
-        messagebox.showinfo("Excluir", "Operação de exclusão concluída!"
-                            + self._protected_note(protected))
+        self._record_batch("lixeira", batch)
+        msg = f"{deleted} imagem(ns) enviada(s) para a Lixeira do Windows."
+        if failed:
+            msg += f"\n{failed} com erro (detalhes no log)."
+        messagebox.showinfo("Excluir", msg + self._protected_note(protected) + self._report_note())
 
 def _report_callback_exception(exc_type, exc_value, exc_tb):
     """Erros dentro de callbacks do Tk (cliques de botão etc.) iam para o stderr,

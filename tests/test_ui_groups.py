@@ -80,8 +80,9 @@ def _selected(app, idx):
                   for im in app.group_check_vars[idx]['images'] if im['var'].get() == 1)
 
 
-def test_fila_de_revisao(app_with_groups):
+def test_fila_de_revisao(app_with_groups, monkeypatch):
     app, root, msgs = app_with_groups
+    monkeypatch.setattr(ic, "_send2trash", os.remove)   # Lixeira simulada
     assert app.pending_idx == [0, 1] and app.verified_idx == []
     assert _titles(app) == ["Grupo 1"]
     assert "Grupos verificados (0)" in _buttons(app.groups_window, [])
@@ -134,7 +135,7 @@ def test_fila_de_revisao(app_with_groups):
     assert _selected(app, 1) == ["b_copy.png"]
     app.delete_all_selected()
     confirm = [m for m in msgs if m[0] == "askyesno"][-1]
-    assert "excluir 1 imagens" in confirm[2]
+    assert "Enviar 1 imagens selecionadas para a Lixeira" in confirm[2]
     assert not os.path.exists(os.path.join(os.path.dirname(app.selected_folder), "fx", "sub", "b_copy.png"))
 
 
@@ -277,3 +278,73 @@ def test_grupo_grande_colapsa_e_expande(tk_root, tmp_path, monkeypatch):
     root.update()
     for w in root.winfo_children():
         w.destroy()
+
+
+def _fake_trash(tmp_dir):
+    """send2trash simulado: move para uma pasta 'lixeira' de teste."""
+    os.makedirs(tmp_dir, exist_ok=True)
+    def _t(path):
+        import shutil
+        shutil.move(path, os.path.join(tmp_dir, os.path.basename(path)))
+    return _t
+
+
+def test_excluir_vai_para_lixeira_e_relatorio(app_with_groups, monkeypatch, tmp_path):
+    app, root, msgs = app_with_groups
+    app.session_report = ic.SessionReport(str(tmp_path / "rel"))
+    lix = str(tmp_path / "lixeira")
+    monkeypatch.setattr(ic, "_send2trash", _fake_trash(lix))
+    app.select_group(0, "identical")
+    fp = app.group_check_vars[0]['images'][1]['filepath']
+    app.delete_all_selected(); root.update()
+    assert "Lixeira do Windows" in [m for m in msgs if m[0] == "askyesno"][-1][2]
+    assert not os.path.exists(fp) and os.path.exists(os.path.join(lix, "a_copy.jpg"))
+    assert "enviadas para a Lixeira" in msgs[-1][2] and "Relatório da sessão" in msgs[-1][2]
+    import csv
+    with open(app.session_report.path, encoding="utf-8-sig", newline="") as f:
+        rows = list(csv.DictReader(f, delimiter=";"))
+    assert rows[-1]["acao"] == "lixeira" and rows[-1]["caminho"] == fp and rows[-1]["grupo"] == "1"
+    assert rows[-1]["status"] == "Idêntica" and rows[-1]["origem"] == "ALVO"
+    # desfazer com lixeira: só orienta
+    app.undo_last_action()
+    assert msgs[-1][0] == "showinfo" and "Lixeira" in msgs[-1][2]
+
+
+def test_excluir_recusa_sem_send2trash(app_with_groups, monkeypatch):
+    app, root, msgs = app_with_groups
+    monkeypatch.setattr(ic, "_send2trash", None)
+    app.select_group(0, "identical")
+    fp = app.group_check_vars[0]['images'][1]['filepath']
+    app.delete_all_selected(); root.update()
+    assert os.path.exists(fp)
+    assert msgs[-1][0] == "showerror" and "Nada foi excluído" in msgs[-1][2]
+    # por grupo também
+    gd = app.group_check_vars[0]
+    app.delete_images(gd['group'], gd['check_vars'])
+    assert os.path.exists(fp) and msgs[-1][0] == "showerror"
+
+
+def test_mover_e_desfazer(app_with_groups, monkeypatch, tmp_path):
+    app, root, msgs = app_with_groups
+    app.session_report = ic.SessionReport(str(tmp_path / "rel"))
+    dest = str(tmp_path / "destino"); os.makedirs(dest)
+    monkeypatch.setattr(filedialog, "askdirectory", lambda **k: dest)
+    app.select_group(0, "identical")
+    info = app.group_check_vars[0]['images'][1]
+    src = info['filepath']
+    app.move_all_selected(); root.update()
+    assert not os.path.exists(src) and os.path.exists(os.path.join(dest, "a_copy.jpg"))
+    assert info['var'].get() == 0 and "Desfazer último lote" in msgs[-1][2]
+    assert app.action_log[-1]["type"] == "move"
+    app.undo_last_action(); root.update()
+    assert os.path.exists(src) and not os.path.exists(os.path.join(dest, "a_copy.jpg"))
+    assert info['var'].get() == 1                      # re-selecionada
+    assert "1 imagem(ns) devolvida(s)" in msgs[-1][2]
+    assert app.action_log == []
+    import csv
+    with open(app.session_report.path, encoding="utf-8-sig", newline="") as f:
+        rows = list(csv.DictReader(f, delimiter=";"))
+    assert [r["acao"] for r in rows] == ["mover", "desfazer_mover"]
+    # nada mais para desfazer
+    app.undo_last_action()
+    assert "Nenhuma ação" in msgs[-1][2]

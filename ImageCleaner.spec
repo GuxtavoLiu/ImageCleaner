@@ -14,6 +14,7 @@ a = Analysis(
         'imagehash',
         'numpy',
         'sqlite3',
+        'send2trash',  # exclusão pela Lixeira do Windows
     ],
     hookspath=[],
     hooksconfig={},
