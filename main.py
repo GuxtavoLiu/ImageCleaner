@@ -70,6 +70,58 @@ THUMB_CACHE_SIZE = max(500, int(4000 * (100 / THUMB_SIZE) ** 2))
 RENDER_FIRST_CHUNK = 4
 RENDER_CHUNK = 3
 
+# ---------------------------------------------------------------------------
+# Aparência: uma paleta e um único helper de botões para toda a interface.
+# Tema ttk "vista" (nativo do Windows) para caixas, barras e scrollbars.
+# ---------------------------------------------------------------------------
+PALETTE = {
+    "primary": "#2E7D32", "bg": "#FAFAFA", "panel": "#FFFFFF", "text": "#333333",
+    "muted": "#777777", "selected_row": "#E8F5E9", "reference_row": "#F1F8E9",
+}
+FONT_UI = ("Segoe UI", 9)
+FONT_BOLD = ("Segoe UI", 9, "bold")
+FONT_TITLE = ("Segoe UI", 18, "bold")
+# kind -> (fundo, fundo ao clicar, texto)
+BUTTON_KINDS = {
+    "primary": ("#2E7D32", "#1B5E20", "white"),
+    "select": ("#4CAF50", "#388E3C", "white"),
+    "similar": ("#FF9800", "#EF6C00", "white"),
+    "move": ("#1565C0", "#0D47A1", "white"),
+    "danger": ("#D32F2F", "#B71C1C", "white"),
+    "neutral": ("#607D8B", "#455A64", "white"),
+    "light": ("#E0E0E0", "#BDBDBD", "#333333"),
+}
+
+
+def make_button(parent, text, kind="light", **kw):
+    """Botão plano com a paleta do app. kind: chave de BUTTON_KINDS.
+       Continua sendo um tk.Button (os testes localizam por classe)."""
+    bg, active, fg = BUTTON_KINDS[kind]
+    opts = dict(text=text, bg=bg, fg=fg, activebackground=active, activeforeground=fg,
+                relief="flat", bd=0, padx=10, pady=4, cursor="hand2", font=FONT_UI,
+                disabledforeground="#9E9E9E")
+    opts.update(kw)
+    return tk.Button(parent, **opts)
+
+
+def apply_theme(root):
+    """Tema visual global: ttk 'vista' (fallback 'clam'), fonte e fundo
+       padrão para os widgets criados a partir daqui. Só aparência."""
+    try:
+        style = ttk.Style(root)
+        names = style.theme_names()
+        style.theme_use("vista" if "vista" in names else "clam")
+    except tk.TclError:
+        pass
+    try:
+        root.option_add("*Font", FONT_UI)
+        root.option_add("*Background", PALETTE["bg"])
+        root.option_add("*Text.background", "white")
+        root.option_add("*Entry.background", "white")
+        root.configure(bg=PALETTE["bg"])
+    except tk.TclError:
+        pass
+
 # Threshold de similaridade (distância de Hamming máxima entre phashes).
 SIMILARITY_THRESHOLD = 10
 
@@ -1211,6 +1263,7 @@ class ImageCleaner:
     def __init__(self, master):
         self.master = master
         self.master.title("Image Cleaner")
+        apply_theme(self.master)
         self.groups = []
         self.images_data = []
         self.selected_folder = ""
@@ -1239,7 +1292,7 @@ class ImageCleaner:
 
         header = tk.Frame(self.master, bg="#2E7D32", padx=20, pady=14)
         header.pack(fill="x")
-        tk.Label(header, text="Image Cleaner", font=("Segoe UI", 18, "bold"),
+        tk.Label(header, text="Image Cleaner", font=FONT_TITLE,
                  fg="white", bg="#2E7D32").pack(anchor="w")
         tk.Label(header, text="Encontre fotos duplicadas ou semelhantes e limpe seu acervo com segurança",
                  font=("Segoe UI", 10), fg="#E8F5E9", bg="#2E7D32").pack(anchor="w")
@@ -1252,10 +1305,9 @@ class ImageCleaner:
         )
         steps.pack(anchor="w", padx=20, pady=(14, 6))
 
-        self.select_btn = tk.Button(self.master, text="Selecionar Pasta", command=self.select_folder,
-                                    font=("Segoe UI", 10, "bold"), bg="#2E7D32", fg="white",
-                                    activebackground="#1B5E20", activeforeground="white",
-                                    padx=18, pady=6, cursor="hand2")
+        self.select_btn = make_button(self.master, "Selecionar Pasta", "primary",
+                                      command=self.select_folder,
+                                      font=("Segoe UI", 10, "bold"), padx=18, pady=6)
         self.select_btn.pack(pady=10)
 
         # Label para exibir o caminho selecionado
@@ -1324,13 +1376,13 @@ class ImageCleaner:
         self.reference_container = tk.Frame(self.master)
         ref_row = tk.Frame(self.reference_container)
         ref_row.pack(fill="x")
-        self.reference_btn = tk.Button(
-            ref_row, text="Selecionar Pasta de Referência (protegida)...",
+        self.reference_btn = make_button(
+            ref_row, "Selecionar Pasta de Referência (protegida)...", "light",
             command=self.select_reference_folder
         )
         self.reference_btn.pack(side="left")
-        self.reference_clear_btn = tk.Button(
-            ref_row, text="Remover referência", command=self.clear_reference_folder,
+        self.reference_clear_btn = make_button(
+            ref_row, "Remover referência", "light", command=self.clear_reference_folder,
             state="disabled"
         )
         self.reference_clear_btn.pack(side="left", padx=(5, 0))
@@ -1357,10 +1409,9 @@ class ImageCleaner:
         # (exibido só quando há referência selecionada; ver select_reference_folder)
 
         # Botão Iniciar (inicialmente oculto)
-        self.start_btn = tk.Button(self.master, text="Iniciar escaneamento", command=self.start_scan,
-                                   font=("Segoe UI", 10, "bold"), bg="#1565C0", fg="white",
-                                   activebackground="#0D47A1", activeforeground="white",
-                                   padx=18, pady=6, cursor="hand2")
+        self.start_btn = make_button(self.master, "Iniciar escaneamento", "move",
+                                     command=self.start_scan,
+                                     font=("Segoe UI", 10, "bold"), padx=18, pady=6)
         # Não exibe o botão nem o frame de subpastas inicialmente
 
     def create_tooltip(self, widget, text):
@@ -1493,7 +1544,7 @@ class ImageCleaner:
         self.progress_time_label.pack(pady=(2, 0))
 
         # Botão cancelar
-        self.progress_cancel_btn = tk.Button(main_frame, text="Cancelar", command=self.cancel_scan)
+        self.progress_cancel_btn = make_button(main_frame, "Cancelar", "light", command=self.cancel_scan)
         self.progress_cancel_btn.pack(pady=(8, 0))
 
         self.progress_started_at = time.time()
@@ -1858,8 +1909,7 @@ class ImageCleaner:
         tk.Label(info_frame, text=info_text, justify="left", font=("Arial", 8)).pack(anchor="w")
 
         # Botão fechar
-        tk.Button(bottom_frame, text="Fechar", command=error_window.destroy,
-                 bg="#5cb85c", fg="white", padx=20).pack()
+        make_button(bottom_frame, "Fechar", "select", command=error_window.destroy, padx=20).pack()
 
         # Aguarda o usuário fechar a janela antes de continuar
         error_window.wait_window()
@@ -2193,31 +2243,26 @@ class ImageCleaner:
         self.page_info_label.pack(side="left", padx=5)
 
         # Botão para selecionar idênticas
-        btn_select_identical = tk.Button(top_frame, text="Selecionar Todas Idênticas",
-                                         command=self.select_identical_images,
-                                         bg="#4CAF50", fg="white")
+        btn_select_identical = make_button(top_frame, "Selecionar Todas Idênticas", "select",
+                                           command=self.select_identical_images)
         btn_select_identical.pack(side="left", padx=5)
 
         # Botão para selecionar semelhantes
-        btn_select_similar = tk.Button(top_frame, text="Selecionar Todas Semelhantes",
-                                       command=self.select_similar_images,
-                                       bg="#FF9800", fg="white")
+        btn_select_similar = make_button(top_frame, "Selecionar Todas Semelhantes", "similar",
+                                         command=self.select_similar_images)
         btn_select_similar.pack(side="left", padx=5)
 
         # Botões de ação global
-        btn_move_all = tk.Button(top_frame, text="Mover Todas Selecionadas",
-                                command=self.move_all_selected,
-                                bg="#2196F3", fg="white")
+        btn_move_all = make_button(top_frame, "Mover Todas Selecionadas", "move",
+                                   command=self.move_all_selected)
         btn_move_all.pack(side="left", padx=5)
 
-        btn_delete_all = tk.Button(top_frame, text="Excluir Todas Selecionadas",
-                                   command=self.delete_all_selected,
-                                   bg="#f44336", fg="white")
+        btn_delete_all = make_button(top_frame, "Excluir Todas Selecionadas", "danger",
+                                     command=self.delete_all_selected)
         btn_delete_all.pack(side="left", padx=5)
 
         # Alterna entre a fila de pendentes e a lista de grupos já verificados
-        self.view_toggle_btn = tk.Button(top_frame, text="", command=self.toggle_view,
-                                         bg="#607D8B", fg="white")
+        self.view_toggle_btn = make_button(top_frame, "", "neutral", command=self.toggle_view)
         self.view_toggle_btn.pack(side="left", padx=(20, 5))
         self.create_tooltip(self.view_toggle_btn,
                             "Ao usar 'Selecionar Idênticas/Semelhantes' ou 'Marcar verificado' de um\n"
@@ -2230,10 +2275,10 @@ class ImageCleaner:
         nav_frame = tk.Frame(top_frame)
         nav_frame.pack(side="right")
 
-        self.prev_btn = tk.Button(nav_frame, text="← Anterior (F1)", command=self.prev_page)
+        self.prev_btn = make_button(nav_frame, "← Anterior (F1)", "light", command=self.prev_page)
         self.prev_btn.pack(side="left", padx=5)
 
-        self.next_btn = tk.Button(nav_frame, text="Próximo (F2) →", command=self.next_page)
+        self.next_btn = make_button(nav_frame, "Próximo (F2) →", "light", command=self.next_page)
         self.next_btn.pack(side="left", padx=5)
 
         # Atalhos de teclado da paginação (valem com a janela de grupos em foco)
@@ -2429,24 +2474,24 @@ class ImageCleaner:
         # e o seguinte sobe para o mesmo lugar).
         select_cmd = self.select_group if verified_view else self.select_and_verify
         if plan_identical_selection(images):
-            tk.Button(btn_frame, text="Selecionar Idênticas", bg="#4CAF50", fg="white",
-                      command=lambda g=idx, c=select_cmd: c(g, "identical")).pack(side="left", padx=5)
+            make_button(btn_frame, "Selecionar Idênticas", "select",
+                        command=lambda g=idx, c=select_cmd: c(g, "identical")).pack(side="left", padx=5)
         if plan_similar_selection(images, md5_count):
-            tk.Button(btn_frame, text="Selecionar Semelhantes", bg="#FF9800", fg="white",
-                      command=lambda g=idx, c=select_cmd: c(g, "similar")).pack(side="left", padx=5)
+            make_button(btn_frame, "Selecionar Semelhantes", "similar",
+                        command=lambda g=idx, c=select_cmd: c(g, "similar")).pack(side="left", padx=5)
         if verified_view:
-            tk.Button(btn_frame, text="Voltar para pendentes",
-                      command=lambda g=idx: self.unverify_group(g)).pack(side="left", padx=5)
+            make_button(btn_frame, "Voltar para pendentes", "light",
+                        command=lambda g=idx: self.unverify_group(g)).pack(side="left", padx=5)
         else:
-            tk.Button(btn_frame, text="Marcar verificado ✓",
-                      command=lambda g=idx: self.verify_group(g)).pack(side="left", padx=5)
+            make_button(btn_frame, "Marcar verificado ✓", "light",
+                        command=lambda g=idx: self.verify_group(g)).pack(side="left", padx=5)
 
-        btn_move = tk.Button(btn_frame, text="Mover Selecionadas",
-                             command=lambda grp=group, vars=group_data['check_vars']: self.move_images(grp, vars))
+        btn_move = make_button(btn_frame, "Mover Selecionadas", "light",
+                               command=lambda grp=group, vars=group_data['check_vars']: self.move_images(grp, vars))
         btn_move.pack(side="left", padx=5)
 
-        btn_delete = tk.Button(btn_frame, text="Excluir Selecionadas",
-                               command=lambda grp=group, vars=group_data['check_vars']: self.delete_images(grp, vars))
+        btn_delete = make_button(btn_frame, "Excluir Selecionadas", "light",
+                                 command=lambda grp=group, vars=group_data['check_vars']: self.delete_images(grp, vars))
         btn_delete.pack(side="left", padx=5)
 
         # Grupos gigantes: exibe MAX_IMAGES_PER_GROUP_DISPLAY por vez, com
@@ -2755,13 +2800,13 @@ class ImageCleaner:
             # não deve jogar o usuário de volta ao topo da página.
             self.render_page(keep_scroll_px=max(0, self.canvas.canvasy(0)))
 
-        btn_next = tk.Button(nav, text=f"{MAX_IMAGES_PER_GROUP_DISPLAY} seguintes ▶",
-                             command=lambda: go(offset + MAX_IMAGES_PER_GROUP_DISPLAY),
-                             state="normal" if end < total else "disabled")
+        btn_next = make_button(nav, f"{MAX_IMAGES_PER_GROUP_DISPLAY} seguintes ▶", "light",
+                               command=lambda: go(offset + MAX_IMAGES_PER_GROUP_DISPLAY),
+                               state="normal" if end < total else "disabled")
         btn_next.pack(side="right", padx=3)
-        btn_prev = tk.Button(nav, text=f"◀ {MAX_IMAGES_PER_GROUP_DISPLAY} anteriores",
-                             command=lambda: go(offset - MAX_IMAGES_PER_GROUP_DISPLAY),
-                             state="normal" if offset > 0 else "disabled")
+        btn_prev = make_button(nav, f"◀ {MAX_IMAGES_PER_GROUP_DISPLAY} anteriores", "light",
+                               command=lambda: go(offset - MAX_IMAGES_PER_GROUP_DISPLAY),
+                               state="normal" if offset > 0 else "disabled")
         btn_prev.pack(side="right", padx=3)
 
     def prev_page(self):
