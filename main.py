@@ -129,6 +129,38 @@ def format_resolution(dims):
     return f"{w} x {h} ({mp_str} MP)"
 
 
+BADGE_STYLES = {
+    "maior resolução": ("#1B5E20", "#C8E6C9"),
+    "mais antiga": ("#0D47A1", "#BBDEFB"),
+    "maior arquivo": ("#424242", "#EEEEEE"),
+}
+
+
+def plan_badges(metas):
+    """
+    Rótulos que destacam o que difere entre as imagens de um grupo.
+    metas: lista de dicts com 'pixels' (int ou None), 'size' (int ou None) e
+    'mtime' (float ou None). Retorna {posição: [rótulos]}. Um rótulo só
+    aparece quando há diferença real no grupo (cópias idênticas não ganham
+    "maior arquivo"); empates dão o rótulo a todas as empatadas.
+    """
+    out = {}
+
+    def mark(key, label, best):
+        values = [m.get(key) for m in metas]
+        if any(v is None for v in values) or len(set(values)) < 2:
+            return
+        target = best(values)
+        for pos, v in enumerate(values):
+            if v == target:
+                out.setdefault(pos, []).append(label)
+
+    mark("pixels", "maior resolução", max)
+    mark("mtime", "mais antiga", min)
+    mark("size", "maior arquivo", max)
+    return out
+
+
 def shorten_path(filepath, roots):
     """
     Caminho curto para a tela: (tag, pasta_relativa, nome_do_arquivo).
@@ -2264,6 +2296,8 @@ class ImageCleaner:
         self.thumb_cache = {}               # filepath -> PhotoImage (ou None se falhou)
         self.image_dims = {}                # filepath -> (largura, altura), lido com a miniatura
         self.row_widgets = {}               # (idx, pos) -> widgets da linha (para pintar a seleção)
+        self.badge_frames = {}              # (idx, pos) -> frame dos rótulos de diferença
+        self._counter_pending = False
 
         # Cria janela de progresso
         self.create_groups_progress_window()
@@ -2329,6 +2363,17 @@ class ImageCleaner:
         # Atalhos de teclado da paginação (valem com a janela de grupos em foco)
         self.groups_window.bind("<F1>", lambda e: self.prev_page())
         self.groups_window.bind("<F2>", lambda e: self.next_page())
+
+        # Barra de status: progresso da revisão e o que está selecionado
+        status_frame = tk.Frame(self.groups_window)
+        status_frame.pack(fill="x", padx=15, pady=(0, 4))
+        self.review_progress = ttk.Progressbar(status_frame, length=220, mode="determinate")
+        self.review_progress.pack(side="left")
+        self.review_label = tk.Label(status_frame, text="", font=FONT_BOLD)
+        self.review_label.pack(side="left", padx=(8, 20))
+        self.selection_label = tk.Label(status_frame, text="", fg=PALETTE["muted"])
+        self.selection_label.pack(side="left")
+        self._update_counters()
 
         # --- Cria um Frame para conter o Canvas e a Scrollbar ---
         scroll_container = tk.Frame(self.groups_window)
@@ -2432,6 +2477,7 @@ class ImageCleaner:
         self.content_frame = tk.Frame(self.canvas)
         self.group_frames = {}
         self.row_widgets = {}
+        self.badge_frames = {}
 
         total, _ = self._update_page_info()
         visible = self._visible_groups()
@@ -2596,9 +2642,14 @@ class ImageCleaner:
                 row_widgets.append(lbl_ref)
 
             # Checkbutton usando o IntVar já existente
-            chk = tk.Checkbutton(text_frame, text="Selecionar", variable=var,
+            head = tk.Frame(text_frame)
+            head.pack(anchor="w", fill="x")
+            chk = tk.Checkbutton(head, text="Selecionar", variable=var,
                                  state="disabled" if is_ref else "normal")
-            chk.pack(anchor="w")
+            chk.pack(side="left")
+            badge_frame = tk.Frame(head)     # preenchido no fim do grupo (plan_badges)
+            badge_frame.pack(side="left", padx=(10, 0))
+            self.badge_frames[(idx, pos)] = badge_frame
 
             # Nome do arquivo em destaque + pasta curta; caminho completo no
             # tooltip e no menu de contexto
@@ -2649,14 +2700,43 @@ class ImageCleaner:
                        lambda e, fp=filepath, g=idx, p=pos: self._show_row_menu(e, fp, g, p))
 
             # Cor de fundo da linha conforme a seleção (pintada pelo trace do var)
-            self.row_widgets[(idx, pos)] = [item_frame, text_frame, chk, lbl_img,
-                                            lbl_name, lbl_path, lbl_info]
+            self.row_widgets[(idx, pos)] = [item_frame, text_frame, head, badge_frame, chk,
+                                            lbl_img, lbl_name, lbl_path, lbl_info]
             self._paint_row(idx, pos)
+
+        # Badges (o que difere entre as imagens): calculados agora, com as
+        # dimensões já lidas pelas miniaturas das linhas renderizadas.
+        self._render_badges(idx, images)
 
         # Repete a navegação no fim de grupos grandes (evita rolar até o topo)
         if len(images) > MAX_IMAGES_PER_GROUP_DISPLAY:
             self._render_group_nav(frame, idx, images, offset)
         return frame
+
+    def _render_badges(self, idx, images):
+        metas = []
+        for info in images:
+            fp = info['filepath']
+            dims = self.image_dims.get(fp)
+            size = self.file_stats.get(fp, (None, None))[0]
+            mtime = info.get('mtime')
+            metas.append({
+                'pixels': dims[0] * dims[1] if dims else None,
+                'size': size,
+                'mtime': None if mtime in (None, float("inf")) else mtime,
+            })
+        badges = plan_badges(metas)
+        for pos, labels in badges.items():
+            frame = self.badge_frames.get((idx, pos))
+            if frame is None:
+                continue
+            try:
+                for text in labels:
+                    fg, bg = BADGE_STYLES[text]
+                    tk.Label(frame, text=text, fg=fg, bg=bg, font=("Segoe UI", 8),
+                             padx=6, pady=1).pack(side="left", padx=(0, 4))
+            except tk.TclError:
+                pass
 
     def _path_roots(self):
         """Raízes para encurtar caminhos na tela: alvo e (se houver) referência."""
@@ -2691,9 +2771,42 @@ class ImageCleaner:
         self._schedule_counter_update()
 
     def _schedule_counter_update(self):
-        """Atualização (coalescida) dos contadores da barra superior."""
-        # preenchido na etapa de progresso/contadores
-        return
+        """Atualização coalescida dos contadores: muitas mudanças seguidas
+           ("Selecionar Todas") viram uma única atualização no próximo idle."""
+        if getattr(self, '_counter_pending', False):
+            return
+        win = getattr(self, 'groups_window', None)
+        if win is None:
+            return
+        try:
+            self._counter_pending = True
+            win.after_idle(self._update_counters)
+        except tk.TclError:
+            self._counter_pending = False
+
+    def _update_counters(self):
+        """Barra de status: 'Verificados x / N' e 'Selecionadas: n (bytes)'."""
+        self._counter_pending = False
+        if not hasattr(self, 'review_label'):
+            return
+        total = len(self.groups)
+        verified = len(self.verified_idx)
+        n_sel = 0
+        bytes_sel = 0
+        for group_data in self.group_check_vars.values():
+            for info in group_data['images']:
+                if info['var'].get() == 1:
+                    n_sel += 1
+                    size = self.file_stats.get(info['filepath'], (None, None))[0]
+                    bytes_sel += size or 0
+        try:
+            self.review_progress.configure(maximum=max(1, total), value=verified)
+            self.review_label.config(text=f"Verificados {verified} / {total}")
+            n_txt = f"{n_sel:,}".replace(",", ".")   # separador de milhar pt-BR
+            self.selection_label.config(
+                text=f"Selecionadas: {n_txt} imagem(ns), {format_bytes(bytes_sel)}")
+        except tk.TclError:
+            pass
 
     def _show_row_menu(self, event, filepath, group_idx, pos):
         menu = tk.Menu(self.groups_window, tearoff=0)
@@ -2747,6 +2860,7 @@ class ImageCleaner:
         self.pending_idx.remove(idx)
         self.verified_idx.append(idx)
         self._update_view_toggle()
+        self._schedule_counter_update()
         if self.view_mode == "pending":
             self._remove_group_from_page(idx)
         else:
@@ -2759,6 +2873,7 @@ class ImageCleaner:
         self.verified_idx.remove(idx)
         bisect.insort(self.pending_idx, idx)
         self._update_view_toggle()
+        self._schedule_counter_update()
         if self.view_mode == "verified":
             self._remove_group_from_page(idx)
         else:

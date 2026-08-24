@@ -29,3 +29,18 @@ def test_format_resolution():
 ])
 def test_shorten_path(fp, roots, esperado):
     assert ic.shorten_path(fp, roots) == esperado
+
+
+def test_plan_badges():
+    m = lambda px, size, mt: {"pixels": px, "size": size, "mtime": mt}
+    # cópias idênticas com mtimes diferentes: só "mais antiga"
+    assert ic.plan_badges([m(100, 10, 5.0), m(100, 10, 3.0)]) == {1: ["mais antiga"]}
+    # tudo igual: nada
+    assert ic.plan_badges([m(100, 10, 1.0), m(100, 10, 1.0)]) == {}
+    # resolução maior em uma, arquivo maior em outra, empate de data
+    r = ic.plan_badges([m(200, 10, 1.0), m(100, 20, 1.0)])
+    assert r == {0: ["maior resolução"], 1: ["maior arquivo"]}
+    # empate no máximo: as duas ganham
+    assert ic.plan_badges([m(200, 1, 1.0), m(200, 1, 1.0), m(50, 1, 1.0)]) == {0: ["maior resolução"], 1: ["maior resolução"]}
+    # dimensão desconhecida em alguma: rótulo de resolução omitido
+    assert ic.plan_badges([m(None, 10, 1.0), m(100, 20, 2.0)]) == {0: ["mais antiga"], 1: ["maior arquivo"]}

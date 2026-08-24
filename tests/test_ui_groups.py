@@ -202,3 +202,32 @@ def test_menu_de_contexto_handlers(app_with_groups, monkeypatch):
     monkeypatch.setattr(os, "startfile", lambda p: (_ for _ in ()).throw(OSError("x")), raising=False)
     app.open_image(fp)
     assert msgs[-1][0] == "showerror"
+
+
+def _badges_of(app, name):
+    idx, pos, _ = _row_labels(app, name)
+    frame = app.badge_frames[(idx, pos)]
+    return [str(c.cget("text")) for c in frame.winfo_children()]
+
+
+def test_badges_e_contadores(app_with_groups):
+    app, root, _ = app_with_groups
+    app.groups_per_page = 20
+    app.render_page(); root.update()
+    # grupo 1: a.jpg(q95, T0+100), a_copy(idêntica, T0+200), a_q30 (menor, T0+50), a_q60 (T0+250)
+    assert _badges_of(app, "a_q30.jpg") == ["mais antiga"]
+    assert "maior arquivo" in _badges_of(app, "a.jpg") and "maior arquivo" in _badges_of(app, "a_copy.jpg")
+    assert _badges_of(app, "a_q60.jpg") == []
+    assert all("maior resolução" not in _badges_of(app, n) for n in ("a.jpg", "a_q30.jpg"))
+    # grupo 2: b e b_copy idênticas com mtime empatado: nenhum rótulo
+    assert _badges_of(app, "b.png") == [] and _badges_of(app, "b_copy.png") == []
+
+    # contadores
+    assert app.review_label.cget("text") == "Verificados 0 / 2"
+    assert "Selecionadas: 0 imagem(ns)" in app.selection_label.cget("text")
+    app.select_group(0, "identical"); root.update()
+    size = os.path.getsize(app.group_check_vars[0]['images'][1]['filepath'])
+    assert app.selection_label.cget("text") == f"Selecionadas: 1 imagem(ns), {ic.format_bytes(size)}"
+    app.verify_group(0); root.update()
+    assert app.review_label.cget("text") == "Verificados 1 / 2"
+    assert float(app.review_progress.cget("value")) == 1.0
