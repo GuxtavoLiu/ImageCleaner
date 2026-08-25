@@ -271,6 +271,11 @@ internas da pasta alvo" controla os grupos sem par no acervo.
   verificados ficam em "Grupos verificados (N)" (com "Voltar para pendentes").
   "Selecionar Todas ..." age só nos pendentes; "Mover/Excluir Todas Selecionadas"
   valem para tudo.
+- **Regra de "Selecionar Semelhantes"** (`SIMILAR_KEEP_PRIORITY` no `main.py`): em cada
+  grupo, entre as imagens não idênticas, MANTÉM a de melhor qualidade e seleciona as
+  outras: 1) maior resolução, 2) maior arquivo, 3) mais antiga, 4) a primeira da lista.
+  Se o grupo tem imagem do acervo de referência, ela é a mantida. "Selecionar Idênticas"
+  segue mantendo a cópia mais antiga (idênticas têm a mesma qualidade por definição).
 - **Linha da imagem**: nome em destaque, pasta curta `[ALVO]/[REF]` (caminho completo
   no tooltip), resolução, tamanho, datas e rótulos "maior resolução", "mais antiga",
   "maior arquivo" (só quando há diferença). Clique na linha alterna a seleção

@@ -215,6 +215,19 @@ def apply_theme(root):
 # Threshold de similaridade (distância de Hamming máxima entre phashes).
 SIMILARITY_THRESHOLD = 10
 
+# "Selecionar Semelhantes": qual imagem do grupo é MANTIDA (as outras são
+# selecionadas). Critérios em ordem; o seguinte só decide em caso de empate.
+#   "resolution": maior largura x altura (desconhecida perde para conhecida)
+#   "size":       maior arquivo em bytes
+#   "mtime":      data de modificação mais antiga
+# Empate total: a primeira na ordem do grupo. Com ("mtime",) volta a regra
+# original "mantém a mais antiga". Não afeta "Selecionar Idênticas".
+SIMILAR_KEEP_PRIORITY = ("resolution", "size", "mtime")
+SIMILAR_RULE_TOOLTIP = ("Mantém, em cada grupo, a imagem de melhor qualidade e seleciona as outras:\n"
+                        "1) maior resolução   2) maior arquivo   3) mais antiga   4) a primeira da lista.\n"
+                        "Se houver imagem do acervo de referência, ela é a mantida.\n"
+                        "Imagens idênticas (mesmo conteúdo) não entram aqui.")
+
 # Confirmação de "Semelhante" por um segundo hash (dhash). É um pós-filtro:
 # não altera o agrupamento por phash (find_similar_groups); dentro de cada
 # grupo, um par com MD5 diferente só continua junto se o dhash também estiver
@@ -1160,16 +1173,42 @@ def plan_identical_selection(images):
     return selected
 
 
-def plan_similar_selection(images, md5_count):
+def keep_sort_key(img, index, priority=SIMILAR_KEEP_PRIORITY):
+    """
+    Chave de ordenação para escolher a imagem MANTIDA num grupo: quanto menor,
+    melhor. Cada critério vira uma tupla (desconhecido?, valor) para que valor
+    desconhecido sempre perca para conhecido; o índice na lista é o último
+    desempate (primeira da ordem do grupo).
+    img: dict com 'pixels' (int ou None), 'size' (int ou None), 'mtime'.
+    """
+    key = []
+    for crit in priority:
+        if crit == "resolution":
+            v = img.get('pixels')
+            key.append((0, -v) if v else (1, 0))
+        elif crit == "size":
+            v = img.get('size')
+            key.append((0, -v) if v is not None else (1, 0))
+        elif crit == "mtime":
+            v = img.get('mtime')
+            key.append((0, v) if v is not None and v != float("inf") else (1, 0))
+    key.append(index)
+    return tuple(key)
+
+
+def plan_similar_selection(images, md5_count, priority=SIMILAR_KEEP_PRIORITY):
     """
     Decide a seleção do botão "Selecionar Semelhantes" para UM grupo.
-    images: como em plan_identical_selection; md5_count: contagem de cada MD5
-    no grupo inteiro (inclui as imagens da referência).
+    images: dicts com 'md5', 'mtime', 'is_reference' e, para a qualidade,
+    'pixels' e 'size' (ausentes = desconhecidos); md5_count: contagem de cada
+    MD5 no grupo inteiro (inclui as imagens da referência).
     Candidatas: MD5 único no grupo (não é "Idêntica") e não é da referência.
       - se o grupo contém ALGUMA imagem da referência: seleciona todas as
         candidatas (a versão do acervo é a preservada);
-      - senão: com 2+ candidatas, ordena por mtime e seleciona todas exceto a
-        mais antiga; com 0 ou 1 candidata, não seleciona nada.
+      - senão: com 2+ candidatas, MANTÉM a melhor segundo `priority`
+        (SIMILAR_KEEP_PRIORITY: maior resolução, maior arquivo, mais antiga;
+        empate total: a primeira do grupo) e seleciona as outras; com 0 ou 1
+        candidata, não seleciona nada.
     Retorna lista de índices em `images`; nunca inclui referência.
     """
     candidates = [i for i, img in enumerate(images)
@@ -1177,8 +1216,8 @@ def plan_similar_selection(images, md5_count):
     if any(img.get('is_reference') for img in images):
         return candidates
     if len(candidates) > 1:
-        candidates.sort(key=lambda i: images[i]['mtime'])
-        return candidates[1:]
+        keep = min(candidates, key=lambda i: keep_sort_key(images[i], i, priority))
+        return [i for i in candidates if i != keep]
     return []
 
 
@@ -2512,6 +2551,7 @@ class ImageCleaner:
         btn_select_similar = make_button(top_frame, "Selecionar Todas Semelhantes", "similar",
                                          command=self.select_similar_images)
         btn_select_similar.pack(side="left", padx=5)
+        self.create_tooltip(btn_select_similar, SIMILAR_RULE_TOOLTIP)
 
         # Botões de ação global
         btn_move_all = make_button(top_frame, "Mover Todas Selecionadas", "move",
@@ -2775,8 +2815,10 @@ class ImageCleaner:
             make_button(btn_frame, "Selecionar Idênticas", "select",
                         command=lambda g=idx, c=select_cmd: c(g, "identical")).pack(side="left", padx=5)
         if plan_similar_selection(images, md5_count):
-            make_button(btn_frame, "Selecionar Semelhantes", "similar",
-                        command=lambda g=idx, c=select_cmd: c(g, "similar")).pack(side="left", padx=5)
+            b_sim = make_button(btn_frame, "Selecionar Semelhantes", "similar",
+                                command=lambda g=idx, c=select_cmd: c(g, "similar"))
+            b_sim.pack(side="left", padx=5)
+            self.create_tooltip(b_sim, SIMILAR_RULE_TOOLTIP)
         if verified_view:
             make_button(btn_frame, "Voltar para pendentes", "light",
                         command=lambda g=idx: self.unverify_group(g)).pack(side="left", padx=5)
@@ -2975,16 +3017,16 @@ class ImageCleaner:
             self.render_page()
 
     def _badges_for_group(self, images):
-        """Rótulos de diferença por posição (plan_badges sobre dims/tamanho/mtime)."""
+        """Rótulos de diferença por posição, com os MESMOS metadados que a
+           regra de seleção usa (assim rótulo e decisão coincidem, inclusive
+           para linhas ocultas de grupos recolhidos)."""
+        self._ensure_metrics(images)
         metas = []
         for info in images:
-            fp = info['filepath']
-            dims = self.image_dims.get(fp)
-            size = self.file_stats.get(fp, (None, None))[0]
             mtime = info.get('mtime')
             metas.append({
-                'pixels': dims[0] * dims[1] if dims else None,
-                'size': size,
+                'pixels': info.get('pixels'),
+                'size': info.get('size'),
                 'mtime': None if mtime in (None, float("inf")) else mtime,
             })
         return plan_badges(metas)
@@ -3425,11 +3467,37 @@ class ImageCleaner:
             self.current_page += 1
             self.render_page()
 
+    def _ensure_metrics(self, images):
+        """
+        Garante 'size' e 'pixels' nos dicts das imagens (usados pela regra de
+        qualidade e pelos rótulos). Tamanho vem do escaneamento; dimensões vêm
+        das miniaturas já lidas ou de uma leitura só do cabeçalho (sem
+        decodificar). Retorna quantos cabeçalhos foram lidos.
+        """
+        read = 0
+        for info in images:
+            fp = info['filepath']
+            if info.get('size') is None:
+                info['size'] = self.file_stats.get(fp, (None, None))[0]
+            if info.get('pixels') is None:
+                dims = self.image_dims.get(fp)
+                if dims is None:
+                    read += 1
+                    try:
+                        with Image.open(fp) as im:
+                            dims = im.size
+                        self.image_dims[fp] = dims
+                    except Exception:
+                        dims = None
+                info['pixels'] = dims[0] * dims[1] if dims else None
+        return read
+
     def _plan_for_group(self, group_data, kind):
         """Índices a selecionar num grupo: kind = "identical" | "similar"."""
         images = group_data['images']
         if kind == "identical":
             return plan_identical_selection(images)
+        self._ensure_metrics(images)
         return plan_similar_selection(images, group_data['md5_count'])
 
     def select_group(self, group_idx, kind):
@@ -3461,14 +3529,35 @@ class ImageCleaner:
            cada grupo. Com referência: mantém a versão do acervo (a lógica de
            decisão está em plan_similar_selection, testável sem interface)."""
         selected_count = 0
-        for idx in self.pending_idx:
-            group_data = self.group_check_vars[idx]
-            for i in self._plan_for_group(group_data, "similar"):
-                group_data['images'][i]['var'].set(1)
-                selected_count += 1
+        # Dimensões desconhecidas são lidas do cabeçalho; com muitas, mostra progresso
+        unknown = sum(1 for idx in self.pending_idx
+                      for im in self.group_check_vars[idx]['images']
+                      if im.get('pixels') is None and im['filepath'] not in self.image_dims)
+        show_progress = unknown > 500
+        if show_progress:
+            self.scan_cancelled = False
+            self.create_progress_window()
+            self.progress_window.title("Lendo dimensões das imagens")
+            self.progress_label.config(text="Lendo dimensões (só o cabeçalho de cada arquivo)...")
+        try:
+            done = 0
+            for n, idx in enumerate(self.pending_idx):
+                group_data = self.group_check_vars[idx]
+                done += self._ensure_metrics(group_data['images'])
+                if show_progress:
+                    self.update_progress(done, unknown, "dimensões", unit="arquivos")
+                    if self.scan_cancelled:
+                        break
+                for i in self._plan_for_group(group_data, "similar"):
+                    group_data['images'][i]['var'].set(1)
+                    selected_count += 1
+        finally:
+            if show_progress:
+                self._close_progress_window()
 
         messagebox.showinfo("Seleção Concluída",
-                           f"{selected_count} imagens semelhantes foram selecionadas (mantendo a mais antiga de cada grupo)."
+                           f"{selected_count} imagens semelhantes foram selecionadas (mantendo a de melhor "
+                           "qualidade de cada grupo: maior resolução, depois maior arquivo, depois mais antiga)."
                            + self._verified_note() + self._reference_selection_note())
 
     def _verified_note(self):
@@ -3927,13 +4016,22 @@ def run_selftest(folder, reference=None, confirm_similar=None):
         # Simula a seleção automática (mesmas funções puras da interface)
         mtime_by_path = {fp: (mt / 1e9 if mt is not None else float("inf"))
                          for (fp, _, mt) in entries}
+        size_by_path = {fp: sz for (fp, sz, _) in entries}
         n_protected = n_sel_ident = n_sel_simil = 0
         for g in groups:
             counts = {}
             for (_, _, m) in g:
                 counts[m] = counts.get(m, 0) + 1
-            images = [{'filepath': fp, 'md5': m, 'mtime': mtime_by_path.get(fp, float("inf")),
-                       'is_reference': cache_key(fp) in ref_keys} for (fp, _, m) in g]
+            images = []
+            for (fp, _, m) in g:
+                try:
+                    with Image.open(fp) as im:
+                        pixels = im.size[0] * im.size[1]
+                except Exception:
+                    pixels = None
+                images.append({'filepath': fp, 'md5': m, 'mtime': mtime_by_path.get(fp, float("inf")),
+                               'is_reference': cache_key(fp) in ref_keys,
+                               'pixels': pixels, 'size': size_by_path.get(fp)})
             n_protected += sum(1 for im in images if im['is_reference'])
             sel_i = plan_identical_selection(images)
             sel_s = plan_similar_selection(images, counts)

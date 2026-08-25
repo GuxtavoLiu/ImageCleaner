@@ -362,3 +362,23 @@ def test_preview_lado_a_lado(app_with_groups):
     assert len(wins) == 1
     wins[0].event_generate("<Escape>"); root.update()
     assert app.preview_window is None
+
+
+def test_selecionar_semelhantes_mantem_melhor_qualidade(app_with_groups):
+    app, root, msgs = app_with_groups
+    app.groups_per_page = 20
+    app.render_page(); root.update()
+    # grupo 1: a_q30 (menor arquivo) x a_q60 (maior): mesma resolução -> mantém a_q60
+    app.select_group(0, "similar"); root.update()
+    assert _selected(app, 0) == ["a_q30.jpg"]
+    # rótulos coincidem com a decisão: a_q60 não tem "maior arquivo" (a.jpg/a_copy têm),
+    # mas entre as candidatas ela é a maior
+    imgs = app.group_check_vars[0]['images']
+    by = {os.path.basename(im['filepath']): im for im in imgs}
+    assert by["a_q60.jpg"]['size'] > by["a_q30.jpg"]['size'] and by["a_q60.jpg"]['pixels'] == by["a_q30.jpg"]['pixels']
+    # "Todas" usa a mesma regra e a mensagem descreve a prioridade
+    for im in imgs:
+        im['var'].set(0)
+    app.select_similar_images(); root.update()
+    assert _selected(app, 0) == ["a_q30.jpg"]
+    assert "melhor qualidade" in msgs[-1][2]

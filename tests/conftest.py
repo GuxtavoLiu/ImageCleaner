@@ -190,13 +190,23 @@ def run_pipeline(root, confirm=False):
 
 def group_to_images_dicts(group):
     """Converte um grupo do build_groups nos dicts que a seleção consome
-       (mesmos campos de initialize_all_groups, sem os widgets Tk)."""
-    return [{
-        'filepath': fp,
-        'md5': md5_val,
-        'mtime': os.path.getmtime(fp),
-        'is_reference': False,
-    } for (fp, _, md5_val) in group]
+       (mesmos campos de initialize_all_groups + métricas de qualidade)."""
+    out = []
+    for (fp, _, md5_val) in group:
+        try:
+            with Image.open(fp) as im:
+                pixels = im.size[0] * im.size[1]
+        except Exception:
+            pixels = None
+        out.append({
+            'filepath': fp,
+            'md5': md5_val,
+            'mtime': os.path.getmtime(fp),
+            'is_reference': False,
+            'pixels': pixels,
+            'size': os.path.getsize(fp),
+        })
+    return out
 
 
 def md5_count_of(group):
@@ -228,7 +238,7 @@ def oracle_similar_selection(images, md5_count):
     return []
 
 
-def snapshot_single_mode(root, confirm=False):
+def snapshot_single_mode(root, confirm=False, priority=None):
     """
     Estrutura serializável do resultado completo do modo de uma pasta:
     grupos (caminhos relativos + rótulo Idêntica/Semelhante, na ordem) e as
@@ -253,7 +263,8 @@ def snapshot_single_mode(root, confirm=False):
         # existirem (pós-refatoração), senão o oráculo (pré-refatoração).
         if hasattr(ic, "plan_identical_selection"):
             ident = ic.plan_identical_selection(images)
-            simil = ic.plan_similar_selection(images, counts)
+            simil = (ic.plan_similar_selection(images, counts, priority) if priority
+                     else ic.plan_similar_selection(images, counts))
         else:
             ident = oracle_identical_selection(images)
             simil = oracle_similar_selection(images, counts)
@@ -272,10 +283,16 @@ GOLDEN_CONFIRM_PATH = os.path.join(TESTS_DIR, "golden_single_mode_confirm.json")
 GOLDEN_FIXTURE_CONFIRM_PATH = os.path.join(TESTS_DIR, "golden_confirm_fixture.json")
 
 
-def generate_golden(tmp_root, confirm=False, path=GOLDEN_PATH, builder=build_single_fixture):
+GOLDEN_QUALITY_PATH = os.path.join(TESTS_DIR, "golden_single_mode_quality.json")
+GOLDEN_FIXTURE_CONFIRM_QUALITY_PATH = os.path.join(TESTS_DIR, "golden_confirm_fixture_quality.json")
+LEGACY_PRIORITY = ("mtime",)   # regra original: mantém a mais antiga
+
+
+def generate_golden(tmp_root, confirm=False, path=GOLDEN_PATH, builder=build_single_fixture,
+                    priority=None):
     """Gera um snapshot dourado (rodar UMA vez, de forma deliberada)."""
     builder(tmp_root)
-    snap = snapshot_single_mode(tmp_root, confirm=confirm)
+    snap = snapshot_single_mode(tmp_root, confirm=confirm, priority=priority)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(snap, f, indent=2, ensure_ascii=False)
     return snap

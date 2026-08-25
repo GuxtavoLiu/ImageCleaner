@@ -123,3 +123,63 @@ def test_similar_identica_do_alvo_nao_e_candidata_mesmo_com_referencia():
     counts = _md5_count(images)
     assert ic.plan_similar_selection(images, counts) == [2]
     assert ic.plan_identical_selection(images) == [1]
+
+
+# --------------------------------------------------------------------------
+# 3) Regra de qualidade (SIMILAR_KEEP_PRIORITY): resolução > arquivo > data
+# --------------------------------------------------------------------------
+
+def _q(md5, mtime, pixels=None, size=None, ref=False):
+    return {'md5': md5, 'mtime': mtime, 'pixels': pixels, 'size': size, 'is_reference': ref}
+
+
+def test_qualidade_resolucao_decide():
+    imgs = [_q("a", 1, pixels=100, size=999), _q("b", 9, pixels=400, size=10)]
+    assert ic.plan_similar_selection(imgs, _md5_count(imgs)) == [0]     # mantém b (maior resolução)
+
+
+def test_qualidade_empate_resolucao_tamanho_decide():
+    imgs = [_q("a", 1, pixels=100, size=2_800_000), _q("b", 1, pixels=100, size=3_100_000)]
+    assert ic.plan_similar_selection(imgs, _md5_count(imgs)) == [0]     # grupo 303: mantém o maior arquivo
+
+
+def test_qualidade_empate_total_data_decide():
+    imgs = [_q("a", 5, pixels=100, size=10), _q("b", 2, pixels=100, size=10), _q("c", 7, pixels=100, size=10)]
+    assert sorted(ic.plan_similar_selection(imgs, _md5_count(imgs))) == [0, 2]   # mantém b (mais antiga)
+
+
+def test_qualidade_empate_absoluto_mantem_a_primeira():
+    imgs = [_q("a", 1, pixels=100, size=10), _q("b", 1, pixels=100, size=10)]
+    assert ic.plan_similar_selection(imgs, _md5_count(imgs)) == [1]
+
+
+def test_qualidade_resolucao_desconhecida_perde():
+    imgs = [_q("a", 1, pixels=None, size=999), _q("b", 9, pixels=50, size=1)]
+    assert ic.plan_similar_selection(imgs, _md5_count(imgs)) == [0]
+    # todas desconhecidas: cai no tamanho
+    imgs = [_q("a", 1, pixels=None, size=5), _q("b", 9, pixels=None, size=7)]
+    assert ic.plan_similar_selection(imgs, _md5_count(imgs)) == [0]
+    # sem métricas nenhuma (dicts antigos): cai na data, como antes
+    imgs = [_img("a", 5), _img("b", 2)]
+    assert ic.plan_similar_selection(imgs, _md5_count(imgs)) == [0]
+
+
+def test_qualidade_referencia_no_grupo_seleciona_todas_as_candidatas():
+    imgs = [_q("r", 1, pixels=10, size=1, ref=True), _q("a", 1, pixels=900, size=900), _q("b", 1, pixels=800, size=800)]
+    assert sorted(ic.plan_similar_selection(imgs, _md5_count(imgs))) == [1, 2]
+
+
+def test_qualidade_identicas_nao_entram():
+    imgs = [_q("m", 1, pixels=100, size=10), _q("m", 2, pixels=100, size=10), _q("x", 3, pixels=900, size=900)]
+    assert ic.plan_similar_selection(imgs, _md5_count(imgs)) == []        # só 1 candidata
+    assert ic.plan_identical_selection(imgs) == [1]                        # idênticas: mais antiga fica
+
+
+def test_prioridade_mtime_reproduz_regra_antiga():
+    for images in _casos_sem_referencia():
+        for im in images:
+            im['pixels'] = 100; im['size'] = 10       # métricas iguais: não interferem
+        counts = _md5_count(images)
+        esperado = sorted(oracle_similar_selection(images, counts))
+        assert sorted(ic.plan_similar_selection(images, counts, priority=("mtime",))) == esperado
+        assert sorted(ic.plan_similar_selection(images, counts)) == esperado

@@ -1,0 +1,30 @@
+{
+  "groups": [
+    [
+      [
+        "alpha_text.png",
+        "Identica"
+      ],
+      [
+        "alpha_text_copy.png",
+        "Identica"
+      ]
+    ],
+    [
+      [
+        "true_a.jpg",
+        "Semelhante"
+      ],
+      [
+        "true_a_q30.jpg",
+        "Semelhante"
+      ]
+    ]
+  ],
+  "selected_identical": [
+    "alpha_text_copy.png"
+  ],
+  "selected_similar": [
+    "true_a_q30.jpg"
+  ]
+}
