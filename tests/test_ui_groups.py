@@ -382,3 +382,71 @@ def test_selecionar_semelhantes_mantem_melhor_qualidade(app_with_groups):
     app.select_similar_images(); root.update()
     assert _selected(app, 0) == ["a_q30.jpg"]
     assert "melhor qualidade" in msgs[-1][2]
+
+
+@pytest.fixture
+def app_same_photo(tk_root, tmp_path, monkeypatch):
+    """App com a feature 'Mesma foto' LIGADA (constante patchada antes de criar
+       o app) sobre a fixture de mesma foto."""
+    from conftest import build_same_photo_fixture
+    monkeypatch.setattr(ic, "SAME_PHOTO_ENABLED", True)
+    root = tk_root
+    for w in root.winfo_children():
+        w.destroy()
+    fx = build_same_photo_fixture(str(tmp_path / "sp"))
+    msgs = []
+    for name in ("showinfo", "showerror", "showwarning"):
+        monkeypatch.setattr(messagebox, name, lambda title, msg, _n=name: msgs.append((_n, title, msg)))
+    monkeypatch.setattr(messagebox, "askyesno", lambda title, msg: msgs.append(("askyesno", title, msg)) or True)
+    monkeypatch.setattr(filedialog, "askdirectory", lambda **k: fx)
+    app = ic.ImageCleaner(root)
+    assert app.same_photo_check.winfo_manager() == "pack"       # checkbox existe com a constante ligada
+    app.select_folder()
+    app.use_cache_var.set(0)
+    app.start_scan()
+    t0 = time.time()
+    while time.time() - t0 < 60 and getattr(app, "groups_window", None) is None:
+        root.update()
+        time.sleep(0.02)
+    assert app.groups, ("sem grupos", msgs)
+    root.update()
+    yield app, root, msgs
+    for w in root.winfo_children():
+        try:
+            w.destroy()
+        except tk.TclError:
+            pass
+
+
+def _info_by_name(app):
+    return {os.path.basename(im['filepath']): im
+            for gd in app.group_check_vars.values() for im in gd['images']}
+
+
+def test_mesma_foto_status_na_tela(app_same_photo):
+    app, root, _ = app_same_photo
+    by = _info_by_name(app)
+    assert by["p_half.jpg"]['same_photo'] is not None and by["p_half.jpg"]['same_photo'] == by["p.jpg"]['same_photo']
+    assert by["p_exif_burst.jpg"]['same_photo'] is None
+    md5c = app.group_check_vars[0]['md5_count']
+    assert ic.image_status(by["p_half.jpg"], md5c) == "Mesma foto"
+    assert ic.image_status(by["p_exif_burst.jpg"], md5c) == "Semelhante"
+    # tag visual e contador
+    _, _, widgets = _row_labels(app, "p_half.jpg")
+    frame = widgets[1]   # text_frame
+    tags = [str(c.cget("text")) for c in frame.winfo_children() if isinstance(c, tk.Label)]
+    assert "MESMA FOTO" in tags
+    _, _, w2 = _row_labels(app, "p_exif_burst.jpg")
+    assert "MESMA FOTO" not in [str(c.cget("text")) for c in w2[1].winfo_children() if isinstance(c, tk.Label)]
+    assert "Mesma foto: 1 classe(s), 4 imagem(ns)" in app.page_info_label.cget("text")
+    # relatório usa o status novo
+    status, origem, size = app._image_meta(0, by["p_half.jpg"]['filepath'])
+    assert status == "Mesma foto"
+
+
+def test_mesma_foto_desligada_nao_aparece(app_with_groups):
+    app, root, _ = app_with_groups
+    assert app.same_photo_check.winfo_manager() == ""            # constante desligada: sem checkbox
+    assert app.groups_same_photo is None
+    assert all(im.get('same_photo') is None for gd in app.group_check_vars.values() for im in gd['images'])
+    assert "Mesma foto" not in app.page_info_label.cget("text")

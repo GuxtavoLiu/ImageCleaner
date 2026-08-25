@@ -147,6 +147,7 @@ def format_resolution(dims):
 
 
 BADGE_STYLES = {
+    "mesma foto": ("#004D40", "#B2DFDB"),
     "maior resolução": ("#1B5E20", "#C8E6C9"),
     "mais antiga": ("#0D47A1", "#BBDEFB"),
     "maior arquivo": ("#424242", "#EEEEEE"),
@@ -309,6 +310,7 @@ DEFAULT_SETTINGS = {
     "scan_subfolders": 1,
     "use_cache": 1,
     "confirm_similar": 1,
+    "same_photo": 1,
     "show_target_only": 1,
 }
 RECENT_LIMIT = 5
@@ -2132,6 +2134,9 @@ class ImageCleaner:
         self.reference_keys = set()     # cache_key dos arquivos listados na referência
         self.reference_prefix = None    # folder_prefix(reference_folder) durante o scan
         self.confirm_stats = None       # estatísticas da confirmação por dhash (se ligada)
+        self.groups_same_photo = None   # por grupo, classe "mesma foto" de cada imagem (ou None)
+        self.same_photo_suspect = set() # classes com cópia "ampliada?"
+        self.same_photo_stats = None
         self.session_report = SessionReport()   # CSV criado no primeiro registro
         self.action_log = []            # lotes de ações desta sessão (para "Desfazer")
         self.settings = load_settings()
@@ -2144,6 +2149,7 @@ class ImageCleaner:
         self.scan_subfolders_var.set(st["scan_subfolders"])
         self.use_cache_var.set(st["use_cache"])
         self.confirm_similar_var.set(st["confirm_similar"] if CONFIRM_SIMILAR else 0)
+        self.same_photo_var.set(st["same_photo"] if SAME_PHOTO_ENABLED else 0)
         self.show_target_only_var.set(st["show_target_only"])
         targets = [f for f in st["recent_targets"] if os.path.isdir(f)]
         refs = [f for f in st["recent_references"] if os.path.isdir(f)]
@@ -2158,6 +2164,7 @@ class ImageCleaner:
         st["scan_subfolders"] = self.scan_subfolders_var.get()
         st["use_cache"] = self.use_cache_var.get()
         st["confirm_similar"] = self.confirm_similar_var.get()
+        st["same_photo"] = self.same_photo_var.get()
         st["show_target_only"] = self.show_target_only_var.get()
         if self.selected_folder:
             st["recent_targets"] = push_recent(st["recent_targets"], self.selected_folder)
@@ -2263,6 +2270,19 @@ class ImageCleaner:
             variable=self.confirm_similar_var
         )
         self.confirm_check.pack(side="left", padx=(15, 0))
+
+        # Detecção de "Mesma foto" (mesma captura em outra versão)
+        self.same_photo_var = tk.IntVar(value=1 if SAME_PHOTO_ENABLED else 0)
+        self.same_photo_check = tk.Checkbutton(
+            self.subfolder_frame,
+            text="Detectar 'Mesma foto' (outra versão da mesma captura)",
+            variable=self.same_photo_var
+        )
+        if SAME_PHOTO_ENABLED:
+            self.same_photo_check.pack(side="left", padx=(15, 0))
+            self.same_photo_info_label = tk.Label(self.subfolder_frame, text="ℹ️", fg="blue", cursor="hand2")
+            self.same_photo_info_label.pack(side="left", padx=5)
+            self.create_tooltip(self.same_photo_info_label, SAME_PHOTO_RULE_TOOLTIP)
         self.confirm_info_label = tk.Label(self.subfolder_frame, text="ℹ️", fg="blue", cursor="hand2")
         self.confirm_info_label.pack(side="left", padx=5)
         self.create_tooltip(self.confirm_info_label,
@@ -2873,6 +2893,9 @@ class ImageCleaner:
         if self.close_requested:
             return
         self.confirm_stats = None
+        self.groups_same_photo = None
+        self.same_photo_suspect = set()
+        self.same_photo_stats = None
         hide_target_only = self.show_target_only_var.get() == 0
         if self.reference_folder and groups_idx:
             # Modo comparação: descarta grupos só da referência (nada a limpar)
@@ -2918,6 +2941,7 @@ class ImageCleaner:
 
         # Confirmação de "Semelhante" por segundo hash (pós-filtro opcional).
         # Desligada, nada daqui executa e o resultado é o de sempre.
+        dhash_by_idx = None
         confirm = CONFIRM_SIMILAR and self.confirm_similar_var.get() == 1
         if confirm and groups_idx:
             t1 = time.time()
@@ -2981,6 +3005,39 @@ class ImageCleaner:
                     "hash' para vê-los."
                 )
                 return
+
+        # "Mesma foto": classes dentro dos grupos (pós-filtro; nada muda desligado)
+        same_photo = SAME_PHOTO_ENABLED and self.same_photo_var.get() == 1
+        if same_photo and groups_idx and not self.close_requested:
+            t1 = time.time()
+            self.create_progress_window()
+            self.progress_window.title("Identificando 'Mesma foto'")
+            self.progress_label.config(text="Lendo provas (dimensões, EXIF, miniatura) das candidatas...")
+            self.progress_window.update()
+            sp_cache = SamePhotoCache() if (self.hash_cache is not None) else None
+            cancelled = False
+            class_by_idx, suspect, sp_stats = {}, set(), None
+            try:
+                class_by_idx, suspect, sp_stats, cancelled = same_photo_stage(
+                    self.images_data, stats, groups_idx, md5_by_idx, dhash_by_idx,
+                    self.hash_cache, sp_cache, HASH_WORKERS,
+                    progress_cb=lambda c, t, f: self.update_progress(c, t, f, unit="imagens"),
+                    cancel_check=lambda: self.scan_cancelled)
+            except ScanCancelled:
+                cancelled = True
+            finally:
+                self._close_progress_window()
+                if sp_cache is not None:
+                    sp_cache.close()
+            if cancelled or self.scan_cancelled or self.close_requested:
+                log.info("Identificação de 'Mesma foto' cancelada")
+                if not self.close_requested:
+                    messagebox.showinfo("Cancelado", "Identificação de 'Mesma foto' cancelada.")
+                return
+            self.groups_same_photo = [[class_by_idx.get(i) for i in g] for g in groups_idx]
+            self.same_photo_suspect = suspect
+            self.same_photo_stats = sp_stats
+            log.info("Mesma foto em %.1fs: %s", time.time() - t1, sp_stats)
 
         self.groups = build_groups(self.images_data, groups_idx, md5_by_idx)
         n_ident = 0
@@ -3103,7 +3160,10 @@ class ImageCleaner:
 
             # Cria IntVar para cada imagem (com trace: pinta a linha e atualiza
             # os contadores quando a seleção muda, por qualquer caminho)
-            for filepath, p_hash, md5_val in group:
+            same_photo_row = None
+            if self.groups_same_photo and len(self.groups_same_photo) == len(self.groups):
+                same_photo_row = self.groups_same_photo[idx]
+            for pos, (filepath, p_hash, md5_val) in enumerate(group):
                 var = tk.IntVar()
                 check_vars.append(var)
                 var.trace_add("write", lambda *a, g=idx, p=len(check_vars) - 1: self._on_var_changed(g, p))
@@ -3116,6 +3176,10 @@ class ImageCleaner:
                     # True só no modo comparação, para arquivos vindos da
                     # listagem da referência (set vazio no modo normal)
                     'is_reference': self._is_reference(filepath),
+                    # classe "mesma foto" (None = fora de classe / feature desligada)
+                    'same_photo': same_photo_row[pos] if same_photo_row else None,
+                    'same_photo_suspect': bool(same_photo_row and same_photo_row[pos] is not None
+                                               and same_photo_row[pos] in self.same_photo_suspect),
                 })
 
             # Armazena dados do grupo
@@ -3331,6 +3395,10 @@ class ImageCleaner:
         if cs:
             info += (f" | Confirmação por 2º hash: {cs['images_dropped']} imagem(ns) e "
                      f"{cs['groups_dropped']} grupo(s) descartados, {cs['groups_split']} divididos")
+        sp = self.same_photo_stats
+        if sp:
+            info += (f" | Mesma foto: {sp['classes']} classe(s), {sp['images_in_classes']} imagem(ns)"
+                     + (f", {sp['classes_suspect']} suspeita(s)" if sp['classes_suspect'] else ""))
         self.page_info_label.config(text=info)
         self.prev_btn.config(state="normal" if self.current_page > 0 else "disabled")
         self.next_btn.config(state="normal" if end_idx < total else "disabled")
@@ -3558,11 +3626,14 @@ class ImageCleaner:
             where = (f"[{tag}] " if tag else "") + (rel_dir or "(raiz)")
             self.create_tooltip(lbl_name, filepath)
 
-            # Verifica se a imagem é idêntica (MD5 duplicado) ou apenas semelhante
-            if md5_count[md5_val] > 1:
-                status = "Idêntica"
-            else:
-                status = "Semelhante"
+            # Status: Idêntica (MD5 repetido) > Mesma foto (classe) > Semelhante
+            status = image_status(img_info, md5_count)
+            if status == "Mesma foto":
+                tag_text = "MESMA FOTO" + ("  ·  ampliada?" if img_info.get('same_photo_suspect') else "")
+                tfg, tbg = BADGE_STYLES["mesma foto"]
+                lbl_same = tk.Label(text_frame, text=tag_text, fg=tfg, bg=tbg, font=FONT_BOLD, padx=4)
+                lbl_same.pack(anchor="w")
+                lbl_same.bind("<Button-1>", toggle_row)
 
             # Metadados do arquivo (protegido: o arquivo pode ter sido
             # movido/excluído por uma ação anterior nesta mesma tela)
@@ -3966,7 +4037,7 @@ class ImageCleaner:
 
                 sel = info['var'].get() == 1
                 ref = info.get('is_reference', False)
-                status = "Idêntica" if md5_count.get(info['md5'], 0) > 1 else "Semelhante"
+                status = image_status(info, md5_count)
                 dims = self.image_dims.get(fp)
                 size = self.file_stats.get(fp, (None, None))[0]
                 mt = info.get('mtime')
@@ -4225,7 +4296,7 @@ class ImageCleaner:
         if data:
             for info in data['images']:
                 if info['filepath'] == filepath:
-                    status = "Idêntica" if data['md5_count'].get(info['md5'], 0) > 1 else "Semelhante"
+                    status = image_status(info, data['md5_count'])
                     origem = "REF" if info.get('is_reference') else "ALVO"
                     break
         return status, origem, size
