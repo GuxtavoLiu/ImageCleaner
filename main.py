@@ -2223,8 +2223,8 @@ class ImageCleaner:
     def create_widgets(self):
         # Janela inicial: tamanho decente e centralizada (só aparência; o
         # fluxo de botões/opções abaixo é o mesmo de sempre).
-        width, height = 680, 540
-        self.master.minsize(640, 500)
+        width, height = 700, 580
+        self.master.minsize(660, 540)
         try:
             sw = self.master.winfo_screenwidth()
             sh = self.master.winfo_screenheight()
@@ -2261,20 +2261,25 @@ class ImageCleaner:
         self.path_label = tk.Label(self.master, text="", fg="blue", wraplength=600)
         self.path_label.pack(pady=5)
 
-        # Frame para checkbox de subpastas (inicialmente oculto)
+        # Frame das opções (inicialmente oculto): duas linhas, para caber na
+        # largura padrão da janela
         self.subfolder_frame = tk.Frame(self.master)
+        options_row1 = tk.Frame(self.subfolder_frame)
+        options_row1.pack(anchor="w")
+        options_row2 = tk.Frame(self.subfolder_frame)
+        options_row2.pack(anchor="w", pady=(4, 0))
 
         # Checkbox para escanear subpastas (marcada por padrão)
         self.scan_subfolders_var = tk.IntVar(value=1)
         self.subfolder_check = tk.Checkbutton(
-            self.subfolder_frame,
+            options_row1,
             text="Escanear subpastas",
             variable=self.scan_subfolders_var
         )
         self.subfolder_check.pack(side="left")
 
         # Ícone de informação (tooltip)
-        self.info_label = tk.Label(self.subfolder_frame, text="ℹ️", fg="blue", cursor="hand2")
+        self.info_label = tk.Label(options_row1, text="ℹ️", fg="blue", cursor="hand2")
         self.info_label.pack(side="left", padx=5)
 
         # Binds para o tooltip
@@ -2286,13 +2291,13 @@ class ImageCleaner:
         # Checkbox para usar cache de hashes (marcada por padrão)
         self.use_cache_var = tk.IntVar(value=1)
         self.cache_check = tk.Checkbutton(
-            self.subfolder_frame,
+            options_row1,
             text="Usar cache de hashes",
             variable=self.use_cache_var
         )
         self.cache_check.pack(side="left", padx=(15, 0))
 
-        self.cache_info_label = tk.Label(self.subfolder_frame, text="ℹ️", fg="blue", cursor="hand2")
+        self.cache_info_label = tk.Label(options_row1, text="ℹ️", fg="blue", cursor="hand2")
         self.cache_info_label.pack(side="left", padx=5)
         self.create_tooltip(self.cache_info_label,
                             "Guarda os hashes já calculados em um cache local\n"
@@ -2301,36 +2306,35 @@ class ImageCleaner:
                             "um escaneamento cancelado pode ser retomado depois.\n"
                             "Arquivos alterados são sempre recalculados.")
 
-        # Confirmação de semelhantes por segundo hash (na mesma linha das opções)
+        # Confirmação de semelhantes por segundo hash (2ª linha das opções)
         self.confirm_similar_var = tk.IntVar(value=1 if CONFIRM_SIMILAR else 0)
         self.confirm_check = tk.Checkbutton(
-            self.subfolder_frame,
+            options_row2,
             text="Confirmar semelhantes com segundo hash",
             variable=self.confirm_similar_var
         )
-        self.confirm_check.pack(side="left", padx=(15, 0))
+        self.confirm_check.pack(side="left")
+        self.confirm_info_label = tk.Label(options_row2, text="ℹ️", fg="blue", cursor="hand2")
+        self.confirm_info_label.pack(side="left", padx=5)
+        self.create_tooltip(self.confirm_info_label,
+                            "Antes de chamar duas fotos de 'Semelhantes', faz uma segunda\n"
+                            "verificação independente. Evita juntar fotos diferentes que só\n"
+                            "coincidem na distribuição de luz e sombra.\n"
+                            "Cópias idênticas nunca são afetadas.\n"
+                            "Desmarque para ver o agrupamento amplo de antes.")
 
         # Detecção de "Mesma foto" (mesma captura em outra versão)
         self.same_photo_var = tk.IntVar(value=1 if SAME_PHOTO_ENABLED else 0)
         self.same_photo_check = tk.Checkbutton(
-            self.subfolder_frame,
-            text="Detectar 'Mesma foto' (outra versão da mesma captura)",
+            options_row2,
+            text="Detectar 'Mesma foto'",
             variable=self.same_photo_var
         )
         if SAME_PHOTO_ENABLED:
             self.same_photo_check.pack(side="left", padx=(15, 0))
-            self.same_photo_info_label = tk.Label(self.subfolder_frame, text="ℹ️", fg="blue", cursor="hand2")
+            self.same_photo_info_label = tk.Label(options_row2, text="ℹ️", fg="blue", cursor="hand2")
             self.same_photo_info_label.pack(side="left", padx=5)
             self.create_tooltip(self.same_photo_info_label, SAME_PHOTO_RULE_TOOLTIP)
-        self.confirm_info_label = tk.Label(self.subfolder_frame, text="ℹ️", fg="blue", cursor="hand2")
-        self.confirm_info_label.pack(side="left", padx=5)
-        self.create_tooltip(self.confirm_info_label,
-                            "Além do hash perceptual (phash), exige que um segundo hash\n"
-                            "(dhash) também considere as imagens parecidas antes de\n"
-                            "mantê-las juntas como 'Semelhante'. Reduz falsos positivos\n"
-                            "(fotos diferentes agrupadas por coincidência de luz/sombra).\n"
-                            "Imagens idênticas (mesmo conteúdo) nunca são afetadas.\n"
-                            "Desmarque para ver o agrupamento amplo de antes.")
 
         # Área da pasta de referência (modo comparação; inicialmente oculta)
         self.reference_container = tk.Frame(self.master)
