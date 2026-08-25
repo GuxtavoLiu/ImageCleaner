@@ -235,17 +235,23 @@ SIMILAR_RULE_TOOLTIP = ("Mantém, em cada grupo, a imagem de melhor qualidade e 
 # dentro dos grupos: nada do agrupamento muda. Desligado = resultado atual.
 # Toda prova é obrigatória e falta de prova é "não" (ver same_photo_pair_ok).
 # ---------------------------------------------------------------------------
+# Calibração em 2026-08-24 no acervo real (667 grupos, 1.324 pares com MD5
+# diferente): 605 pares confirmados em 506 classes; nenhuma foto apenas
+# parecida (phash 8 a 10) passa; rajadas de câmera ficam a NCC 0,973 a 0,979
+# ou são vetadas pelo EXIF (12); uma rajada sem EXIF (NCC 0,981) cai só no
+# gradiente (0,81 contra p1 = 0,93 dos confirmados). Porta do dhash em 4
+# acrescenta 6 confirmações sem nenhum nome de rajada.
 SAME_PHOTO_ENABLED = False
 SAME_PHOTO_PHASH_MAX = 2            # distâncias de phash são sempre pares: 0 ou 2
-SAME_PHOTO_DHASH_MAX = 2            # porta de candidatura (calibrar até 6)
+SAME_PHOTO_DHASH_MAX = 4            # porta de candidatura (2 = 632 candidatos; 4 = 662; 6 = 677)
 SAME_PHOTO_MIN_SIDE = 100           # lado menor mínimo (px): ícones não entram
 SAME_PHOTO_ASPECT_TOL = 0.01        # tolerância relativa da proporção (dimensões brutas)
-SAME_PHOTO_GRAY_SIZE = 64           # miniatura em cinza (pixels brutos, sem exif_transpose)
+SAME_PHOTO_GRAY_SIZE = 64           # miniatura em cinza (32x32 deixa passar 14% das quase-rajadas)
 SAME_PHOTO_MIN_STD = 6.0            # desvio mínimo da miniatura (níveis de cinza)
-SAME_PHOTO_NCC_MIN = 0.98           # correlação global mínima
+SAME_PHOTO_NCC_MIN = 0.98           # correlação global mínima (candidatos p5 = 0,998; rajadas < 0,98)
 SAME_PHOTO_BLOCKS = 4               # grade 4x4 = 16 blocos para a pior região
-SAME_PHOTO_BLOCK_ERR_MAX = 0.30     # erro quadrático médio máximo num bloco (unidades de desvio global)
-SAME_PHOTO_GRAD_NCC_MIN = None      # correlação de gradientes (None = desligada; calibrar)
+SAME_PHOTO_BLOCK_ERR_MAX = 0.30     # erro quadrático médio máximo num bloco (candidatos p99 = 0,26)
+SAME_PHOTO_GRAD_NCC_MIN = 0.85      # correlação de gradientes (confirmados p1 = 0,93; parecidas p95 = 0,66)
 SAME_PHOTO_EXIF_VETO = True
 SAME_PHOTO_EXIF_WINDOW = 3600       # DateTimeOriginal diferindo até isto (s) = rajada/sequência: veta
 SAME_PHOTO_PIXEL_IDENTICAL_NCC = 0.999   # conteúdo pixel-idêntico: o veto EXIF não se aplica
