@@ -321,3 +321,69 @@ def tk_root():
         root.destroy()
     except tk.TclError:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Fixture "Mesma foto": base com textura (o dhash precisa de gradientes
+# estáveis) e variantes que devem (ou não) ser reconhecidas como a mesma foto.
+# ---------------------------------------------------------------------------
+
+def _textured_base(w=320, h=240, seed=5):
+    rng = np.random.RandomState(seed)
+    yy, xx = np.mgrid[0:h, 0:w]
+    arr = 90 + 60 * (xx / w) + 40 * (yy / h) + rng.normal(0, 12, (h, w))
+    for _ in range(10):
+        x0, y0 = rng.randint(0, w - 40), rng.randint(0, h - 40)
+        arr[y0:y0 + rng.randint(20, 60), x0:x0 + rng.randint(20, 60)] += rng.randint(-70, 70)
+    arr = np.clip(arr, 0, 255).astype(np.uint8)
+    rgb = np.stack([arr, np.clip(arr * 0.9, 0, 255).astype(np.uint8),
+                    np.clip(arr * 1.1, 0, 255).astype(np.uint8)], axis=-1)
+    return Image.fromarray(rgb, "RGB")
+
+
+def _exif(dto=None, make="Canon", model="EOS", orientation=None, subsec=None):
+    ex = Image.Exif()
+    if make:
+        ex[271] = make
+    if model:
+        ex[272] = model
+    if orientation:
+        ex[274] = orientation
+    if dto:
+        ex.get_ifd(0x8769)[0x9003] = dto
+    if subsec:
+        ex.get_ifd(0x8769)[0x9291] = subsec
+    return ex.tobytes()
+
+
+def build_same_photo_fixture(root):
+    """
+    p.jpg (320x240, q95, EXIF 2020:09:13 10:00:00) e variantes:
+      mesma foto: p_half (50%, sem EXIF), p_q30 (recompressão), p_exif_edit
+        (pixels de p_q30, data +3 anos: edição de data, não veta);
+      NÃO mesma foto: p_border (borda 10 px: proporção), p_crop (recorte 10%),
+        p_rot (pixels rotacionados + Orientation=8), p_flip (espelhada),
+        p_sticker (quadrado preto 40x40: pior região), p_exif_burst (pixels de
+        p_q30, data +2 s: veto EXIF), p_tiny (48 px: dimensão mínima).
+    """
+    os.makedirs(root, exist_ok=True)
+    base = _textured_base()
+    base.save(os.path.join(root, "p.jpg"), quality=95, exif=_exif("2020:09:13 10:00:00"))
+    base.resize((160, 120), Image.LANCZOS).save(os.path.join(root, "p_half.jpg"), quality=90)
+    base.save(os.path.join(root, "p_q30.jpg"), quality=30, exif=_exif("2020:09:13 10:00:00"))
+    base.save(os.path.join(root, "p_exif_edit.jpg"), quality=30, exif=_exif("2023:09:13 10:00:00"))
+    base.save(os.path.join(root, "p_exif_burst.jpg"), quality=30, exif=_exif("2020:09:13 10:00:02"))
+    bordered = Image.new("RGB", (340, 260), (255, 255, 255))
+    bordered.paste(base, (10, 10))
+    bordered.save(os.path.join(root, "p_border.jpg"), quality=95)
+    base.crop((16, 12, 304, 228)).save(os.path.join(root, "p_crop.jpg"), quality=95)
+    base.transpose(Image.ROTATE_90).save(os.path.join(root, "p_rot.jpg"), quality=95,
+                                         exif=_exif("2020:09:13 10:00:00", orientation=8))
+    base.transpose(Image.FLIP_LEFT_RIGHT).save(os.path.join(root, "p_flip.jpg"), quality=95)
+    stick = base.copy()
+    stick.paste((0, 0, 0), (190, 125, 250, 185))
+    stick.save(os.path.join(root, "p_sticker.jpg"), quality=95)
+    base.resize((48, 36), Image.LANCZOS).save(os.path.join(root, "p_tiny.jpg"), quality=95)
+    for k, name in enumerate(sorted(os.listdir(root))):
+        os.utime(os.path.join(root, name), (T0 + 10 * k, T0 + 10 * k))
+    return root

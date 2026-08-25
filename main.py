@@ -228,6 +228,35 @@ SIMILAR_RULE_TOOLTIP = ("Mantém, em cada grupo, a imagem de melhor qualidade e 
                         "Se houver imagem do acervo de referência, ela é a mantida.\n"
                         "Imagens idênticas (mesmo conteúdo) não entram aqui.")
 
+# ---------------------------------------------------------------------------
+# "Mesma foto": mesma captura em outra versão (redimensionada, recomprimida,
+# EXIF alterado). Terceiro status entre "Idêntica" e "Semelhante". Pós-filtro
+# dentro dos grupos: nada do agrupamento muda. Desligado = resultado atual.
+# Toda prova é obrigatória e falta de prova é "não" (ver same_photo_pair_ok).
+# ---------------------------------------------------------------------------
+SAME_PHOTO_ENABLED = False
+SAME_PHOTO_PHASH_MAX = 2            # distâncias de phash são sempre pares: 0 ou 2
+SAME_PHOTO_DHASH_MAX = 2            # porta de candidatura (calibrar até 6)
+SAME_PHOTO_MIN_SIDE = 100           # lado menor mínimo (px): ícones não entram
+SAME_PHOTO_ASPECT_TOL = 0.01        # tolerância relativa da proporção (dimensões brutas)
+SAME_PHOTO_GRAY_SIZE = 64           # miniatura em cinza (pixels brutos, sem exif_transpose)
+SAME_PHOTO_MIN_STD = 6.0            # desvio mínimo da miniatura (níveis de cinza)
+SAME_PHOTO_NCC_MIN = 0.98           # correlação global mínima
+SAME_PHOTO_BLOCKS = 4               # grade 4x4 = 16 blocos para a pior região
+SAME_PHOTO_BLOCK_ERR_MAX = 0.30     # erro quadrático médio máximo num bloco (unidades de desvio global)
+SAME_PHOTO_GRAD_NCC_MIN = None      # correlação de gradientes (None = desligada; calibrar)
+SAME_PHOTO_EXIF_VETO = True
+SAME_PHOTO_EXIF_WINDOW = 3600       # DateTimeOriginal diferindo até isto (s) = rajada/sequência: veta
+SAME_PHOTO_PIXEL_IDENTICAL_NCC = 0.999   # conteúdo pixel-idêntico: o veto EXIF não se aplica
+SAME_PHOTO_PIXEL_IDENTICAL_ERR = 0.01
+SAME_PHOTO_UPSCALE_BPP_RATIO = 0.5  # maior em pixels com bytes/pixel < 50% da menor = "ampliada?"
+SAME_PHOTO_RULE_TOOLTIP = ("Mesma foto = mesma captura em outra versão (tamanho, compressão, EXIF).\n"
+                           "Provas exigidas: hashes quase iguais, mesma proporção, correlação de\n"
+                           "pixels alta no todo e em cada região, e EXIF sem indício de rajada.\n"
+                           "Mantém a de melhor qualidade (resolução, arquivo, data) e seleciona as\n"
+                           "outras; classes com cópia 'ampliada?' ficam para você decidir.")
+
+
 # Confirmação de "Semelhante" por um segundo hash (dhash). É um pós-filtro:
 # não altera o agrupamento por phash (find_similar_groups); dentro de cada
 # grupo, um par com MD5 diferente só continua junto se o dhash também estiver
@@ -621,6 +650,119 @@ class HashCache:
             self.conn = None
         self.loaded = {}
         self.loaded_prefixes = []
+
+
+class SamePhotoCache:
+    """
+    Cache das provas de "Mesma foto" em tabela própria (mesmo arquivo SQLite
+    do HashCache, tabela same_photo_v1): dimensões brutas, campos EXIF e a
+    miniatura em cinza (BLOB de gray_size**2 bytes). Fica fora da tabela
+    quente de hashes de propósito: load_prefix não a carrega e store() de
+    hashes não a toca. Consultas só por lote de caminhos envolvidos.
+    """
+    TABLE = "same_photo_v1"
+
+    def __init__(self, path=None):
+        self.conn = None
+        self.pending = []
+        self.path = path or get_hash_cache_path()
+        try:
+            self.conn = sqlite3.connect(self.path, timeout=5)
+            try:
+                self.conn.execute("PRAGMA journal_mode=WAL")
+                self.conn.execute("PRAGMA busy_timeout=5000")
+            except Exception as e:
+                log.warning("Cache mesma foto: PRAGMA falhou: %s", e)
+            self.conn.execute(
+                f"CREATE TABLE IF NOT EXISTS {self.TABLE} ("
+                "path TEXT PRIMARY KEY, size INTEGER, mtime_ns INTEGER, "
+                "width INTEGER, height INTEGER, gray_size INTEGER, gray BLOB, exif TEXT)"
+            )
+            self.conn.commit()
+        except Exception as e:
+            log.warning("Cache mesma foto desativado: %s", e)
+            self.conn = None
+
+    @property
+    def active(self):
+        return self.conn is not None
+
+    def lookup_many(self, items, gray_size=None):
+        """items: lista de (filepath, size, mtime_ns). Retorna {filepath: features}
+           só para registros válidos (size/mtime iguais, blob do tamanho certo)."""
+        out = {}
+        if self.conn is None or not items:
+            return out
+        gray_size = gray_size or SAME_PHOTO_GRAY_SIZE
+        by_key = {cache_key(fp): (fp, size, mt) for fp, size, mt in items}
+        keys = list(by_key)
+        for start in range(0, len(keys), 400):
+            chunk = keys[start:start + 400]
+            marks = ",".join("?" * len(chunk))
+            try:
+                rows = self.conn.execute(
+                    f"SELECT path, size, mtime_ns, width, height, gray_size, gray, exif "
+                    f"FROM {self.TABLE} WHERE path IN ({marks})", chunk).fetchall()
+            except Exception as e:
+                log.warning("Cache mesma foto: consulta falhou: %s", e)
+                return out
+            for path, size, mt, w, h, gs, gray, exif in rows:
+                fp, want_size, want_mt = by_key[path]
+                if size != want_size or mt != want_mt:
+                    continue
+                if gs != gray_size or gray is None or len(gray) != gray_size * gray_size:
+                    continue
+                try:
+                    exif_d = json.loads(exif) if exif else {}
+                except Exception:
+                    exif_d = {}
+                out[fp] = {"dims": (w, h), "exif": exif_d, "gray": bytes(gray)}
+        return out
+
+    def store(self, filepath, size, mtime_ns, features, gray_size=None):
+        if self.conn is None:
+            return
+        gray_size = gray_size or SAME_PHOTO_GRAY_SIZE
+        w, h = features["dims"]
+        self.pending.append((cache_key(filepath), size, mtime_ns, w, h, gray_size,
+                             sqlite3.Binary(features["gray"]),
+                             json.dumps(features.get("exif") or {}, ensure_ascii=False)))
+        if len(self.pending) >= 500:
+            self.flush()
+
+    def flush(self):
+        if self.conn is None or not self.pending:
+            return
+        rows = self.pending
+        self.pending = []
+        sql = (f"INSERT OR REPLACE INTO {self.TABLE} "
+               "(path, size, mtime_ns, width, height, gray_size, gray, exif) VALUES (?,?,?,?,?,?,?,?)")
+        try:
+            self.conn.executemany(sql, rows)
+            self.conn.commit()
+        except Exception as e:
+            log.warning("Cache mesma foto: lote de %d falhou (%s); um a um", len(rows), e)
+            dropped = 0
+            for row in rows:
+                try:
+                    self.conn.execute(sql, row)
+                except Exception:
+                    dropped += 1
+            try:
+                self.conn.commit()
+            except Exception as e2:
+                log.warning("Cache mesma foto: commit falhou: %s", e2)
+            if dropped:
+                log.warning("Cache mesma foto: %d registro(s) descartado(s)", dropped)
+
+    def close(self):
+        self.flush()
+        if self.conn is not None:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+            self.conn = None
 
 
 class ScanCancelled(Exception):
@@ -1487,6 +1629,490 @@ def confirm_similar_groups(images_data, groups_idx, md5_by_idx, dhash_by_idx,
         if progress_cb:
             progress_cb(gi + 1, total)
     return out, stats
+
+
+# ---------------------------------------------------------------------------
+# "Mesma foto": provas por par e classes dentro dos grupos (funções puras)
+# ---------------------------------------------------------------------------
+
+def _exif_str(v):
+    if v is None:
+        return None
+    try:
+        s = str(v).strip().strip("\x00")
+    except Exception:
+        return None
+    return s or None
+
+
+def read_exif_fields(img):
+    """Campos EXIF usados pelo veto, lidos do cabeçalho (sem decodificar):
+       DateTimeOriginal e SubSecTimeOriginal ficam no sub-IFD Exif (0x8769)."""
+    out = {"dto": None, "subsec": None, "uid": None, "make": None, "model": None}
+    try:
+        ex = img.getexif()
+        if not ex:
+            return out
+        out["make"] = _exif_str(ex.get(271))
+        out["model"] = _exif_str(ex.get(272))
+        sub = ex.get_ifd(0x8769)
+        out["dto"] = _exif_str(sub.get(0x9003))
+        out["subsec"] = _exif_str(sub.get(0x9291))
+        out["uid"] = _exif_str(sub.get(0xA420))
+    except Exception:
+        pass
+    return out
+
+
+def parse_exif_datetime(text):
+    """'AAAA:MM:DD HH:MM:SS' -> timestamp (s) ou None."""
+    if not text:
+        return None
+    try:
+        return datetime.strptime(text[:19], "%Y:%m:%d %H:%M:%S").timestamp()
+    except Exception:
+        return None
+
+
+def same_photo_features(filepath, size=None):
+    """
+    Provas de UMA imagem numa única abertura: dimensões brutas, campos EXIF e
+    miniatura size x size em cinza dos pixels BRUTOS (sem exif_transpose, como
+    o phash/dhash), via _flatten_alpha + draft JPEG + LANCZOS.
+    """
+    size = size or SAME_PHOTO_GRAY_SIZE
+    with Image.open(filepath) as img:
+        dims = img.size
+        exif = read_exif_fields(img)
+        if img.format == "JPEG":
+            img.draft("L", (size * 2, size * 2))
+        gray = _flatten_alpha(img).convert("L").resize((size, size), Image.LANCZOS)
+        return {"dims": dims, "exif": exif, "gray": gray.tobytes()}
+
+
+def gray_array(blob, size=None):
+    """BLOB -> array float32 (size, size), ou None se o tamanho não bate."""
+    size = size or SAME_PHOTO_GRAY_SIZE
+    if blob is None or len(blob) != size * size:
+        return None
+    return np.frombuffer(blob, dtype=np.uint8).astype(np.float32).reshape(size, size)
+
+
+def normalize_gray(a, min_std=None):
+    """Média 0 e desvio 1; None se a imagem é quase lisa (sem prova)."""
+    min_std = SAME_PHOTO_MIN_STD if min_std is None else min_std
+    if a is None:
+        return None
+    std = float(a.std())
+    if std < min_std:
+        return None
+    return (a - a.mean()) / std
+
+
+def ncc_global(na, nb):
+    """Correlação de Pearson entre duas miniaturas já normalizadas."""
+    return float((na * nb).mean())
+
+
+def block_max_error(na, nb, blocks=None):
+    """
+    Pior região: maior erro quadrático médio entre blocos correspondentes
+    (grade blocks x blocks) das miniaturas normalizadas. Mede diferença
+    LOCAL na escala global (uma pessoa que se mexeu, um adesivo), sem a
+    instabilidade da correlação por bloco em regiões lisas (céu).
+    """
+    blocks = blocks or SAME_PHOTO_BLOCKS
+    n = na.shape[0]
+    h = n // blocks
+    worst = 0.0
+    for r in range(blocks):
+        for c in range(blocks):
+            d = na[r * h:(r + 1) * h, c * h:(c + 1) * h] - nb[r * h:(r + 1) * h, c * h:(c + 1) * h]
+            worst = max(worst, float((d * d).mean()))
+    return worst
+
+
+def ncc_gradient(na, nb):
+    """Correlação das magnitudes de gradiente (estrutura, não iluminação)."""
+    def grad(a):
+        gx = np.diff(a, axis=1)[:-1, :]
+        gy = np.diff(a, axis=0)[:, :-1]
+        return np.sqrt(gx * gx + gy * gy)
+    ga, gb = grad(na), grad(nb)
+    ga = ga - ga.mean()
+    gb = gb - gb.mean()
+    den = float(np.sqrt((ga * ga).sum() * (gb * gb).sum()))
+    if den < 1e-6:
+        return 0.0
+    return float((ga * gb).sum() / den)
+
+
+def aspect_close(d1, d2, tol=None):
+    tol = SAME_PHOTO_ASPECT_TOL if tol is None else tol
+    if not d1 or not d2 or 0 in d1 or 0 in d2:
+        return False
+    r1, r2 = d1[0] / d1[1], d2[0] / d2[1]
+    return abs(r1 - r2) <= tol * max(r1, r2)
+
+
+def exif_veto(e1, e2, pixel_identical, window=None):
+    """
+    EXIF nunca confirma; só derruba. Veta quando:
+      - DateTimeOriginal existe nas duas, difere e a diferença é de até
+        `window` segundos (rajada/sequência; diferença de dias é edição de
+        data, ex.: scripts que corrigem a data), ou
+      - DTO igual e SubSecTimeOriginal existe nas duas e difere, ou
+      - ImageUniqueID existe nas duas e difere.
+    Conteúdo pixel-idêntico nunca é vetado (não pode ser outra captura).
+    """
+    if pixel_identical or not e1 or not e2:
+        return False
+    window = SAME_PHOTO_EXIF_WINDOW if window is None else window
+    d1, d2 = e1.get("dto"), e2.get("dto")
+    if d1 and d2:
+        if d1 != d2:
+            t1, t2 = parse_exif_datetime(d1), parse_exif_datetime(d2)
+            if t1 is None or t2 is None:
+                return True
+            if abs(t1 - t2) <= window:
+                return True
+        else:
+            s1, s2 = e1.get("subsec"), e2.get("subsec")
+            if s1 and s2 and s1 != s2:
+                return True
+    u1, u2 = e1.get("uid"), e2.get("uid")
+    if u1 and u2 and u1 != u2:
+        return True
+    return False
+
+
+def same_photo_pair_ok(fa, fb, params=None):
+    """
+    Provas de pixels/EXIF para um par já candidato pelos hashes.
+    fa, fb: features (dims, exif, gray) OU None (sem prova => False).
+    Retorna (ok, motivo) com motivo em: "ok", "sem_prova", "dimensao",
+    "proporcao", "lisa", "ncc", "bloco", "gradiente", "exif".
+    """
+    p = params or {}
+    min_side = p.get("min_side", SAME_PHOTO_MIN_SIDE)
+    if not fa or not fb:
+        return False, "sem_prova"
+    da, db = fa.get("dims"), fb.get("dims")
+    if not da or not db or min(da) < min_side or min(db) < min_side:
+        return False, "dimensao"
+    if not aspect_close(da, db, p.get("aspect_tol")):
+        return False, "proporcao"
+    na = normalize_gray(gray_array(fa.get("gray"), p.get("gray_size")), p.get("min_std"))
+    nb = normalize_gray(gray_array(fb.get("gray"), p.get("gray_size")), p.get("min_std"))
+    if na is None or nb is None:
+        return False, "lisa"
+    ncc = ncc_global(na, nb)
+    if ncc < p.get("ncc_min", SAME_PHOTO_NCC_MIN):
+        return False, "ncc"
+    err = block_max_error(na, nb, p.get("blocks"))
+    if err > p.get("block_err_max", SAME_PHOTO_BLOCK_ERR_MAX):
+        return False, "bloco"
+    grad_min = p.get("grad_ncc_min", SAME_PHOTO_GRAD_NCC_MIN)
+    if grad_min is not None and ncc_gradient(na, nb) < grad_min:
+        return False, "gradiente"
+    if p.get("exif_veto", SAME_PHOTO_EXIF_VETO):
+        identical = (ncc >= p.get("pixel_identical_ncc", SAME_PHOTO_PIXEL_IDENTICAL_NCC)
+                     and err <= p.get("pixel_identical_err", SAME_PHOTO_PIXEL_IDENTICAL_ERR))
+        if exif_veto(fa.get("exif"), fb.get("exif"), identical, p.get("exif_window")):
+            return False, "exif"
+    return True, "ok"
+
+
+def same_photo_candidate_pairs(images_data, groups_idx, md5_by_idx, dhash_by_idx,
+                               phash_max=None, dhash_max=None, cancel_check=None):
+    """
+    Pares (gi, i, j) com i < j, dentro de cada grupo, que passam na porta dos
+    hashes: MD5 diferente (e sem sentinela ERR:), nenhum degenerado, ambos com
+    dhash, distância de phash <= phash_max e de dhash <= dhash_max.
+    Grupos com um único MD5 são pulados. Retorna (pairs, stats).
+    """
+    phash_max = SAME_PHOTO_PHASH_MAX if phash_max is None else phash_max
+    dhash_max = SAME_PHOTO_DHASH_MAX if dhash_max is None else dhash_max
+    pairs = []
+    stats = {"groups_checked": 0, "pairs_hash_rule": 0, "pairs_without_dhash": 0}
+    for gi, group in enumerate(groups_idx):
+        if cancel_check and cancel_check():
+            raise ScanCancelled()
+        md5s = [md5_by_idx.get(i, images_data[i][2]) for i in group]
+        if len(set(md5s)) < 2:
+            continue
+        stats["groups_checked"] += 1
+        k = len(group)
+        P = np.array([hash_to_int(images_data[i][1]) for i in group], dtype=np.uint64)
+        deg = np.array([is_degenerate_hash(p) for p in P.tolist()], dtype=bool)
+        bad = np.array([(m is None) or str(m).startswith("ERR:") for m in md5s], dtype=bool)
+        class_of = {}
+        cls = np.array([class_of.setdefault(m, len(class_of)) for m in md5s], dtype=np.int64)
+        has = np.array([i in dhash_by_idx for i in group], dtype=bool)
+        D = np.array([dhash_by_idx.get(i, 0) for i in group], dtype=np.uint64)
+        block = int(max(16, min(512, 4_000_000 // k)))
+        for start in range(0, k, block):
+            if start + 1 >= k:
+                break
+            end = min(start + block, k)
+            rows, cols = slice(start, end), slice(start + 1, k)
+            pd = _popcount_u64(P[rows][:, None] ^ P[cols][None, :])
+            dd = _popcount_u64(D[rows][:, None] ^ D[cols][None, :])
+            tri = np.arange(end - start)[:, None] <= np.arange(k - start - 1)[None, :]
+            diff_md5 = cls[rows][:, None] != cls[cols][None, :]
+            usable = (~deg[rows])[:, None] & (~deg[cols])[None, :] & (~bad[rows])[:, None] & (~bad[cols])[None, :]
+            close = (pd <= phash_max) & tri & diff_md5 & usable
+            both = has[rows][:, None] & has[cols][None, :]
+            stats["pairs_without_dhash"] += int((close & ~both).sum())
+            ok = close & both & (dd <= dhash_max)
+            rr, cc = np.nonzero(ok)
+            for r, c in zip((rr + start).tolist(), (cc + start + 1).tolist()):
+                pairs.append((gi, group[r], group[c]))
+    stats["pairs_hash_rule"] = len(pairs)
+    return pairs, stats
+
+
+def same_photo_features_for_indices(images_data, stats, indices, cache, workers,
+                                    progress_cb=None, cancel_check=None):
+    """Features (dims, exif, gray) dos índices pedidos: cache em lote, depois
+       cálculo em paralelo (padrão de dhash_for_groups). -> (feat_by_idx, cancelled)."""
+    feat_by_idx = {}
+    indices = sorted(set(indices))
+    items = []
+    for i in indices:
+        size, mt = stats[i] if stats[i] else (None, None)
+        items.append((images_data[i][0], size, mt))
+    cached = cache.lookup_many([it for it in items if it[1] is not None]) if cache is not None else {}
+    to_compute = []
+    for i, (fp, size, mt) in zip(indices, items):
+        if fp in cached:
+            feat_by_idx[i] = cached[fp]
+        else:
+            to_compute.append(i)
+    total = len(to_compute)
+    processed = 0
+    cancelled = False
+    if total == 0:
+        return feat_by_idx, False
+
+    def worker(idx):
+        fp = images_data[idx][0]
+        try:
+            return idx, same_photo_features(fp), None
+        except Exception as e:
+            return idx, None, e
+
+    def on_result(result):
+        nonlocal processed
+        idx, feat, err = result
+        fp = images_data[idx][0]
+        if err is None:
+            feat_by_idx[idx] = feat
+            size, mt = stats[idx] if stats[idx] else (None, None)
+            if cache is not None and size is not None:
+                cache.store(fp, size, mt, feat)
+        else:
+            log.warning("Mesma foto: sem provas para %s (%s)", fp, err)
+        processed += 1
+        if progress_cb:
+            progress_cb(processed, total, fp)
+
+    try:
+        cancelled = _run_parallel_bounded(to_compute, worker, on_result, workers, cancel_check)
+    finally:
+        if cache is not None:
+            cache.flush()
+    return feat_by_idx, cancelled
+
+
+def _new_same_photo_stats():
+    return {"groups_checked": 0, "pairs_hash_rule": 0, "pairs_without_dhash": 0,
+            "pairs_confirmed": 0, "rejected": {}, "unions_refused_clique": 0,
+            "classes": 0, "images_in_classes": 0, "classes_suspect": 0}
+
+
+def same_photo_classes(groups_idx, pairs, images_data, stats, md5_by_idx, feat_by_idx,
+                       params=None, cancel_check=None):
+    """
+    Classes de "mesma foto" por grupo: Union-Find sobre pares confirmados com
+    LIGAÇÃO COMPLETA (duas classes só se unem se todo par cruzado é aresta),
+    memorizando recusas por par de raízes. Cópias com MD5 igual entram na
+    classe da sua cópia. Só classes com 2+ MD5 distintos são devolvidas.
+    Retorna (class_by_idx, suspect_class_ids, sp_stats). Id da classe = menor
+    índice; classe "suspeita" = a de mais pixels tem bytes/pixel muito menor
+    que outra (cópia ampliada?).
+    """
+    p = params or {}
+    sp = _new_same_photo_stats()
+    pairs_by_group = {}
+    for gi, i, j in pairs:
+        pairs_by_group.setdefault(gi, []).append((i, j))
+    class_by_idx = {}
+    suspect = set()
+    bpp_ratio = p.get("upscale_bpp_ratio", SAME_PHOTO_UPSCALE_BPP_RATIO)
+    for gi, group in enumerate(groups_idx):
+        gpairs = pairs_by_group.get(gi)
+        if not gpairs:
+            continue
+        if cancel_check and cancel_check():
+            raise ScanCancelled()
+        pos = {idx: k for k, idx in enumerate(group)}
+        k = len(group)
+        uf = UnionFind(k)
+        edges = set()
+        md5s = [md5_by_idx.get(i, images_data[i][2]) for i in group]
+        first = {}
+        for a, m in enumerate(md5s):
+            if m is None or str(m).startswith("ERR:"):
+                continue
+            if m in first:
+                uf.union(first[m], a)
+                edges.add((min(first[m], a), max(first[m], a)))
+                # cópias bit a bit também são arestas entre si e com quem já liga a uma delas
+            else:
+                first[m] = a
+        # arestas por cópia idêntica: propaga para todas as duplas de mesmo MD5
+        same_md5_members = {}
+        for a, m in enumerate(md5s):
+            same_md5_members.setdefault(m, []).append(a)
+        for members in same_md5_members.values():
+            for x in members:
+                for y in members:
+                    if x < y:
+                        edges.add((x, y))
+        confirmed = []
+        for i, j in gpairs:
+            fa, fb = feat_by_idx.get(i), feat_by_idx.get(j)
+            ok, reason = same_photo_pair_ok(fa, fb, p)
+            if ok:
+                a, b = pos[i], pos[j]
+                confirmed.append((min(a, b), max(a, b)))
+            else:
+                sp["rejected"][reason] = sp["rejected"].get(reason, 0) + 1
+        sp["pairs_confirmed"] += len(confirmed)
+        for (a, b) in confirmed:
+            edges.add((a, b))
+        # aresta confirmada entre a e b vale para todas as cópias idênticas de a e de b
+        for (a, b) in list(edges):
+            for x in same_md5_members.get(md5s[a], [a]):
+                for y in same_md5_members.get(md5s[b], [b]):
+                    if x != y:
+                        edges.add((min(x, y), max(x, y)))
+        refused = set()
+        members_of = {}
+        for a in range(k):
+            members_of.setdefault(uf.find(a), []).append(a)
+        for (a, b) in sorted(confirmed):
+            ra, rb = uf.find(a), uf.find(b)
+            if ra == rb:
+                continue
+            key = (min(ra, rb), max(ra, rb))
+            if key in refused:
+                continue
+            ma, mb = members_of[ra], members_of[rb]
+            if all((min(x, y), max(x, y)) in edges for x in ma for y in mb):
+                uf.union(a, b)
+                root = uf.find(a)
+                merged = ma + mb
+                for r in (ra, rb):
+                    members_of.pop(r, None)
+                members_of[root] = merged
+            else:
+                refused.add(key)
+                sp["unions_refused_clique"] += 1
+        for root, members in members_of.items():
+            if len(members) < 2:
+                continue
+            if len({md5s[a] for a in members}) < 2:
+                continue
+            idxs = [group[a] for a in members]
+            cid = min(idxs)
+            for idx in idxs:
+                class_by_idx[idx] = cid
+            sp["classes"] += 1
+            sp["images_in_classes"] += len(idxs)
+            # trava de cópia ampliada: bytes por pixel
+            bpp = {}
+            for idx in idxs:
+                f = feat_by_idx.get(idx)
+                size = stats[idx][0] if stats[idx] else None
+                if f and f.get("dims") and size:
+                    px = f["dims"][0] * f["dims"][1]
+                    if px:
+                        bpp[idx] = (px, size / px)
+            if len(bpp) >= 2:
+                best = max(bpp, key=lambda i: bpp[i][0])
+                best_px, best_bpp = bpp[best]
+                for idx, (px, val) in bpp.items():
+                    if px < best_px and best_bpp < bpp_ratio * val:
+                        suspect.add(cid)
+                        sp["classes_suspect"] += 1
+                        break
+    return class_by_idx, suspect, sp
+
+
+def same_photo_stage(images_data, stats, groups_idx, md5_by_idx, dhash_by_idx,
+                     hash_cache, sp_cache, workers, progress_cb=None, cancel_check=None,
+                     params=None):
+    """
+    Orquestra "mesma foto": porta dos hashes -> provas (cache/cálculo) ->
+    classes. dhash_by_idx=None significa "não calculado": calcula só o
+    necessário via dhash_for_groups; {} significa "nada a confirmar".
+    Retorna (class_by_idx, suspect_ids, stats, cancelled).
+    """
+    cancelled = False
+    if dhash_by_idx is None:
+        dhash_by_idx, cancelled = dhash_for_groups(images_data, stats, groups_idx, md5_by_idx,
+                                                   hash_cache, workers, progress_cb, cancel_check)
+        if cancelled:
+            return {}, set(), _new_same_photo_stats(), True
+    pairs, pstats = same_photo_candidate_pairs(
+        images_data, groups_idx, md5_by_idx, dhash_by_idx,
+        (params or {}).get("phash_max"), (params or {}).get("dhash_max"), cancel_check)
+    indices = sorted({i for _, i, j in pairs} | {j for _, i, j in pairs})
+    feat_by_idx, cancelled = same_photo_features_for_indices(
+        images_data, stats, indices, sp_cache, workers, progress_cb, cancel_check)
+    if cancelled:
+        return {}, set(), _new_same_photo_stats(), True
+    class_by_idx, suspect, sp = same_photo_classes(
+        groups_idx, pairs, images_data, stats, md5_by_idx, feat_by_idx, params, cancel_check)
+    sp.update({k: pstats[k] for k in ("groups_checked", "pairs_hash_rule", "pairs_without_dhash")})
+    return class_by_idx, suspect, sp, False
+
+
+def image_status(info, md5_count):
+    """'Idêntica' (MD5 repetido no grupo) > 'Mesma foto' (classe) > 'Semelhante'."""
+    if md5_count.get(info['md5'], 0) > 1:
+        return "Idêntica"
+    if info.get('same_photo') is not None:
+        return "Mesma foto"
+    return "Semelhante"
+
+
+def plan_same_photo_selection(images, priority=SIMILAR_KEEP_PRIORITY):
+    """
+    Botão "Selecionar Mesma foto": por classe (info['same_photo']), entre
+    TODAS as imagens do alvo da classe (cópias idênticas incluídas), mantém a
+    melhor por keep_sort_key e seleciona as outras. Referência na classe =>
+    seleciona todas as do alvo. Classe suspeita (cópia ampliada?) => nada.
+    Nunca devolve referência.
+    """
+    classes = {}
+    for i, img in enumerate(images):
+        c = img.get('same_photo')
+        if c is not None:
+            classes.setdefault(c, []).append(i)
+    selected = []
+    for idxs in classes.values():
+        if any(images[i].get('same_photo_suspect') for i in idxs):
+            continue
+        targets = [i for i in idxs if not images[i].get('is_reference')]
+        if len(targets) < len(idxs):
+            selected.extend(targets)
+        elif len(targets) > 1:
+            keep = min(targets, key=lambda i: keep_sort_key(images[i], i, priority))
+            selected.extend(i for i in targets if i != keep)
+    return selected
 
 
 class ImageCleaner:
