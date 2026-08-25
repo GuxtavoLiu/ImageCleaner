@@ -438,7 +438,7 @@ def test_mesma_foto_status_na_tela(app_same_photo):
     assert "MESMA FOTO" in tags
     _, _, w2 = _row_labels(app, "p_exif_burst.jpg")
     assert "MESMA FOTO" not in [str(c.cget("text")) for c in w2[1].winfo_children() if isinstance(c, tk.Label)]
-    assert "Mesma foto: 1 classe(s), 4 imagem(ns)" in app.page_info_label.cget("text")
+    assert "Mesma foto: 1 classe(s), 4 img" in app.page_info_label.cget("text")
     # relatório usa o status novo
     status, origem, size = app._image_meta(0, by["p_half.jpg"]['filepath'])
     assert status == "Mesma foto"

@@ -225,10 +225,12 @@ SIMILARITY_THRESHOLD = 10
 # Empate total: a primeira na ordem do grupo. Com ("mtime",) volta a regra
 # original "mantém a mais antiga". Não afeta "Selecionar Idênticas".
 SIMILAR_KEEP_PRIORITY = ("resolution", "size", "mtime")
-SIMILAR_RULE_TOOLTIP = ("Mantém, em cada grupo, a imagem de melhor qualidade e seleciona as outras:\n"
-                        "1) maior resolução   2) maior arquivo   3) mais antiga   4) a primeira da lista.\n"
-                        "Se houver imagem do acervo de referência, ela é a mantida.\n"
-                        "Imagens idênticas (mesmo conteúdo) não entram aqui.")
+SIMILAR_RULE_TOOLTIP = ("Semelhantes: fotos parecidas entre si, mas que não são a mesma imagem\n"
+                        "(ou o programa não teve certeza de que são).\n"
+                        "Este botão mantém a melhor versão de cada grupo (maior resolução, depois\n"
+                        "arquivo maior, depois a mais antiga) e seleciona as outras.\n"
+                        "Se houver foto do acervo de referência no grupo, ela é a mantida.\n"
+                        "Cópias idênticas não entram aqui: use 'Selecionar Idênticas'.")
 
 # ---------------------------------------------------------------------------
 # "Mesma foto": mesma captura em outra versão (redimensionada, recomprimida,
@@ -258,11 +260,13 @@ SAME_PHOTO_EXIF_WINDOW = 3600       # DateTimeOriginal diferindo até isto (s) =
 SAME_PHOTO_PIXEL_IDENTICAL_NCC = 0.999   # conteúdo pixel-idêntico: o veto EXIF não se aplica
 SAME_PHOTO_PIXEL_IDENTICAL_ERR = 0.01
 SAME_PHOTO_UPSCALE_BPP_RATIO = 0.5  # maior em pixels com bytes/pixel < 50% da menor = "ampliada?"
-SAME_PHOTO_RULE_TOOLTIP = ("Mesma foto = mesma captura em outra versão (tamanho, compressão, EXIF).\n"
-                           "Provas exigidas: hashes quase iguais, mesma proporção, correlação de\n"
-                           "pixels alta no todo e em cada região, e EXIF sem indício de rajada.\n"
-                           "Mantém a de melhor qualidade (resolução, arquivo, data) e seleciona as\n"
-                           "outras; classes com cópia 'ampliada?' ficam para você decidir.")
+SAME_PHOTO_RULE_TOOLTIP = ("Mesma foto: a mesma imagem guardada mais de uma vez em versões diferentes\n"
+                           "(menor, mais comprimida, reenviada pelo WhatsApp, com data alterada...).\n"
+                           "O programa só usa esse rótulo quando tem certeza, depois de várias\n"
+                           "verificações independentes; em dúvida, deixa como 'Semelhante'.\n"
+                           "Este botão mantém a melhor versão (maior resolução, depois arquivo maior,\n"
+                           "depois a mais antiga) e seleciona as outras para você mover ou excluir.\n"
+                           "Se uma cópia parecer 'ampliada' artificialmente, o programa não decide por você.")
 
 
 # Confirmação de "Semelhante" por um segundo hash (dhash). É um pós-filtro:
@@ -2381,27 +2385,33 @@ class ImageCleaner:
         mb["menu"] = menu
         return mb
 
+    def _hide_tooltip(self, event=None):
+        """Fecha o tooltip ativo (há no máximo um por vez)."""
+        tip = getattr(self, '_active_tooltip', None)
+        self._active_tooltip = None
+        if tip is not None:
+            try:
+                tip.destroy()
+            except tk.TclError:
+                pass
+
     def create_tooltip(self, widget, text):
-        """Cria um tooltip para um widget"""
+        """Tooltip de um widget. Só existe um tooltip ativo por vez e ele fecha
+           ao sair do widget, ao clicar nele e quando o widget é destruído
+           (ex.: o grupo some da fila com o mouse ainda sobre o botão)."""
         def on_enter(event):
-            tooltip = tk.Toplevel()
+            self._hide_tooltip()
+            tooltip = tk.Toplevel(self.master)
             tooltip.wm_overrideredirect(True)
-            tooltip.wm_geometry(f"+{event.x_root+10}+{event.y_root+10}")
-
-            label = tk.Label(tooltip, text=text, justify='left',
-                           background="#ffffe0", relief='solid', borderwidth=1,
-                           font=("Arial", 9))
-            label.pack()
-
-            widget.tooltip = tooltip
-
-        def on_leave(event):
-            if hasattr(widget, 'tooltip'):
-                widget.tooltip.destroy()
-                del widget.tooltip
+            tooltip.wm_geometry(f"+{event.x_root + 10}+{event.y_root + 10}")
+            tk.Label(tooltip, text=text, justify='left', background="#ffffe0",
+                     relief='solid', borderwidth=1, font=("Segoe UI", 9), padx=6, pady=4).pack()
+            self._active_tooltip = tooltip
 
         widget.bind('<Enter>', on_enter)
-        widget.bind('<Leave>', on_leave)
+        widget.bind('<Leave>', self._hide_tooltip)
+        widget.bind('<Button-1>', self._hide_tooltip, add='+')
+        widget.bind('<Destroy>', self._hide_tooltip, add='+')
 
     def select_folder(self):
         folder = filedialog.askdirectory(title="Selecione a pasta com imagens")
@@ -3263,9 +3273,8 @@ class ImageCleaner:
         top_frame = tk.Frame(self.groups_window)
         top_frame.pack(fill="x", padx=10, pady=5)
 
-        # Label com informação de paginação
-        self.page_info_label = tk.Label(top_frame, text="", font=("Arial", 10))
-        self.page_info_label.pack(side="left", padx=5)
+        # A informação de paginação/contagens fica na barra de status (2ª linha),
+        # para a 1ª linha caber só com os botões mesmo em telas menores.
 
         # Botão para selecionar idênticas
         btn_select_identical = make_button(top_frame, "Selecionar Todas Idênticas", "select",
@@ -3339,6 +3348,8 @@ class ImageCleaner:
         self.review_label.pack(side="left", padx=(8, 20))
         self.selection_label = tk.Label(status_frame, text="", fg=PALETTE["muted"])
         self.selection_label.pack(side="left")
+        self.page_info_label = tk.Label(status_frame, text="", fg=PALETTE["text"])
+        self.page_info_label.pack(side="left", padx=(20, 0))
         self._update_counters()
 
         # --- Cria um Frame para conter o Canvas e a Scrollbar ---
@@ -3429,16 +3440,16 @@ class ImageCleaner:
         self.page_by_view[self.view_mode] = self.current_page
         end_idx = min((self.current_page + 1) * self.groups_per_page, total)
         vista = "Verificados" if self.view_mode == "verified" else "Pendentes"
-        info = (f"{vista}: página {self.current_page + 1} de {total_pages} | "
-                f"{len(self.pending_idx)} pendentes, {len(self.verified_idx)} verificados "
-                f"(total {len(self.groups)})")
+        info = (f"{vista}: página {self.current_page + 1} de {total_pages}   |   "
+                f"{len(self.pending_idx)} pendentes, {len(self.verified_idx)} verificados, "
+                f"{len(self.groups)} no total")
         cs = self.confirm_stats
         if cs:
-            info += (f" | Confirmação por 2º hash: {cs['images_dropped']} imagem(ns) e "
-                     f"{cs['groups_dropped']} grupo(s) descartados, {cs['groups_split']} divididos")
+            info += (f"   |   2º hash descartou {cs['images_dropped']} img em "
+                     f"{cs['groups_dropped']} grupo(s)")
         sp = self.same_photo_stats
         if sp:
-            info += (f" | Mesma foto: {sp['classes']} classe(s), {sp['images_in_classes']} imagem(ns)"
+            info += (f"   |   Mesma foto: {sp['classes']} classe(s), {sp['images_in_classes']} img"
                      + (f", {sp['classes_suspect']} suspeita(s)" if sp['classes_suspect'] else ""))
         self.page_info_label.config(text=info)
         self.prev_btn.config(state="normal" if self.current_page > 0 else "disabled")
