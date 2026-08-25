@@ -102,6 +102,7 @@ FONT_TITLE = ("Segoe UI", 18, "bold")
 # kind -> (fundo, fundo ao clicar, texto)
 BUTTON_KINDS = {
     "primary": ("#2E7D32", "#1B5E20", "white"),
+    "same": ("#00897B", "#00695C", "white"),
     "select": ("#4CAF50", "#388E3C", "white"),
     "similar": ("#FF9800", "#EF6C00", "white"),
     "move": ("#1565C0", "#0D47A1", "white"),
@@ -1732,27 +1733,51 @@ def block_max_error(na, nb, blocks=None):
     blocks = blocks or SAME_PHOTO_BLOCKS
     n = na.shape[0]
     h = n // blocks
-    worst = 0.0
-    for r in range(blocks):
-        for c in range(blocks):
-            d = na[r * h:(r + 1) * h, c * h:(c + 1) * h] - nb[r * h:(r + 1) * h, c * h:(c + 1) * h]
-            worst = max(worst, float((d * d).mean()))
-    return worst
+    d = (na - nb)[:h * blocks, :h * blocks]
+    d = d * d
+    per_block = d.reshape(blocks, h, blocks, h).mean(axis=(1, 3))
+    return float(per_block.max())
+
+
+def gradient_vector(na):
+    """Magnitude do gradiente da miniatura normalizada, centrada e com norma 1
+       (None se não há estrutura). Pré-calculada uma vez por imagem."""
+    gx = np.diff(na, axis=1)[:-1, :]
+    gy = np.diff(na, axis=0)[:, :-1]
+    g = np.sqrt(gx * gx + gy * gy)
+    g = g - g.mean()
+    norm = float(np.sqrt((g * g).sum()))
+    if norm < 1e-6:
+        return None
+    return g / norm
 
 
 def ncc_gradient(na, nb):
     """Correlação das magnitudes de gradiente (estrutura, não iluminação)."""
-    def grad(a):
-        gx = np.diff(a, axis=1)[:-1, :]
-        gy = np.diff(a, axis=0)[:, :-1]
-        return np.sqrt(gx * gx + gy * gy)
-    ga, gb = grad(na), grad(nb)
-    ga = ga - ga.mean()
-    gb = gb - gb.mean()
-    den = float(np.sqrt((ga * ga).sum() * (gb * gb).sum()))
-    if den < 1e-6:
+    ga, gb = gradient_vector(na), gradient_vector(nb)
+    if ga is None or gb is None:
         return 0.0
-    return float((ga * gb).sum() / den)
+    return float((ga * gb).sum())
+
+
+def prepare_proof(feat, params=None):
+    """
+    Pré-processa as provas de UMA imagem para comparar muitos pares sem
+    repetir trabalho: miniatura normalizada, vetor de gradiente e motivo de
+    rejeição individual ("sem_prova", "dimensao", "lisa") ou None se está apta.
+    """
+    p = params or {}
+    if not feat:
+        return {"reason": "sem_prova"}
+    dims = feat.get("dims")
+    if not dims or min(dims) < p.get("min_side", SAME_PHOTO_MIN_SIDE):
+        return {"reason": "dimensao", "dims": dims}
+    na = normalize_gray(gray_array(feat.get("gray"), p.get("gray_size")), p.get("min_std"))
+    if na is None:
+        return {"reason": "lisa", "dims": dims}
+    grad_min = p.get("grad_ncc_min", SAME_PHOTO_GRAD_NCC_MIN)
+    return {"reason": None, "dims": dims, "exif": feat.get("exif") or {}, "na": na,
+            "grad": gradient_vector(na) if grad_min is not None else None}
 
 
 def aspect_close(d1, d2, tol=None):
@@ -1794,26 +1819,24 @@ def exif_veto(e1, e2, pixel_identical, window=None):
     return False
 
 
-def same_photo_pair_ok(fa, fb, params=None):
+def same_photo_pair_ok(fa, fb, params=None, pa=None, pb=None):
     """
     Provas de pixels/EXIF para um par já candidato pelos hashes.
-    fa, fb: features (dims, exif, gray) OU None (sem prova => False).
+    fa, fb: features (dims, exif, gray) OU None (sem prova => False);
+    pa, pb: provas pré-processadas por prepare_proof (opcional, para não
+    repetir trabalho em grupos grandes).
     Retorna (ok, motivo) com motivo em: "ok", "sem_prova", "dimensao",
     "proporcao", "lisa", "ncc", "bloco", "gradiente", "exif".
     """
     p = params or {}
-    min_side = p.get("min_side", SAME_PHOTO_MIN_SIDE)
-    if not fa or not fb:
-        return False, "sem_prova"
-    da, db = fa.get("dims"), fb.get("dims")
-    if not da or not db or min(da) < min_side or min(db) < min_side:
-        return False, "dimensao"
-    if not aspect_close(da, db, p.get("aspect_tol")):
+    pa = pa if pa is not None else prepare_proof(fa, p)
+    pb = pb if pb is not None else prepare_proof(fb, p)
+    for reason in ("sem_prova", "dimensao", "lisa"):
+        if pa["reason"] == reason or pb["reason"] == reason:
+            return False, reason
+    if not aspect_close(pa["dims"], pb["dims"], p.get("aspect_tol")):
         return False, "proporcao"
-    na = normalize_gray(gray_array(fa.get("gray"), p.get("gray_size")), p.get("min_std"))
-    nb = normalize_gray(gray_array(fb.get("gray"), p.get("gray_size")), p.get("min_std"))
-    if na is None or nb is None:
-        return False, "lisa"
+    na, nb = pa["na"], pb["na"]
     ncc = ncc_global(na, nb)
     if ncc < p.get("ncc_min", SAME_PHOTO_NCC_MIN):
         return False, "ncc"
@@ -1821,12 +1844,15 @@ def same_photo_pair_ok(fa, fb, params=None):
     if err > p.get("block_err_max", SAME_PHOTO_BLOCK_ERR_MAX):
         return False, "bloco"
     grad_min = p.get("grad_ncc_min", SAME_PHOTO_GRAD_NCC_MIN)
-    if grad_min is not None and ncc_gradient(na, nb) < grad_min:
-        return False, "gradiente"
+    if grad_min is not None:
+        ga, gb = pa.get("grad"), pb.get("grad")
+        g = float((ga * gb).sum()) if ga is not None and gb is not None else 0.0
+        if g < grad_min:
+            return False, "gradiente"
     if p.get("exif_veto", SAME_PHOTO_EXIF_VETO):
         identical = (ncc >= p.get("pixel_identical_ncc", SAME_PHOTO_PIXEL_IDENTICAL_NCC)
                      and err <= p.get("pixel_identical_err", SAME_PHOTO_PIXEL_IDENTICAL_ERR))
-        if exif_veto(fa.get("exif"), fb.get("exif"), identical, p.get("exif_window")):
+        if exif_veto(pa["exif"], pb["exif"], identical, p.get("exif_window")):
             return False, "exif"
     return True, "ok"
 
@@ -1989,9 +2015,12 @@ def same_photo_classes(groups_idx, pairs, images_data, stats, md5_by_idx, feat_b
                     if x < y:
                         edges.add((x, y))
         confirmed = []
+        proofs = {}
         for i, j in gpairs:
-            fa, fb = feat_by_idx.get(i), feat_by_idx.get(j)
-            ok, reason = same_photo_pair_ok(fa, fb, p)
+            for x in (i, j):
+                if x not in proofs:
+                    proofs[x] = prepare_proof(feat_by_idx.get(x), p)
+            ok, reason = same_photo_pair_ok(None, None, p, proofs[i], proofs[j])
             if ok:
                 a, b = pos[i], pos[j]
                 confirmed.append((min(a, b), max(a, b)))
@@ -3249,6 +3278,12 @@ class ImageCleaner:
         btn_select_similar.pack(side="left", padx=5)
         self.create_tooltip(btn_select_similar, SIMILAR_RULE_TOOLTIP)
 
+        if self.groups_same_photo is not None:
+            btn_same = make_button(top_frame, "Selecionar Todas Mesma Foto", "same",
+                                   command=self.select_same_photo_images)
+            btn_same.pack(side="left", padx=5)
+            self.create_tooltip(btn_same, SAME_PHOTO_RULE_TOOLTIP)
+
         # Botões de ação global
         btn_move_all = make_button(top_frame, "Mover Todas Selecionadas", "move",
                                    command=self.move_all_selected)
@@ -3519,6 +3554,11 @@ class ImageCleaner:
                                 command=lambda g=idx, c=select_cmd: c(g, "similar"))
             b_sim.pack(side="left", padx=5)
             self.create_tooltip(b_sim, SIMILAR_RULE_TOOLTIP)
+        if plan_same_photo_selection(images):
+            b_same = make_button(btn_frame, "Selecionar Mesma foto", "same",
+                                 command=lambda g=idx, c=select_cmd: c(g, "same_photo"))
+            b_same.pack(side="left", padx=5)
+            self.create_tooltip(b_same, SAME_PHOTO_RULE_TOOLTIP)
         if verified_view:
             make_button(btn_frame, "Voltar para pendentes", "light",
                         command=lambda g=idx: self.unverify_group(g)).pack(side="left", padx=5)
@@ -4201,7 +4241,45 @@ class ImageCleaner:
         if kind == "identical":
             return plan_identical_selection(images)
         self._ensure_metrics(images)
+        if kind == "same_photo":
+            return plan_same_photo_selection(images)
         return plan_similar_selection(images, group_data['md5_count'])
+
+    def select_same_photo_images(self):
+        """Seleciona, em todos os grupos PENDENTES, as versões piores de cada
+           classe "Mesma foto" (mantém a melhor por qualidade; referência é a
+           mantida; classes com cópia 'ampliada?' ficam de fora)."""
+        selected_count = 0
+        skipped_suspect = 0
+        ref_worse = 0
+        for idx in self.pending_idx:
+            group_data = self.group_check_vars[idx]
+            images = group_data['images']
+            if not any(im.get('same_photo') is not None for im in images):
+                continue
+            self._ensure_metrics(images)
+            classes = {}
+            for im in images:
+                if im.get('same_photo') is not None:
+                    classes.setdefault(im['same_photo'], []).append(im)
+            for members in classes.values():
+                if any(im.get('same_photo_suspect') for im in members):
+                    skipped_suspect += 1
+                refs = [im for im in members if im.get('is_reference')]
+                others = [im for im in members if not im.get('is_reference')]
+                if refs and others and max((im.get('pixels') or 0) for im in others) > max((im.get('pixels') or 0) for im in refs):
+                    ref_worse += 1
+            for i in plan_same_photo_selection(images):
+                images[i]['var'].set(1)
+                selected_count += 1
+        msg = (f"{selected_count} imagens 'Mesma foto' foram selecionadas (mantendo, em cada classe, "
+               "a de melhor qualidade: maior resolução, depois maior arquivo, depois mais antiga).")
+        if skipped_suspect:
+            msg += f"\n\n{skipped_suspect} classe(s) com cópia 'ampliada?' foram deixadas para você decidir."
+        if ref_worse:
+            msg += (f"\n\nAtenção: em {ref_worse} classe(s) a cópia do acervo de referência tem resolução "
+                    "MENOR que a do alvo; a referência é mantida mesmo assim (revise se quiser).")
+        messagebox.showinfo("Seleção Concluída", msg + self._verified_note() + self._reference_selection_note())
 
     def select_group(self, group_idx, kind):
         """Seleção automática (idênticas ou semelhantes) só de UM grupo,

@@ -450,3 +450,38 @@ def test_mesma_foto_desligada_nao_aparece(app_with_groups):
     assert app.groups_same_photo is None
     assert all(im.get('same_photo') is None for gd in app.group_check_vars.values() for im in gd['images'])
     assert "Mesma foto" not in app.page_info_label.cget("text")
+
+
+def test_mesma_foto_botoes_e_selecao(app_same_photo):
+    app, root, msgs = app_same_photo
+    by = _info_by_name(app)
+    top = _buttons(app.groups_window, [])
+    assert "Selecionar Todas Mesma Foto" in top
+    grp = [i for i, gd in app.group_check_vars.items() if any(im.get('same_photo') is not None for im in gd['images'])][0]
+    assert "Selecionar Mesma foto" in _buttons(app.group_frames[grp], [])
+    # por grupo: mantém p.jpg (maior resolução), seleciona as outras da classe
+    app.select_group(grp, "same_photo"); root.update()
+    sel = {n for n, im in by.items() if im['var'].get() == 1}
+    assert sel == {"p_half.jpg", "p_q30.jpg", "p_exif_edit.jpg"}
+    assert by["p.jpg"]['var'].get() == 0 and by["p_exif_burst.jpg"]['var'].get() == 0
+    # global: mesma regra só nos pendentes; grupo verificado é ignorado
+    for im in by.values():
+        im['var'].set(0)
+    app.verify_group(grp); root.update()
+    app.select_same_photo_images()
+    assert not any(im['var'].get() for im in by.values())
+    assert "0 imagens 'Mesma foto'" in msgs[-1][2]
+    app.unverify_group(grp); root.update()
+    app.select_same_photo_images()
+    assert {n for n, im in by.items() if im['var'].get() == 1} == {"p_half.jpg", "p_q30.jpg", "p_exif_edit.jpg"}
+    assert "3 imagens 'Mesma foto'" in msgs[-1][2]
+    # select_and_verify com o botão do grupo tira o grupo da fila
+    app.unverify_group(grp) if grp in app.verified_idx else None
+    app.select_and_verify(grp, "same_photo"); root.update()
+    assert grp in app.verified_idx
+
+
+def test_mesma_foto_desligada_sem_botoes(app_with_groups):
+    app, root, _ = app_with_groups
+    assert "Selecionar Todas Mesma Foto" not in _buttons(app.groups_window, [])
+    assert "Selecionar Mesma foto" not in _buttons(app.content_frame, [])
