@@ -444,8 +444,33 @@ def test_mesma_foto_status_na_tela(app_same_photo):
     assert status == "Mesma foto"
 
 
-def test_mesma_foto_desligada_nao_aparece(app_with_groups):
-    app, root, _ = app_with_groups
+@pytest.fixture
+def app_same_photo_off(tk_root, tmp_path, monkeypatch):
+    """App com a feature 'Mesma foto' DESLIGADA pela constante (fixture única)."""
+    monkeypatch.setattr(ic, "SAME_PHOTO_ENABLED", False)
+    root = tk_root
+    for w in root.winfo_children():
+        w.destroy()
+    fx = build_single_fixture(str(tmp_path / "fx"))
+    for name in ("showinfo", "showerror", "showwarning"):
+        monkeypatch.setattr(messagebox, name, lambda *a, **k: None)
+    monkeypatch.setattr(filedialog, "askdirectory", lambda **k: fx)
+    app = ic.ImageCleaner(root)
+    app.select_folder(); app.use_cache_var.set(0); app.start_scan()
+    t0 = time.time()
+    while time.time() - t0 < 60 and getattr(app, "groups_window", None) is None:
+        root.update(); time.sleep(0.02)
+    root.update()
+    yield app, root, []
+    for w in root.winfo_children():
+        try:
+            w.destroy()
+        except tk.TclError:
+            pass
+
+
+def test_mesma_foto_desligada_nao_aparece(app_same_photo_off):
+    app, root, _ = app_same_photo_off
     assert app.same_photo_check.winfo_manager() == ""            # constante desligada: sem checkbox
     assert app.groups_same_photo is None
     assert all(im.get('same_photo') is None for gd in app.group_check_vars.values() for im in gd['images'])
@@ -481,7 +506,7 @@ def test_mesma_foto_botoes_e_selecao(app_same_photo):
     assert grp in app.verified_idx
 
 
-def test_mesma_foto_desligada_sem_botoes(app_with_groups):
-    app, root, _ = app_with_groups
+def test_mesma_foto_desligada_sem_botoes(app_same_photo_off):
+    app, root, _ = app_same_photo_off
     assert "Selecionar Todas Mesma Foto" not in _buttons(app.groups_window, [])
     assert "Selecionar Mesma foto" not in _buttons(app.content_frame, [])

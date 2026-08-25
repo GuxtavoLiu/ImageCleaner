@@ -242,7 +242,7 @@ SIMILAR_RULE_TOOLTIP = ("Mantém, em cada grupo, a imagem de melhor qualidade e 
 # ou são vetadas pelo EXIF (12); uma rajada sem EXIF (NCC 0,981) cai só no
 # gradiente (0,81 contra p1 = 0,93 dos confirmados). Porta do dhash em 4
 # acrescenta 6 confirmações sem nenhum nome de rajada.
-SAME_PHOTO_ENABLED = False
+SAME_PHOTO_ENABLED = True
 SAME_PHOTO_PHASH_MAX = 2            # distâncias de phash são sempre pares: 0 ou 2
 SAME_PHOTO_DHASH_MAX = 4            # porta de candidatura (2 = 632 candidatos; 4 = 662; 6 = 677)
 SAME_PHOTO_MIN_SIDE = 100           # lado menor mínimo (px): ícones não entram

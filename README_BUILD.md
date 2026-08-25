@@ -276,6 +276,20 @@ internas da pasta alvo" controla os grupos sem par no acervo.
   outras: 1) maior resolução, 2) maior arquivo, 3) mais antiga, 4) a primeira da lista.
   Se o grupo tem imagem do acervo de referência, ela é a mantida. "Selecionar Idênticas"
   segue mantendo a cópia mais antiga (idênticas têm a mesma qualidade por definição).
+- **Status "Mesma foto"** (`SAME_PHOTO_*` no `main.py`; checkbox "Detectar 'Mesma foto'"):
+  terceiro nível entre Idêntica (mesmo arquivo) e Semelhante (parecida): a mesma captura
+  em outra versão (redimensionada, recomprimida, EXIF alterado, WhatsApp/iCloud). Só entra
+  com TODAS as provas: hashes quase iguais (phash <= 2, dhash <= 4), mesma proporção
+  bruta, lado mínimo 100 px, correlação de pixels >= 0,98 no todo (miniatura 64x64),
+  pior região com erro <= 0,30, correlação de gradientes >= 0,85, e sem indício de rajada
+  no EXIF (DateTimeOriginal diferindo em até 1 h, SubSec ou ImageUniqueID diferentes; o
+  veto não vale para conteúdo pixel-idêntico, ex.: data corrigida por script). Falta de
+  prova = não. Classes por ligação completa (uma cadeia não arrasta fotos diferentes).
+  Botões "Selecionar Mesma foto" / "Selecionar Todas Mesma Foto" mantêm a de melhor
+  qualidade; classes com cópia "ampliada?" (bytes/pixel muito menor) ficam para você.
+  Limitações conhecidas: cena estática de tripé sem EXIF pode entrar como "mesma foto";
+  cópia com rotação gravada nos pixels nunca é candidata; edições leves (cor, recorte de
+  poucos pixels) contam como a mesma foto. Calibrado no acervo real em 2026-08-24.
 - **Linha da imagem**: nome em destaque, pasta curta `[ALVO]/[REF]` (caminho completo
   no tooltip), resolução, tamanho, datas e rótulos "maior resolução", "mais antiga",
   "maior arquivo" (só quando há diferença). Clique na linha alterna a seleção
