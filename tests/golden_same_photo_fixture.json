@@ -1,0 +1,48 @@
+{
+  "groups": [
+    [
+      [
+        "p.jpg",
+        "MesmaFoto"
+      ],
+      [
+        "p_crop.jpg",
+        "Semelhante"
+      ],
+      [
+        "p_exif_burst.jpg",
+        "Semelhante"
+      ],
+      [
+        "p_exif_edit.jpg",
+        "MesmaFoto"
+      ],
+      [
+        "p_half.jpg",
+        "MesmaFoto"
+      ],
+      [
+        "p_q30.jpg",
+        "MesmaFoto"
+      ],
+      [
+        "p_tiny.jpg",
+        "Semelhante"
+      ]
+    ]
+  ],
+  "selected_identical": [],
+  "selected_similar": [
+    "p_crop.jpg",
+    "p_exif_burst.jpg",
+    "p_exif_edit.jpg",
+    "p_half.jpg",
+    "p_q30.jpg",
+    "p_tiny.jpg"
+  ],
+  "selected_same_photo": [
+    "p_exif_edit.jpg",
+    "p_half.jpg",
+    "p_q30.jpg"
+  ]
+}

@@ -172,9 +172,11 @@ def _confirm_stage(images_data, stats, groups_idx, md5_by_idx):
     return groups_idx, cstats
 
 
-def run_pipeline(root, confirm=False):
+def run_pipeline_full(root, confirm=False, same_photo=False):
     """Pipeline puro completo do modo de uma pasta, como o run_selftest faz.
-       confirm=True acrescenta a confirmação por segundo hash."""
+       confirm=True acrescenta a confirmação por segundo hash; same_photo=True
+       roda o estágio "Mesma foto". Retorna (entries, images_data, groups,
+       class_by_path, suspect_ids)."""
     entries = ic.list_image_files(root, True, ic.VALID_EXTENSIONS)
     results, errors_by_idx, _ = ic.hash_files(entries, None, WORKERS)
     images_data = [r for r in results if r is not None]
@@ -184,7 +186,17 @@ def run_pipeline(root, confirm=False):
     md5_by_idx, _ = ic.md5_for_groups(images_data, stats, groups_idx, None, WORKERS)
     if confirm:
         groups_idx, _ = _confirm_stage(images_data, stats, groups_idx, md5_by_idx)
+    class_by_path, suspect = {}, set()
+    if same_photo:
+        cls, suspect, _, _ = ic.same_photo_stage(images_data, stats, groups_idx, md5_by_idx,
+                                                 None, None, None, WORKERS)
+        class_by_path = {images_data[i][0]: c for i, c in cls.items()}
     groups = ic.build_groups(images_data, groups_idx, md5_by_idx)
+    return entries, images_data, groups, class_by_path, suspect
+
+
+def run_pipeline(root, confirm=False):
+    entries, images_data, groups, _, _ = run_pipeline_full(root, confirm=confirm)
     return entries, images_data, groups
 
 
@@ -238,13 +250,16 @@ def oracle_similar_selection(images, md5_count):
     return []
 
 
-def snapshot_single_mode(root, confirm=False, priority=None):
+def snapshot_single_mode(root, confirm=False, priority=None, same_photo=False):
     """
     Estrutura serializável do resultado completo do modo de uma pasta:
     grupos (caminhos relativos + rótulo Idêntica/Semelhante, na ordem) e as
     seleções automáticas (como listas ordenadas de caminhos relativos).
+    Com same_photo=True o rótulo "MesmaFoto" e a chave "selected_same_photo"
+    entram no snapshot (só nesse caso: os goldens antigos não mudam).
     """
-    _, _, groups = run_pipeline(root, confirm=confirm)
+    _, _, groups, class_by_path, suspect = run_pipeline_full(root, confirm=confirm, same_photo=same_photo)
+    sel_same = []
 
     def rel(fp):
         return os.path.relpath(fp, root).replace("\\", "/")
@@ -254,11 +269,15 @@ def snapshot_single_mode(root, confirm=False, priority=None):
     sel_similar = []
     for group in groups:
         counts = md5_count_of(group)
-        snap_groups.append([
-            [rel(fp), "Identica" if counts[m] > 1 else "Semelhante"]
-            for (fp, _, m) in group
-        ])
         images = group_to_images_dicts(group)
+        for im in images:
+            cid = class_by_path.get(im['filepath'])
+            im['same_photo'] = cid
+            im['same_photo_suspect'] = cid in suspect
+        snap_groups.append([
+            [rel(im['filepath']), ic.image_status(im, counts).replace("Idêntica", "Identica").replace("Mesma foto", "MesmaFoto")]
+            for im in images
+        ])
         # Usa o mecanismo de seleção vigente no main.py: as funções puras se
         # existirem (pós-refatoração), senão o oráculo (pré-refatoração).
         if hasattr(ic, "plan_identical_selection"):
@@ -270,11 +289,16 @@ def snapshot_single_mode(root, confirm=False, priority=None):
             simil = oracle_similar_selection(images, counts)
         sel_identical.extend(sorted(rel(images[i]['filepath']) for i in ident))
         sel_similar.extend(sorted(rel(images[i]['filepath']) for i in simil))
-    return {
+        if same_photo:
+            sel_same.extend(sorted(rel(images[i]['filepath']) for i in ic.plan_same_photo_selection(images)))
+    snap = {
         "groups": snap_groups,
         "selected_identical": sel_identical,
         "selected_similar": sel_similar,
     }
+    if same_photo:
+        snap["selected_same_photo"] = sel_same
+    return snap
 
 
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -288,11 +312,15 @@ GOLDEN_FIXTURE_CONFIRM_QUALITY_PATH = os.path.join(TESTS_DIR, "golden_confirm_fi
 LEGACY_PRIORITY = ("mtime",)   # regra original: mantém a mais antiga
 
 
+GOLDEN_SAME_PHOTO_FIXTURE_PATH = os.path.join(TESTS_DIR, "golden_same_photo_fixture.json")
+GOLDEN_SINGLE_SAME_PHOTO_PATH = os.path.join(TESTS_DIR, "golden_single_mode_same_photo.json")
+
+
 def generate_golden(tmp_root, confirm=False, path=GOLDEN_PATH, builder=build_single_fixture,
-                    priority=None):
+                    priority=None, same_photo=False):
     """Gera um snapshot dourado (rodar UMA vez, de forma deliberada)."""
     builder(tmp_root)
-    snap = snapshot_single_mode(tmp_root, confirm=confirm, priority=priority)
+    snap = snapshot_single_mode(tmp_root, confirm=confirm, priority=priority, same_photo=same_photo)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(snap, f, indent=2, ensure_ascii=False)
     return snap

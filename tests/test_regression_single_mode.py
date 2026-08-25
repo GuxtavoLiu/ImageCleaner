@@ -91,3 +91,40 @@ def test_selftest_fixture_confirm(tmp_path):
     assert "CONF(" not in sem
     n_sem = int(sem.split(" grupos")[0].split(", ")[-1])
     assert n_sem >= 3                              # sem confirmação: falsos e degenerados agrupam
+
+
+def test_mesma_foto_goldens_e_semelhantes_inalterados(tmp_path):
+    """Feature "Mesma foto" ligada explicitamente: goldens próprios; e a seleção
+       de Semelhantes é IDÊNTICA à da regra de qualidade sem a feature."""
+    from conftest import (GOLDEN_SAME_PHOTO_FIXTURE_PATH, GOLDEN_SINGLE_SAME_PHOTO_PATH,
+                          build_same_photo_fixture)
+    root = build_single_fixture(str(tmp_path / "fix"))
+    com = snapshot_single_mode(root, confirm=True, same_photo=True)
+    with open(GOLDEN_SINGLE_SAME_PHOTO_PATH, encoding="utf-8") as f:
+        assert com == json.load(f)
+    with open(GOLDEN_QUALITY_PATH, encoding="utf-8") as f:
+        sem = json.load(f)
+    assert com["selected_similar"] == sem["selected_similar"]
+    assert com["selected_identical"] == sem["selected_identical"]
+    assert "selected_same_photo" in com and "selected_same_photo" not in sem
+    root2 = build_same_photo_fixture(str(tmp_path / "sp"))
+    with open(GOLDEN_SAME_PHOTO_FIXTURE_PATH, encoding="utf-8") as f:
+        dourado = json.load(f)
+    assert snapshot_single_mode(root2, confirm=True, same_photo=True) == dourado
+    # a fixture prova o que deve: p_half/p_q30/p_exif_edit são "MesmaFoto" e a
+    # seleção mantém p.jpg (maior arquivo na mesma resolução? não: p_half é menor,
+    # p.jpg tem mais pixels que p_half e mais bytes que p_q30)
+    labels = {name: lab for g in dourado["groups"] for name, lab in g}
+    assert labels["p_half.jpg"] == "MesmaFoto" and labels["p_q30.jpg"] == "MesmaFoto"
+    assert labels["p_exif_burst.jpg"] == "Semelhante"
+    assert "p.jpg" not in dourado["selected_same_photo"]
+    assert {"p_half.jpg", "p_q30.jpg", "p_exif_edit.jpg"} <= set(dourado["selected_same_photo"])
+
+
+def test_selftest_mesma_foto(tmp_path):
+    from conftest import build_same_photo_fixture
+    root = build_same_photo_fixture(str(tmp_path / "sp"))
+    com = ic.run_selftest(root, same_photo=True)
+    assert "MESMA FOTO: 1 classes, 4 imagens, 0 suspeitas" in com
+    sem = ic.run_selftest(root, same_photo=False)
+    assert "MESMA FOTO" not in sem

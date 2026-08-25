@@ -4573,12 +4573,13 @@ def _report_callback_exception(exc_type, exc_value, exc_tb):
         pass
 
 
-def run_selftest(folder, reference=None, confirm_similar=None):
+def run_selftest(folder, reference=None, confirm_similar=None, same_photo=None):
     """
     Modo de diagnóstico sem interface: `ImageCleaner.exe --selftest PASTA`
     ou `--selftest PASTA --ref REFERENCIA` (modo de comparação), opcionalmente
     com `--no-confirm` (desliga a confirmação de semelhantes por dhash;
-    confirm_similar=None usa o padrão CONFIRM_SIMILAR).
+    confirm_similar=None usa o padrão CONFIRM_SIMILAR) e `--no-same-photo`
+    (same_photo=None usa o padrão SAME_PHOTO_ENABLED).
     Roda o pipeline completo (listar, hash, agrupar, MD5) e escreve o resumo
     no log (e no console, quando houver). Útil para validar o executável e
     para diagnosticar problemas em campo. Não usa o cache e não altera nada.
@@ -4615,6 +4616,7 @@ def run_selftest(folder, reference=None, confirm_similar=None):
     if confirm_similar is None:
         confirm_similar = CONFIRM_SIMILAR
     confirm_stats = None
+    dhash_by_idx = None
     if confirm_similar and groups_idx:
         dhash_by_idx, _ = dhash_for_groups(images_data, stats, groups_idx, md5_by_idx, None, HASH_WORKERS)
         groups_idx, confirm_stats = confirm_similar_groups(
@@ -4622,6 +4624,14 @@ def run_selftest(folder, reference=None, confirm_similar=None):
         if reference is not None:
             groups_idx = filter_groups_for_reference(groups_idx, images_data, ref_keys)
         log.info("SELFTEST confirmação: %s", confirm_stats)
+    if same_photo is None:
+        same_photo = SAME_PHOTO_ENABLED
+    class_by_idx, suspect_ids, sp_stats = {}, set(), None
+    if same_photo and groups_idx:
+        class_by_idx, suspect_ids, sp_stats, _ = same_photo_stage(
+            images_data, stats, groups_idx, md5_by_idx, dhash_by_idx, None, None, HASH_WORKERS)
+        log.info("SELFTEST mesma foto: %s", sp_stats)
+    class_by_path = {images_data[i][0]: c for i, c in class_by_idx.items()}
     groups = build_groups(images_data, groups_idx, md5_by_idx)
     n_ident = 0
     for g in groups:
@@ -4638,12 +4648,17 @@ def run_selftest(folder, reference=None, confirm_similar=None):
                     f"{confirm_stats['groups_split']} divididos, "
                     f"{confirm_stats['pairs_rejected_dhash']} pares rejeitados, "
                     f"{confirm_stats['images_degenerate']} degeneradas")
+    if sp_stats is not None:
+        rej = ", ".join(f"{k} {v}" for k, v in sorted(sp_stats["rejected"].items())) or "nenhum"
+        summary += (f" | MESMA FOTO: {sp_stats['classes']} classes, {sp_stats['images_in_classes']} imagens, "
+                    f"{sp_stats['classes_suspect']} suspeitas, {sp_stats['pairs_hash_rule']} candidatos, "
+                    f"{sp_stats['pairs_confirmed']} confirmados, rejeitados: {rej}")
     if reference is not None:
         # Simula a seleção automática (mesmas funções puras da interface)
         mtime_by_path = {fp: (mt / 1e9 if mt is not None else float("inf"))
                          for (fp, _, mt) in entries}
         size_by_path = {fp: sz for (fp, sz, _) in entries}
-        n_protected = n_sel_ident = n_sel_simil = 0
+        n_protected = n_sel_ident = n_sel_simil = n_sel_same = 0
         for g in groups:
             counts = {}
             for (_, _, m) in g:
@@ -4655,19 +4670,25 @@ def run_selftest(folder, reference=None, confirm_similar=None):
                         pixels = im.size[0] * im.size[1]
                 except Exception:
                     pixels = None
+                cid = class_by_path.get(fp)
                 images.append({'filepath': fp, 'md5': m, 'mtime': mtime_by_path.get(fp, float("inf")),
                                'is_reference': cache_key(fp) in ref_keys,
-                               'pixels': pixels, 'size': size_by_path.get(fp)})
+                               'pixels': pixels, 'size': size_by_path.get(fp),
+                               'same_photo': cid, 'same_photo_suspect': cid in suspect_ids})
             n_protected += sum(1 for im in images if im['is_reference'])
             sel_i = plan_identical_selection(images)
             sel_s = plan_similar_selection(images, counts)
-            for i in sel_i + sel_s:
+            sel_p = plan_same_photo_selection(images)
+            for i in sel_i + sel_s + sel_p:
                 assert not images[i]['is_reference'], \
                     f"BUG: imagem da referência selecionada: {images[i]['filepath']}"
             n_sel_ident += len(sel_i)
             n_sel_simil += len(sel_s)
+            n_sel_same += len(sel_p)
         summary += (f" | REF: {len(groups)} grupos, {n_protected} protegidas, "
                     f"{n_sel_ident} selecionáveis (idênticas), {n_sel_simil} (semelhantes)")
+        if sp_stats is not None:
+            summary += f", {n_sel_same} (mesma foto)"
     log.info(summary)
     return summary
 
@@ -4677,6 +4698,7 @@ if __name__ == "__main__":
         try:
             reference = None
             confirm_similar = None
+            same_photo = None
             extra = sys.argv[3:]
             while extra:
                 opt = extra.pop(0)
@@ -4684,10 +4706,14 @@ if __name__ == "__main__":
                     reference = extra.pop(0)
                 elif opt == "--no-confirm":
                     confirm_similar = False
+                elif opt == "--no-same-photo":
+                    same_photo = False
+                elif opt == "--same-photo":
+                    same_photo = True
                 else:
-                    raise ValueError(f"Opção desconhecida: {opt} "
-                                     "(uso: --selftest PASTA [--ref REFERENCIA] [--no-confirm])")
-            result = run_selftest(sys.argv[2], reference, confirm_similar)
+                    raise ValueError(f"Opção desconhecida: {opt} (uso: --selftest PASTA "
+                                     "[--ref REFERENCIA] [--no-confirm] [--same-photo | --no-same-photo])")
+            result = run_selftest(sys.argv[2], reference, confirm_similar, same_photo)
             code = 0
         except (FileNotFoundError, ValueError) as e:
             log.error("SELFTEST: %s", e)

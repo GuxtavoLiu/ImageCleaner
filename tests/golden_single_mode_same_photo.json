@@ -1,0 +1,44 @@
+{
+  "groups": [
+    [
+      [
+        "a.jpg",
+        "Identica"
+      ],
+      [
+        "a_copy.jpg",
+        "Identica"
+      ],
+      [
+        "a_q30.jpg",
+        "MesmaFoto"
+      ],
+      [
+        "a_q60.jpg",
+        "MesmaFoto"
+      ]
+    ],
+    [
+      [
+        "sub/b.png",
+        "Identica"
+      ],
+      [
+        "sub/b_copy.png",
+        "Identica"
+      ]
+    ]
+  ],
+  "selected_identical": [
+    "a_copy.jpg",
+    "sub/b_copy.png"
+  ],
+  "selected_similar": [
+    "a_q30.jpg"
+  ],
+  "selected_same_photo": [
+    "a_copy.jpg",
+    "a_q30.jpg",
+    "a_q60.jpg"
+  ]
+}
