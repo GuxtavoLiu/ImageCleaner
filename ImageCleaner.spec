@@ -1,58 +1,45 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-block_cipher = None
 
 a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[
-        ('README_BUILD.md', '.'),  # Inclui o README no executável
-    ],
-    hiddenimports=[
-        'PIL._tkinter_finder',  # Necessário para Pillow + Tkinter
-        'imagehash',
-        'numpy',
-        'sqlite3',
-        'send2trash',  # exclusão pela Lixeira do Windows
-    ],
+    datas=[('assets/icon.ico', 'assets')],
+    hiddenimports=['PIL._tkinter_finder', 'send2trash'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[
-        'matplotlib',  # Exclui módulos não utilizados para reduzir tamanho
-        'pandas',
-        'pytest',
-        'IPython',
-        # NÃO excluir numpy/scipy/pywt: o imagehash depende deles.
-    ],
-    win_no_prefer_redirects=False,
-    win_private_assemblies=False,
-    cipher=block_cipher,
+    excludes=[],
     noarchive=False,
+    optimize=0,
 )
-
-pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+pyz = PYZ(a.pure)
 
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
     [],
+    exclude_binaries=True,
     name='ImageCleaner',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,  # Compressão UPX (reduz tamanho)
-    upx_exclude=[],
-    runtime_tmpdir=None,
-    console=False,  # Remove janela do console
+    upx=True,
+    console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=None,  # Adicione 'icon.ico' aqui se tiver um ícone
+    icon=['assets/icon.ico'],
+)
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    name='ImageCleaner',
 )

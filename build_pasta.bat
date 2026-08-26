@@ -23,6 +23,8 @@ if exist "dist" rmdir /s /q "dist"
 
 REM Compila como pasta (--onedir é o padrão)
 python -m PyInstaller --windowed ^
+    --icon "assets\icon.ico" ^
+    --add-data "assets\icon.ico;assets" ^
     --name "ImageCleaner" ^
     --hidden-import PIL._tkinter_finder ^
     main.py

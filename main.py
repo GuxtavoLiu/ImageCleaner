@@ -196,6 +196,24 @@ def shorten_path(filepath, roots):
     return "", os.path.dirname(filepath), name
 
 
+def get_app_icon_path():
+    """assets/icon.ico ao lado do main.py ou dentro do pacote PyInstaller."""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, "assets", "icon.ico")
+
+
+def apply_app_icon(root):
+    """Ícone do app na janela principal e, no Windows, em todas as janelas
+       filhas (default=). Sem o arquivo, fica o ícone padrão do Tk."""
+    path = get_app_icon_path()
+    if not os.path.exists(path):
+        return
+    try:
+        root.iconbitmap(default=path)
+    except tk.TclError as e:
+        log.warning("Ícone não aplicado (%s): %s", path, e)
+
+
 def apply_theme(root):
     """Tema visual global: ttk 'vista' (fallback 'clam'), fonte e fundo
        padrão para os widgets criados a partir daqui. Só aparência."""
@@ -2161,6 +2179,7 @@ class ImageCleaner:
         self.master = master
         self.master.title("Image Cleaner")
         apply_theme(self.master)
+        apply_app_icon(self.master)
         self.groups = []
         self.images_data = []
         self.selected_folder = ""
