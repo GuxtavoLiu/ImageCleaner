@@ -202,6 +202,19 @@ def get_app_icon_path():
     return os.path.join(base, "assets", "icon.ico")
 
 
+def set_windows_app_identity():
+    """No Windows, dá ao processo uma identidade própria (AppUserModelID).
+       Sem isso a barra de tarefas agrupa a janela com o pythonw.exe e mostra
+       o ícone do Python em vez do ícone do app."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("GustavoLiu.ImageCleaner")
+    except Exception as e:
+        log.warning("AppUserModelID não definido: %s", e)
+
+
 def apply_app_icon(root):
     """Ícone do app na janela principal e, no Windows, em todas as janelas
        filhas (default=). Sem o arquivo, fica o ícone padrão do Tk."""
@@ -4920,6 +4933,7 @@ if __name__ == "__main__":
 
     setup_logging()
     log.info("ImageCleaner iniciado (Python %s)", sys.version.split()[0])
+    set_windows_app_identity()
     root = tk.Tk()
     root.report_callback_exception = _report_callback_exception
     app = ImageCleaner(root)
