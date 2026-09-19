@@ -337,6 +337,7 @@ def extension_plate(filepath, kind, width, height):
 
 BADGE_STYLES = {
     "mesma foto": ("#004D40", "#B2DFDB"),
+    "live photo": ("#4A148C", "#E1BEE7"),
     "maior resolução": ("#1B5E20", "#C8E6C9"),
     "mais antiga": ("#0D47A1", "#BBDEFB"),
     "maior arquivo": ("#424242", "#EEEEEE"),
@@ -2222,6 +2223,174 @@ def build_byte_groups(entries, groups_idx, md5_by_idx):
     """Grupos de bytes no formato da interface: (filepath, None, md5). O lugar
        do ImageHash fica vazio: nada depois de build_groups lê esse campo."""
     return [[(entries[i][0], None, md5_by_idx[i]) for i in group] for group in groups_idx]
+
+
+# ---------------------------------------------------------------------------
+# Live Photos do iPhone: a foto (JPG/HEIC) tem ao lado um vídeo curto .MOV com
+# o mesmo nome. Ao tirar a foto duplicada de uma pasta, o .MOV dela ficaria
+# órfão. Funções puras; a regra de segurança é a mesma do resto: o vídeo só
+# acompanha a foto se sobrar uma cópia BYTE A BYTE idêntica dele.
+# ---------------------------------------------------------------------------
+LIVE_PHOTO_STILL_EXTENSIONS = (".jpg", ".jpeg", ".heic", ".heif")
+
+
+def live_photo_companion(photo_path):
+    """
+    Caminho do .MOV par de uma Live Photo, ou None. É par quando: mesma pasta,
+    mesmo nome-base, e o .MOV traz a marca de Live Photo da Apple (um vídeo
+    comum que por acaso tenha o mesmo número da foto NÃO é par). Se a foto e o
+    vídeo trazem identificadores e eles diferem, também não é par.
+    """
+    stem, ext = os.path.splitext(photo_path)
+    if ext.lower() not in LIVE_PHOTO_STILL_EXTENSIONS:
+        return None
+    mov = next((c for c in (stem + ".MOV", stem + ".mov") if os.path.isfile(c)), None)
+    if mov is None:
+        return None
+    info = mp4probe.probe(mov)
+    if not info["live_photo"]:
+        return None
+    photo_id = mp4probe.photo_content_id(photo_path)
+    if photo_id and info["content_id"] and photo_id != info["content_id"]:
+        return None
+    return mov
+
+
+def is_live_photo_video(path):
+    """True se `path` é o .MOV de uma Live Photo (pela marca da Apple)."""
+    return os.path.splitext(path)[1].lower() == ".mov" and mp4probe.probe(path)["live_photo"]
+
+
+def stills_with_same_stem(path, folder_index=None):
+    """Fotos (JPG/HEIC) na MESMA pasta com o mesmo nome-base de `path`, lidas
+       do diretório de verdade (ex.: IMG_1.JPG e IMG_1.HEIC dividem um .MOV).
+       folder_index: dict reaproveitado entre chamadas, para cada pasta ser
+       listada UMA vez por ação (milhares de selecionados na mesma pasta)."""
+    folder = os.path.dirname(path)
+    if folder_index is None:
+        folder_index = {}
+    by_stem = folder_index.get(folder)
+    if by_stem is None:
+        by_stem = {}
+        try:
+            names = os.listdir(folder)
+        except OSError:
+            names = []
+        for name in names:
+            base, ext = os.path.splitext(name)
+            if ext.lower() in LIVE_PHOTO_STILL_EXTENSIONS:
+                by_stem.setdefault(base.lower(), []).append(os.path.join(folder, name))
+        folder_index[folder] = by_stem
+    stem = os.path.splitext(os.path.basename(path))[0].lower()
+    own = cache_key(path)
+    return [full for full in by_stem.get(stem, []) if cache_key(full) != own]
+
+
+def same_content(path_a, path_b):
+    """True só se os dois arquivos têm exatamente os mesmos bytes (lidos agora).
+       Qualquer erro de leitura = False (sem prova, não é cópia)."""
+    try:
+        if os.path.getsize(path_a) != os.path.getsize(path_b):
+            return False
+        with open(path_a, "rb") as fa, open(path_b, "rb") as fb:
+            while True:
+                a = fa.read(MD5_CHUNK_SIZE)
+                b = fb.read(MD5_CHUNK_SIZE)
+                if a != b:
+                    return False
+                if not a:
+                    return True
+    except OSError:
+        return False
+
+
+def plan_live_companions(groups, selected_keys, is_protected=None, acting_keys=None, tick=None):
+    """
+    Decide quais vídeos de Live Photo acompanham as fotos selecionadas.
+    groups: lista de listas de caminhos (os grupos da tela); selected_keys:
+    set de cache_key dos caminhos selecionados; is_protected(caminho) -> bool.
+
+    Um .MOV só entra no plano se TODAS valem:
+      - o par é de verdade (live_photo_companion) e a foto dele está selecionada;
+      - ele mesmo não está selecionado nem é protegido (referência);
+      - nenhuma OUTRA foto de mesmo nome-base fica na pasta (ela ainda usa o vídeo);
+      - sobra uma cópia byte a byte idêntica dele: o .MOV par de uma foto NÃO
+        selecionada do mesmo grupo, conferido agora (same_content), ou um
+        arquivo idêntico a ele, não selecionado, num grupo de vídeos.
+    acting_keys (padrão: selected_keys): as fotos que saem AGORA. Numa ação de
+    um grupo só, selected_keys continua sendo TUDO o que está marcado na tela:
+    um vídeo marcado em outro grupo não serve de cópia que fica (ele pode sair
+    logo em seguida).
+    tick(n), se informado, é chamado a cada par conferido (a conferência lê os
+    dois vídeos inteiros: com centenas de pares a interface precisa respirar;
+    tick pode levantar ScanCancelled para abortar).
+    Retorna (plano, sem_copia): plano = [(foto, mov)], sem_copia = quantos
+    pares de verdade ficaram de fora por não haver cópia provada do vídeo.
+    """
+    is_protected = is_protected or (lambda p: False)
+    acting_keys = selected_keys if acting_keys is None else acting_keys
+    companion_cache = {}
+    folder_index = {}
+
+    def companion(photo):
+        key = cache_key(photo)
+        if key not in companion_cache:
+            companion_cache[key] = live_photo_companion(photo)
+        return companion_cache[key]
+
+    # vídeos que têm um idêntico NÃO selecionado em algum grupo (prova = MD5 da varredura)
+    group_of = {}
+    for members in groups:
+        for fp in members:
+            group_of[cache_key(fp)] = members
+    plan, without_copy, taken = [], 0, set()
+    for members in groups:
+        for photo in members:
+            if cache_key(photo) not in acting_keys or is_protected(photo):
+                continue
+            mov = companion(photo)
+            if mov is None:
+                continue
+            mov_key = cache_key(mov)
+            if mov_key in selected_keys or mov_key in taken or is_protected(mov):
+                continue
+            if any(cache_key(s) not in selected_keys for s in stills_with_same_stem(photo, folder_index)):
+                continue   # outra foto que fica ainda usa este vídeo
+            if tick:
+                tick(len(plan) + without_copy + 1)
+            proof = False
+            for other in members:                       # par idêntico ao lado de uma foto mantida
+                if cache_key(other) in selected_keys or cache_key(other) == cache_key(photo):
+                    continue
+                other_mov = companion(other)
+                if (other_mov and cache_key(other_mov) != mov_key
+                        and cache_key(other_mov) not in selected_keys and same_content(mov, other_mov)):
+                    proof = True
+                    break
+            if not proof:                               # ou um idêntico que fica, num grupo de vídeos
+                proof = any(cache_key(fp) != mov_key and cache_key(fp) not in selected_keys
+                            and same_content(mov, fp) for fp in group_of.get(mov_key, []))
+            if proof:
+                plan.append((photo, mov))
+                taken.add(mov_key)
+            else:
+                without_copy += 1
+    return plan, without_copy
+
+
+def orphaned_live_photos(selected_paths, selected_keys):
+    """Quantos vídeos SELECIONADOS são a parte em vídeo de uma Live Photo cuja
+       foto (mesma pasta, mesmo nome) NÃO está selecionada: a foto ficaria sem
+       o vídeo dela."""
+    count = 0
+    folder_index = {}
+    for path in selected_paths:
+        if os.path.splitext(path)[1].lower() != ".mov":
+            continue
+        stills = [s for s in stills_with_same_stem(path, folder_index) if cache_key(s) not in selected_keys]
+        if stills and is_live_photo_video(path):
+            count += 1
+    return count
 
 
 # ---------------------------------------------------------------------------
@@ -4255,6 +4424,7 @@ class ImageCleaner:
         self.media_info = {}                # MD5 (ou caminho) -> dict do mp4probe (vídeos)
         self.preview_photos = {}
         self.preview_requested = set()
+        self.live_cache = {}                # cache_key(foto) -> .MOV par de Live Photo (ou None)
         self.thumb_labels = {}              # chave da miniatura -> Labels que a exibem agora
         self._cancel_thumb_poll()           # agendamento de uma janela de grupos anterior
         self._thumb_loader = shellthumb.ThumbnailLoader()
@@ -4418,6 +4588,14 @@ class ImageCleaner:
         if files is None:
             files = getattr(self, 'has_non_photos', False)
         return file_wording(text) if files else text
+
+    def _live_companion(self, filepath):
+        """.MOV par de Live Photo desta foto (ou None), conferido uma vez por tela."""
+        key = cache_key(filepath)
+        cache = self.live_cache
+        if key not in cache:
+            cache[key] = live_photo_companion(filepath)
+        return cache[key]
 
     def _media_info(self, filepath, kind, share_key=None):
         """Dados do cabeçalho de um vídeo MP4/MOV (mp4probe), lidos uma vez por
@@ -4827,6 +5005,13 @@ class ImageCleaner:
                 lbl_same = tk.Label(text_frame, text=tag_text, fg=tfg, bg=tbg, font=FONT_BOLD, padx=4)
                 lbl_same.pack(anchor="w")
                 lbl_same.bind("<Button-1>", toggle_row)
+            if kind in (KIND_PHOTO, KIND_PHOTO_BYTES) and self._live_companion(filepath):
+                # Live Photo do iPhone: avisa que há um vídeo .MOV par ao lado
+                lfg, lbg = BADGE_STYLES["live photo"]
+                lbl_live = tk.Label(text_frame, text="LIVE PHOTO  ·  tem o vídeo .MOV ao lado",
+                                    fg=lfg, bg=lbg, font=FONT_BOLD, padx=4)
+                lbl_live.pack(anchor="w")
+                lbl_live.bind("<Button-1>", toggle_row)
 
             # Metadados do arquivo (protegido: o arquivo pode ter sido
             # movido/excluído por uma ação anterior nesta mesma tela)
@@ -5682,6 +5867,10 @@ class ImageCleaner:
                 "Escaneie de novo sem o cache." if stale else "")
 
     @staticmethod
+    def _live_moved_note(count, verb):
+        return f"\n+ {count} vídeo(s) de Live Photo {verb} junto com a foto." if count else ""
+
+    @staticmethod
     def _changed_note(changed):
         return (f"\n{changed} arquivo(s) mudaram depois da varredura e NÃO serão tocados "
                 "(a comparação valia para o conteúdo antigo; escaneie de novo)."
@@ -5718,14 +5907,94 @@ class ImageCleaner:
                     break
         return status, origem, size
 
-    def _record_batch(self, action, items):
+    def _live_photo_step(self, selected_paths):
+        """
+        Antes de mover/excluir: acha os vídeos de Live Photo que podem
+        acompanhar as fotos selecionadas (plan_live_companions: só os que têm
+        cópia idêntica ficando) e pergunta UMA vez. Sem nenhum par, não há
+        diálogo algum (o fluxo de sempre não muda).
+        Retorna None se o usuário cancelou tudo; senão um dict:
+          'pairs':  {cache_key(foto): (foto, mov)} a levar junto (vazio se "Não")
+          'note':   texto para a mensagem final (vídeos que ficaram, fotos órfãs)
+          'warn':   texto para a confirmação (fotos que ficarão sem o vídeo)
+          'labels': {mov: (status, tamanho)} para o relatório CSV
+        """
+        selected_paths = list(selected_paths)
+        acting_keys = {cache_key(p) for p in selected_paths}
+        # "Fica" = não está marcado em NENHUM grupo (não só no grupo desta ação)
+        selected_keys = acting_keys | {cache_key(im['filepath']) for d in self.group_check_vars.values()
+                                       for im in d['images'] if im['var'].get() == 1}
+        groups = [[im['filepath'] for im in d['images']] for d in self.group_check_vars.values()]
+        started = time.time()
+        state = {"window": False}
+
+        def tick(n):
+            # Conferir os vídeos lê os dois arquivos de cada par: se demorar,
+            # aparece uma janela de progresso com Cancelar
+            if not state["window"] and time.time() - started > 0.7:
+                self.scan_cancelled = False
+                self.create_progress_window()
+                self.progress_window.title("Live Photos")
+                state["window"] = True
+            if state["window"]:
+                self.progress_label.config(text=f"Conferindo os vídeos das Live Photos... {n}")
+                self.progress_window.update()
+                if self.scan_cancelled:
+                    raise ScanCancelled()
+
+        try:
+            plan, without_copy = plan_live_companions(groups, selected_keys, self._is_protected,
+                                                      acting_keys, tick)
+        except ScanCancelled:
+            return None
+        finally:
+            if state["window"]:
+                self._close_progress_window()
+        orphans = orphaned_live_photos(selected_paths, selected_keys)
+        out = {'pairs': {}, 'note': "", 'warn': "", 'labels': {}}
+        if orphans:
+            out['warn'] = (f"\n\nAtenção: {orphans} vídeo(s) selecionado(s) são a parte em vídeo de Live "
+                           "Photos cuja foto NÃO está selecionada: a foto ficará sem o vídeo dela.")
+        if without_copy:
+            out['note'] = (f"\n{without_copy} vídeo(s) de Live Photo (.MOV ao lado da foto) ficaram onde "
+                           "estão: não há cópia idêntica deles ao lado das fotos mantidas.")
+        if not plan:
+            return out
+        answer = messagebox.askyesnocancel(
+            "Live Photos",
+            f"{len(plan)} das fotos selecionadas são Live Photos do iPhone: cada uma tem ao lado um "
+            "vídeo curto (.MOV) com o mesmo nome.\n\n"
+            f"Esses {len(plan)} vídeo(s) têm cópia idêntica, conferida agora, ao lado da foto que "
+            "será mantida.\n\n"
+            "Levar esses vídeos junto com as fotos?\n"
+            "(Não = só as fotos; os vídeos ficam soltos na pasta.)")
+        if answer is None:
+            return None
+        if answer:
+            for photo, mov in plan:
+                out['pairs'][cache_key(photo)] = (photo, mov)
+                try:
+                    size = os.path.getsize(mov)
+                except OSError:
+                    size = None
+                out['labels'][mov] = ("Live Photo (par)", size)
+        else:
+            out['note'] += f"\n{len(plan)} vídeo(s) de Live Photo ficaram na pasta, a seu pedido."
+        return out
+
+    def _record_batch(self, action, items, labels=None):
         """Registra um lote no relatório CSV e, se for reversível, no log de
-           ações. items: lista de (group_idx, caminho, destino)."""
+           ações. items: lista de (group_idx, caminho, destino). labels:
+           {caminho: (status, tamanho)} para itens que não são linha de grupo
+           (o .MOV que acompanhou uma Live Photo)."""
         if not items:
             return
         rows = []
         for group_idx, src, dst in items:
             status, origem, size = self._image_meta(group_idx, src)
+            if labels and src in labels:
+                status, size = labels[src]
+                origem = "ALVO"
             rows.append({"acao": action, "grupo": (group_idx + 1) if group_idx is not None else "",
                          "status": status, "origem": origem, "caminho": src,
                          "destino": dst or "", "tamanho": size if size is not None else ""})
@@ -5819,12 +6088,17 @@ class ImageCleaner:
         errors = []
         batch = []
 
+        wanted = [im['filepath'] for d in self.group_check_vars.values() for im in d['images']
+                  if im['var'].get() == 1 and not self._is_protected(im['filepath'])]
+        # Live Photos: o .MOV ao lado da foto pode ir junto (só pergunta se houver par)
+        live = self._live_photo_step(wanted)
+        if live is None:
+            return   # cancelado na pergunta das Live Photos: nada foi movido
         # Provas de "cópia exata" que vieram do cache são relidas agora
-        stale = self._stale_proofs(
-            im['filepath'] for d in self.group_check_vars.values() for im in d['images']
-            if im['var'].get() == 1 and not self._is_protected(im['filepath']))
+        stale = self._stale_proofs(wanted)
         if stale is None:
             return   # reconferência cancelada: nada foi movido
+        live_moved = 0
 
         # Itera sobre todos os grupos
         for group_idx, group_data in self.group_check_vars.items():
@@ -5847,24 +6121,35 @@ class ImageCleaner:
                         img_info['var'].set(0)
                         continue
                     try:
-                        new_path = self._move_file(filepath, dest_folder)
+                        pair = live['pairs'].get(cache_key(filepath))
+                        new_mov = mov_err = None
+                        if pair:
+                            new_path, new_mov, mov_err = self._move_pair(filepath, pair[1], dest_folder)
+                        else:
+                            new_path = self._move_file(filepath, dest_folder)
                         if new_path is None:
                             skipped_count += 1  # já estava na pasta de destino
                         else:
                             moved_count += 1
                             batch.append((group_idx, filepath, new_path))
                             img_info['var'].set(0)  # Desmarca após mover
+                            if new_mov:
+                                live_moved += 1
+                                batch.append((group_idx, pair[1], new_mov))
+                            if mov_err:
+                                errors.append(f"{pair[1]}: {mov_err}")
                     except Exception as e:
                         errors.append(f"{filepath}: {str(e)}")
 
-        self._record_batch("mover", batch)
+        self._record_batch("mover", batch, live['labels'])
         # Recarrega a página atual para atualizar a visualização
         self.render_page()
 
         skipped_msg = self._t(f"\n{skipped_count} imagem(ns) ignorada(s): já estavam na pasta de destino "
                               f"(continuam selecionadas)." if skipped_count else "")
         skipped_msg += (self._t(self._protected_note(protected)) + self._changed_note(changed)
-                        + self._stale_note(len(stale)))
+                        + self._stale_note(len(stale)) + self._live_moved_note(live_moved, "movido(s)")
+                        + live['note'] + live['warn'])
         undo_msg = "\n\nPara devolver: menu 'Mais' > 'Desfazer último lote'." if batch else ""
         if errors:
             error_msg = (self._t(f"{moved_count} imagens movidas.") + f"{skipped_msg}\n\nErros:\n"
@@ -5901,22 +6186,32 @@ class ImageCleaner:
         if self._trash_refused():
             return
 
+        wanted = [im['filepath'] for d in self.group_check_vars.values() for im in d['images']
+                  if im['var'].get() == 1 and not self._is_protected(im['filepath'])
+                  and im['filepath'] not in changed_paths]
+        # Live Photos: o .MOV ao lado da foto pode ir junto (só pergunta se houver
+        # par), ANTES da confirmação, para o número prometido ser o executado
+        live = self._live_photo_step(wanted)
+        if live is None:
+            return
+        live_line = (f"\n+ {len(live['pairs'])} vídeo(s) de Live Photo (.MOV ao lado da foto)."
+                     if live['pairs'] else "")
+
         confirm = messagebox.askyesno("Excluir", self._t(
                                      f"Enviar {selected_count} imagens selecionadas para a Lixeira do Windows?"
-                                     + self._protected_note(protected)) + self._changed_note(len(changed_paths)))
+                                     + self._protected_note(protected)) + self._changed_note(len(changed_paths))
+                                     + live_line + live['warn'])
         if not confirm:
             return
 
         # Provas de "cópia exata" que vieram do cache são relidas agora, antes
         # de qualquer arquivo ir para a Lixeira
-        stale = self._stale_proofs(
-            im['filepath'] for d in self.group_check_vars.values() for im in d['images']
-            if im['var'].get() == 1 and not self._is_protected(im['filepath'])
-            and im['filepath'] not in changed_paths)
+        stale = self._stale_proofs(wanted)
         if stale is None:
             return   # reconferência cancelada: nada foi excluído
 
         deleted_count = 0
+        live_deleted = 0
         errors = []
         batch = []
 
@@ -5944,22 +6239,32 @@ class ImageCleaner:
                         img_info['var'].set(0)  # Desmarca após excluir
                     except Exception as e:
                         errors.append(f"{filepath}: {str(e)}")
+                        continue
+                    pair = live['pairs'].get(cache_key(filepath))
+                    if pair:   # a foto foi: o vídeo de Live Photo dela vai junto
+                        try:
+                            trash_file(pair[1])
+                            live_deleted += 1
+                            batch.append((group_idx, pair[1], None))
+                        except Exception as e:
+                            errors.append(f"{pair[1]}: {str(e)}")
 
-        self._record_batch("lixeira", batch)
+        self._record_batch("lixeira", batch, live['labels'])
         # Recarrega a página atual para atualizar a visualização
         self.render_page()
 
+        extra = (self._stale_note(len(stale)) + self._live_moved_note(live_deleted, "enviado(s) à Lixeira")
+                 + live['note'])
         if errors:
             error_msg = (self._t(f"{deleted_count} imagens enviadas para a Lixeira.") + "\n\nErros:\n"
                          + "\n".join(errors[:5]))
             if len(errors) > 5:
                 error_msg += f"\n... e mais {len(errors) - 5} erros."
-            messagebox.showwarning("Excluir - Concluído com Erros",
-                                   error_msg + self._stale_note(len(stale)) + self._report_note())
+            messagebox.showwarning("Excluir - Concluído com Erros", error_msg + extra + self._report_note())
         else:
             messagebox.showinfo("Excluir", self._t(f"{deleted_count} imagens enviadas para a Lixeira do Windows!"
                                                    + self._protected_note(protected))
-                                + self._stale_note(len(stale)) + self._report_note())
+                                + extra + self._report_note())
 
     @staticmethod
     def _move_file(filepath, dest_folder):
@@ -5978,6 +6283,41 @@ class ImageCleaner:
             while os.path.exists(new_path):
                 new_path = os.path.join(dest_folder, f"{name}_{counter}{ext}")
                 counter += 1
+        ImageCleaner._move_to(filepath, new_path)
+        return new_path
+
+    @staticmethod
+    def _move_pair(photo, mov, dest_folder):
+        """
+        Move uma Live Photo (foto + .MOV) mantendo o par: os dois recebem o
+        MESMO sufixo de colisão (IMG_1_2.JPG e IMG_1_2.MOV), senão o vínculo
+        pelo nome se perderia no destino. Retorna (novo_foto, novo_mov, erro_mov);
+        novo_foto None = a foto já estava na pasta de destino (nada é movido).
+        Erro ao mover a FOTO propaga; erro só no vídeo volta em erro_mov (a
+        foto já foi e tem de ser registrada).
+        """
+        name, ext = os.path.splitext(os.path.basename(photo))
+        mov_ext = os.path.splitext(mov)[1]
+        if cache_key(os.path.join(dest_folder, name + ext)) == cache_key(photo):
+            return None, None, None
+        counter = 0
+        while True:
+            suffix = f"_{counter}" if counter else ""
+            new_photo = os.path.join(dest_folder, name + suffix + ext)
+            new_mov = os.path.join(dest_folder, name + suffix + mov_ext)
+            if not os.path.exists(new_photo) and not os.path.exists(new_mov):
+                break
+            counter += 1
+        ImageCleaner._move_to(photo, new_photo)
+        try:
+            ImageCleaner._move_to(mov, new_mov)
+        except Exception as e:
+            return new_photo, None, e
+        return new_photo, new_mov, None
+
+    @staticmethod
+    def _move_to(filepath, new_path):
+        """shutil.move com limpeza da cópia parcial se falhar no meio."""
         try:
             shutil.move(filepath, new_path)
         except Exception:
@@ -6008,10 +6348,15 @@ class ImageCleaner:
         batch = []
         group_idx = self._group_index_of(group)
         files = any(is_file_kind(classify_file(fp)) for (fp, _, _) in group)
-        stale = self._stale_proofs(fp for (fp, _, _), var in zip(group, check_vars)
-                                   if var.get() == 1 and not self._is_protected(fp))
+        wanted = [fp for (fp, _, _), var in zip(group, check_vars)
+                  if var.get() == 1 and not self._is_protected(fp)]
+        live = self._live_photo_step(wanted)
+        if live is None:
+            return   # cancelado na pergunta das Live Photos: nada foi movido
+        stale = self._stale_proofs(wanted)
         if stale is None:
             return   # reconferência cancelada: nada foi movido
+        live_moved = 0
         for (filepath, _, _), var in zip(group, check_vars):
             if var.get() == 1:
                 if self._is_protected(filepath):
@@ -6027,23 +6372,35 @@ class ImageCleaner:
                     var.set(0)
                     continue
                 try:
-                    new_path = self._move_file(filepath, dest_folder)
+                    pair = live['pairs'].get(cache_key(filepath))
+                    new_mov = mov_err = None
+                    if pair:
+                        new_path, new_mov, mov_err = self._move_pair(filepath, pair[1], dest_folder)
+                    else:
+                        new_path = self._move_file(filepath, dest_folder)
                     if new_path is None:
                         skipped += 1  # já estava na pasta de destino
                     else:
                         moved += 1
                         batch.append((group_idx, filepath, new_path))
+                        if new_mov:
+                            live_moved += 1
+                            batch.append((group_idx, pair[1], new_mov))
+                        if mov_err:
+                            failed += 1
+                            log.warning("Erro ao mover o vídeo da Live Photo %s: %s", pair[1], mov_err)
                 except Exception as e:
                     failed += 1
                     log.warning("Erro ao mover %s: %s", filepath, e)
-        self._record_batch("mover", batch)
+        self._record_batch("mover", batch, live['labels'])
         msg = self._t(f"{moved} imagem(ns) movida(s).", files=files)
         if skipped:
             msg += self._t(f"\n{skipped} ignorada(s): já estavam na pasta de destino.", files=files)
         if failed:
             msg += f"\n{failed} com erro (detalhes no log)."
         msg += (self._t(self._protected_note(protected), files=files) + self._changed_note(changed)
-                + self._stale_note(len(stale)))
+                + self._stale_note(len(stale)) + self._live_moved_note(live_moved, "movido(s)")
+                + live['note'] + live['warn'])
         if batch:
             msg += "\n\nPara devolver: menu 'Mais' > 'Desfazer último lote'."
         messagebox.showinfo("Mover", msg + self._report_note())
@@ -6068,21 +6425,27 @@ class ImageCleaner:
             return
         if self._trash_refused():
             return
+        wanted = [fp for (fp, _, _), var in zip(group, check_vars)
+                  if var.get() == 1 and not self._is_protected(fp) and fp not in changed_paths]
+        live = self._live_photo_step(wanted)
+        if live is None:
+            return
+        live_line = (f"\n+ {len(live['pairs'])} vídeo(s) de Live Photo (.MOV ao lado da foto)."
+                     if live['pairs'] else "")
         # A contagem importa: em grupos grandes a seleção pode incluir imagens
         # que não estão na faixa exibida no momento.
         confirm = messagebox.askyesno(
             "Excluir",
             self._t(f"Enviar {selected_count} imagem(ns) selecionada(s) deste grupo para a Lixeira do Windows?"
                     + self._protected_note(protected), files=files) + self._changed_note(len(changed_paths))
+            + live_line + live['warn']
         )
         if not confirm:
             return
-        stale = self._stale_proofs(fp for (fp, _, _), var in zip(group, check_vars)
-                                   if var.get() == 1 and not self._is_protected(fp)
-                                   and fp not in changed_paths)
+        stale = self._stale_proofs(wanted)
         if stale is None:
             return   # reconferência cancelada: nada foi excluído
-        deleted = failed = 0
+        deleted = failed = live_deleted = 0
         batch = []
         group_idx = self._group_index_of(group)
         for (filepath, _, _), var in zip(group, check_vars):
@@ -6103,12 +6466,24 @@ class ImageCleaner:
                 except Exception as e:
                     failed += 1
                     log.warning("Erro ao excluir %s: %s", filepath, e)
-        self._record_batch("lixeira", batch)
+                    continue
+                pair = live['pairs'].get(cache_key(filepath))
+                if pair:   # a foto foi: o vídeo de Live Photo dela vai junto
+                    try:
+                        trash_file(pair[1])
+                        live_deleted += 1
+                        batch.append((group_idx, pair[1], None))
+                    except Exception as e:
+                        failed += 1
+                        log.warning("Erro ao excluir o vídeo da Live Photo %s: %s", pair[1], e)
+        self._record_batch("lixeira", batch, live['labels'])
         msg = self._t(f"{deleted} imagem(ns) enviada(s) para a Lixeira do Windows.", files=files)
         if failed:
             msg += f"\n{failed} com erro (detalhes no log)."
         messagebox.showinfo("Excluir", msg + self._t(self._protected_note(protected), files=files)
-                            + self._stale_note(len(stale)) + self._report_note())
+                            + self._stale_note(len(stale))
+                            + self._live_moved_note(live_deleted, "enviado(s) à Lixeira")
+                            + live['note'] + self._report_note())
 
 def _report_callback_exception(exc_type, exc_value, exc_tb):
     """Erros dentro de callbacks do Tk (cliques de botão etc.) iam para o stderr,

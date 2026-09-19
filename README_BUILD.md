@@ -305,6 +305,26 @@ Na tela inicial: **Fotos** (ligada por padrão), **Vídeos** e **Outros arquivos
 - Módulos ao lado do `main.py` (o PyInstaller recolhe sozinho): `shellthumb.py` (miniatura
   do Explorer via ctypes) e `mp4probe.py` (cabeçalho de MP4/MOV em Python puro).
 
+### Live Photos do iPhone (foto + vídeo .MOV com o mesmo nome)
+Uma Live Photo são dois arquivos na mesma pasta: `IMG_1234.JPG` (ou `.HEIC`) e `IMG_1234.MOV`.
+Tirar a foto duplicada deixaria o vídeo dela órfão. O app reconhece o par pela marca que o
+iPhone grava dentro do `.MOV` (`com.apple.quicktime.content.identifier`, lida pelo
+`mp4probe.py`): um vídeo comum que por acaso tenha o mesmo número da foto **não** é par.
+- A linha da foto ganha o rótulo **LIVE PHOTO**.
+- Ao mover ou excluir, o app pergunta uma vez se leva os vídeos junto (Sim / Não / Cancelar).
+  Sem nenhum par, não há pergunta nenhuma.
+- **Trava contra perda**: o vídeo só acompanha a foto se sobra uma cópia byte a byte idêntica
+  dele, conferida na hora: o `.MOV` par de uma foto que fica no mesmo grupo, ou um vídeo
+  idêntico não selecionado num grupo de vídeos. Sem essa prova o vídeo **fica** e a mensagem
+  final avisa. Também fica se outra foto de mesmo nome (ex.: `IMG_1234.HEIC`) continua na
+  pasta, se já está selecionado por conta própria, ou se é da pasta de referência.
+- No sentido inverso, a confirmação avisa quando um `.MOV` selecionado é a parte em vídeo de
+  uma Live Photo cuja foto não está selecionada (a foto ficaria sem o vídeo).
+- Ao mover, foto e vídeo recebem o mesmo sufixo de colisão (`IMG_1_1.JPG` e `IMG_1_1.MOV`).
+  "Desfazer" devolve os dois; no CSV o vídeo aparece com o status "Live Photo (par)".
+- Validado com arquivos de teste que carregam a mesma marca da Apple; ainda não com uma
+  Live Photo real.
+
 ### Tela de grupos: como revisar rápido
 - **Fila de revisão**: "Selecionar Idênticas/Semelhantes" ou "Marcar verificado ✓" de
   um grupo tira o grupo dos pendentes; o próximo sobe para o mesmo lugar. Os
