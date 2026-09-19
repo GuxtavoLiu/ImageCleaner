@@ -1,0 +1,1105 @@
+{
+  "normal": {
+    "dialogs": [
+      [
+        "showinfo",
+        "Escaneamento Concluído",
+        "✓ 7 de 7 imagens processadas com sucesso!\n\n⚠️ Ao clicar em OK, o carregamento pode demorar alguns minutos.\nPor favor, aguarde."
+      ]
+    ],
+    "progress_titles": [
+      "Escaneando Imagens",
+      "Agrupando Imagens",
+      "Verificando Imagens Idênticas",
+      "Confirmando Semelhantes",
+      "Identificando 'Mesma foto'"
+    ],
+    "scan_in_progress": false,
+    "has_groups_window": true,
+    "groups": [
+      [
+        [
+          "ALVO/a.jpg",
+          0
+        ],
+        [
+          "ALVO/a_copy.jpg",
+          0
+        ],
+        [
+          "ALVO/a_q30.jpg",
+          1
+        ],
+        [
+          "ALVO/a_q60.jpg",
+          2
+        ]
+      ],
+      [
+        [
+          "ALVO/sub/b.png",
+          0
+        ],
+        [
+          "ALVO/sub/b_copy.png",
+          0
+        ]
+      ]
+    ],
+    "groups_same_photo": [
+      [
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        null,
+        null
+      ]
+    ],
+    "same_photo_suspect_count": 0,
+    "confirm_stats": {
+      "groups_in": 2,
+      "groups_out": 2,
+      "groups_unchanged": 2,
+      "groups_split": 0,
+      "groups_dropped": 0,
+      "images_in": 6,
+      "images_out": 6,
+      "images_dropped": 0,
+      "images_degenerate": 0,
+      "pairs_checked": 5,
+      "pairs_rejected_dhash": 0,
+      "pairs_rejected_degenerate": 0,
+      "pairs_without_dhash": 0
+    },
+    "same_photo_stats": {
+      "groups_checked": 1,
+      "pairs_hash_rule": 5,
+      "pairs_without_dhash": 0,
+      "pairs_confirmed": 5,
+      "rejected": {},
+      "unions_refused_clique": 0,
+      "classes": 1,
+      "images_in_classes": 4,
+      "classes_suspect": 0
+    },
+    "window_title": "Grupos de Imagens Similares",
+    "labels": {
+      "review": "Verificados 0 / 2",
+      "selection": "Selecionadas: 0 imagem(ns), 0 bytes",
+      "page_info": "Pendentes: página 1 de 1   |   2 pendentes, 0 verificados, 2 no total   |   2º hash descartou 0 img em 0 grupo(s)   |   Mesma foto: 1 classe(s), 4 img"
+    },
+    "group_titles": [
+      "Grupo 1",
+      "Grupo 2"
+    ],
+    "buttons": [
+      "Selecionar Todas Idênticas",
+      "Selecionar Todas Semelhantes",
+      "Selecionar Todas Mesma Foto",
+      "Mover Todas Selecionadas",
+      "Excluir Todas Selecionadas",
+      "Grupos verificados (0)",
+      "← Anterior (F1)",
+      "Próximo (F2) →",
+      "Selecionar Idênticas",
+      "Selecionar Semelhantes",
+      "Selecionar Mesma foto",
+      "Marcar verificado ✓",
+      "Mover Selecionadas",
+      "Excluir Selecionadas",
+      "Selecionar Idênticas",
+      "Marcar verificado ✓",
+      "Mover Selecionadas",
+      "Excluir Selecionadas"
+    ],
+    "rows": {
+      "0:0": [
+        "[ALVO] (raiz)",
+        "Status: Idêntica   |   Resolução: 128 x 128 (0,0 MP)"
+      ],
+      "0:1": [
+        "[ALVO] (raiz)",
+        "Status: Idêntica   |   Resolução: 128 x 128 (0,0 MP)"
+      ],
+      "0:2": [
+        "[ALVO] (raiz)",
+        "Status: Mesma foto   |   Resolução: 128 x 128 (0,0 MP)"
+      ],
+      "0:3": [
+        "[ALVO] (raiz)",
+        "Status: Mesma foto   |   Resolução: 128 x 128 (0,0 MP)"
+      ],
+      "1:0": [
+        "[ALVO] sub",
+        "Status: Idêntica   |   Resolução: 128 x 128 (0,0 MP)"
+      ],
+      "1:1": [
+        "[ALVO] sub",
+        "Status: Idêntica   |   Resolução: 128 x 128 (0,0 MP)"
+      ]
+    },
+    "statuses": [
+      [
+        "Idêntica",
+        "Idêntica",
+        "Mesma foto",
+        "Mesma foto"
+      ],
+      [
+        "Idêntica",
+        "Idêntica"
+      ]
+    ]
+  },
+  "normal_sem_pos_filtros": {
+    "dialogs": [
+      [
+        "showinfo",
+        "Escaneamento Concluído",
+        "✓ 7 de 7 imagens processadas com sucesso!\n\n⚠️ Ao clicar em OK, o carregamento pode demorar alguns minutos.\nPor favor, aguarde."
+      ]
+    ],
+    "progress_titles": [
+      "Escaneando Imagens",
+      "Agrupando Imagens",
+      "Verificando Imagens Idênticas"
+    ],
+    "scan_in_progress": false,
+    "has_groups_window": true,
+    "groups": [
+      [
+        [
+          "ALVO/a.jpg",
+          0
+        ],
+        [
+          "ALVO/a_copy.jpg",
+          0
+        ],
+        [
+          "ALVO/a_q30.jpg",
+          1
+        ],
+        [
+          "ALVO/a_q60.jpg",
+          2
+        ]
+      ],
+      [
+        [
+          "ALVO/sub/b.png",
+          0
+        ],
+        [
+          "ALVO/sub/b_copy.png",
+          0
+        ]
+      ]
+    ],
+    "groups_same_photo": null,
+    "same_photo_suspect_count": 0,
+    "confirm_stats": null,
+    "same_photo_stats": null,
+    "window_title": "Grupos de Imagens Similares",
+    "labels": {
+      "review": "Verificados 0 / 2",
+      "selection": "Selecionadas: 0 imagem(ns), 0 bytes",
+      "page_info": "Pendentes: página 1 de 1   |   2 pendentes, 0 verificados, 2 no total"
+    },
+    "group_titles": [
+      "Grupo 1",
+      "Grupo 2"
+    ],
+    "buttons": [
+      "Selecionar Todas Idênticas",
+      "Selecionar Todas Semelhantes",
+      "Mover Todas Selecionadas",
+      "Excluir Todas Selecionadas",
+      "Grupos verificados (0)",
+      "← Anterior (F1)",
+      "Próximo (F2) →",
+      "Selecionar Idênticas",
+      "Selecionar Semelhantes",
+      "Marcar verificado ✓",
+      "Mover Selecionadas",
+      "Excluir Selecionadas",
+      "Selecionar Idênticas",
+      "Marcar verificado ✓",
+      "Mover Selecionadas",
+      "Excluir Selecionadas"
+    ],
+    "rows": {
+      "0:0": [
+        "[ALVO] (raiz)",
+        "Status: Idêntica   |   Resolução: 128 x 128 (0,0 MP)"
+      ],
+      "0:1": [
+        "[ALVO] (raiz)",
+        "Status: Idêntica   |   Resolução: 128 x 128 (0,0 MP)"
+      ],
+      "0:2": [
+        "[ALVO] (raiz)",
+        "Status: Semelhante   |   Resolução: 128 x 128 (0,0 MP)"
+      ],
+      "0:3": [
+        "[ALVO] (raiz)",
+        "Status: Semelhante   |   Resolução: 128 x 128 (0,0 MP)"
+      ],
+      "1:0": [
+        "[ALVO] sub",
+        "Status: Idêntica   |   Resolução: 128 x 128 (0,0 MP)"
+      ],
+      "1:1": [
+        "[ALVO] sub",
+        "Status: Idêntica   |   Resolução: 128 x 128 (0,0 MP)"
+      ]
+    },
+    "statuses": [
+      [
+        "Idêntica",
+        "Idêntica",
+        "Semelhante",
+        "Semelhante"
+      ],
+      [
+        "Idêntica",
+        "Idêntica"
+      ]
+    ]
+  },
+  "pasta_vazia": {
+    "dialogs": [
+      [
+        "showinfo",
+        "Resultado",
+        "Nenhuma imagem encontrada."
+      ]
+    ],
+    "progress_titles": [
+      "Escaneando Imagens"
+    ],
+    "scan_in_progress": false,
+    "has_groups_window": false
+  },
+  "sem_semelhantes": {
+    "dialogs": [
+      [
+        "showinfo",
+        "Escaneamento Concluído",
+        "✓ 2 de 2 imagens processadas com sucesso!\n\n⚠️ Ao clicar em OK, o carregamento pode demorar alguns minutos.\nPor favor, aguarde."
+      ],
+      [
+        "showinfo",
+        "Resultado",
+        "Nenhuma imagem similar encontrada."
+      ]
+    ],
+    "progress_titles": [
+      "Escaneando Imagens",
+      "Agrupando Imagens"
+    ],
+    "scan_in_progress": false,
+    "has_groups_window": false
+  },
+  "referencia": {
+    "dialogs": [
+      [
+        "showinfo",
+        "Escaneamento Concluído",
+        "✓ 8 de 8 imagens processadas com sucesso!\nSendo 5 da pasta alvo e 3 da referência (protegida).\n\n⚠️ Ao clicar em OK, o carregamento pode demorar alguns minutos.\nPor favor, aguarde."
+      ]
+    ],
+    "progress_titles": [
+      "Escaneando Imagens",
+      "Agrupando Imagens",
+      "Verificando Imagens Idênticas",
+      "Confirmando Semelhantes",
+      "Identificando 'Mesma foto'"
+    ],
+    "scan_in_progress": false,
+    "has_groups_window": true,
+    "groups": [
+      [
+        [
+          "ALVO/dup_a.jpg",
+          0
+        ],
+        [
+          "ALVO/quase_a.jpg",
+          1
+        ],
+        [
+          "REF/acervo_a.jpg",
+          0
+        ]
+      ],
+      [
+        [
+          "ALVO/interna1.jpg",
+          0
+        ],
+        [
+          "ALVO/interna2.jpg",
+          0
+        ],
+        [
+          "REF/acervo_b.jpg",
+          1
+        ],
+        [
+          "REF/acervo_b2.jpg",
+          1
+        ]
+      ]
+    ],
+    "groups_same_photo": [
+      [
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        0,
+        0
+      ]
+    ],
+    "same_photo_suspect_count": 0,
+    "confirm_stats": {
+      "groups_in": 2,
+      "groups_out": 2,
+      "groups_unchanged": 2,
+      "groups_split": 0,
+      "groups_dropped": 0,
+      "images_in": 7,
+      "images_out": 7,
+      "images_dropped": 0,
+      "images_degenerate": 0,
+      "pairs_checked": 6,
+      "pairs_rejected_dhash": 0,
+      "pairs_rejected_degenerate": 0,
+      "pairs_without_dhash": 0
+    },
+    "same_photo_stats": {
+      "groups_checked": 2,
+      "pairs_hash_rule": 6,
+      "pairs_without_dhash": 0,
+      "pairs_confirmed": 6,
+      "rejected": {},
+      "unions_refused_clique": 0,
+      "classes": 2,
+      "images_in_classes": 7,
+      "classes_suspect": 0
+    },
+    "window_title": "Grupos de Imagens Similares",
+    "labels": {
+      "review": "Verificados 0 / 2",
+      "selection": "Selecionadas: 0 imagem(ns), 0 bytes",
+      "page_info": "Pendentes: página 1 de 1   |   2 pendentes, 0 verificados, 2 no total   |   2º hash descartou 0 img em 0 grupo(s)   |   Mesma foto: 2 classe(s), 7 img"
+    },
+    "group_titles": [
+      "Grupo 1",
+      "Grupo 2"
+    ],
+    "buttons": [
+      "Selecionar Todas Idênticas",
+      "Selecionar Todas Semelhantes",
+      "Selecionar Todas Mesma Foto",
+      "Mover Todas Selecionadas",
+      "Excluir Todas Selecionadas",
+      "Grupos verificados (0)",
+      "← Anterior (F1)",
+      "Próximo (F2) →",
+      "Selecionar Idênticas",
+      "Selecionar Semelhantes",
+      "Selecionar Mesma foto",
+      "Marcar verificado ✓",
+      "Mover Selecionadas",
+      "Excluir Selecionadas",
+      "Selecionar Idênticas",
+      "Selecionar Mesma foto",
+      "Marcar verificado ✓",
+      "Mover Selecionadas",
+      "Excluir Selecionadas"
+    ],
+    "rows": {
+      "0:0": [
+        "[ALVO] (raiz)",
+        "Status: Idêntica   |   Resolução: 128 x 128 (0,0 MP)"
+      ],
+      "0:1": [
+        "[ALVO] (raiz)",
+        "Status: Mesma foto   |   Resolução: 128 x 128 (0,0 MP)"
+      ],
+      "0:2": [
+        "[REF] (raiz)",
+        "Status: Idêntica   |   Resolução: 128 x 128 (0,0 MP)"
+      ],
+      "1:0": [
+        "[ALVO] (raiz)",
+        "Status: Idêntica   |   Resolução: 128 x 128 (0,0 MP)"
+      ],
+      "1:1": [
+        "[ALVO] (raiz)",
+        "Status: Idêntica   |   Resolução: 128 x 128 (0,0 MP)"
+      ],
+      "1:2": [
+        "[REF] (raiz)",
+        "Status: Idêntica   |   Resolução: 128 x 128 (0,0 MP)"
+      ],
+      "1:3": [
+        "[REF] (raiz)",
+        "Status: Idêntica   |   Resolução: 128 x 128 (0,0 MP)"
+      ]
+    },
+    "statuses": [
+      [
+        "Idêntica",
+        "Mesma foto",
+        "Idêntica"
+      ],
+      [
+        "Idêntica",
+        "Idêntica",
+        "Idêntica",
+        "Idêntica"
+      ]
+    ]
+  },
+  "referencia_oculta_internas": {
+    "dialogs": [
+      [
+        "showinfo",
+        "Escaneamento Concluído",
+        "✓ 8 de 8 imagens processadas com sucesso!\nSendo 5 da pasta alvo e 3 da referência (protegida).\n\n⚠️ Ao clicar em OK, o carregamento pode demorar alguns minutos.\nPor favor, aguarde."
+      ]
+    ],
+    "progress_titles": [
+      "Escaneando Imagens",
+      "Agrupando Imagens",
+      "Verificando Imagens Idênticas",
+      "Confirmando Semelhantes",
+      "Identificando 'Mesma foto'"
+    ],
+    "scan_in_progress": false,
+    "has_groups_window": true,
+    "groups": [
+      [
+        [
+          "ALVO/dup_a.jpg",
+          0
+        ],
+        [
+          "ALVO/quase_a.jpg",
+          1
+        ],
+        [
+          "REF/acervo_a.jpg",
+          0
+        ]
+      ],
+      [
+        [
+          "ALVO/interna1.jpg",
+          0
+        ],
+        [
+          "ALVO/interna2.jpg",
+          0
+        ],
+        [
+          "REF/acervo_b.jpg",
+          1
+        ],
+        [
+          "REF/acervo_b2.jpg",
+          1
+        ]
+      ]
+    ],
+    "groups_same_photo": [
+      [
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        0,
+        0
+      ]
+    ],
+    "same_photo_suspect_count": 0,
+    "confirm_stats": {
+      "groups_in": 2,
+      "groups_out": 2,
+      "groups_unchanged": 2,
+      "groups_split": 0,
+      "groups_dropped": 0,
+      "images_in": 7,
+      "images_out": 7,
+      "images_dropped": 0,
+      "images_degenerate": 0,
+      "pairs_checked": 6,
+      "pairs_rejected_dhash": 0,
+      "pairs_rejected_degenerate": 0,
+      "pairs_without_dhash": 0
+    },
+    "same_photo_stats": {
+      "groups_checked": 2,
+      "pairs_hash_rule": 6,
+      "pairs_without_dhash": 0,
+      "pairs_confirmed": 6,
+      "rejected": {},
+      "unions_refused_clique": 0,
+      "classes": 2,
+      "images_in_classes": 7,
+      "classes_suspect": 0
+    },
+    "window_title": "Grupos de Imagens Similares",
+    "labels": {
+      "review": "Verificados 0 / 2",
+      "selection": "Selecionadas: 0 imagem(ns), 0 bytes",
+      "page_info": "Pendentes: página 1 de 1   |   2 pendentes, 0 verificados, 2 no total   |   2º hash descartou 0 img em 0 grupo(s)   |   Mesma foto: 2 classe(s), 7 img"
+    },
+    "group_titles": [
+      "Grupo 1",
+      "Grupo 2"
+    ],
+    "buttons": [
+      "Selecionar Todas Idênticas",
+      "Selecionar Todas Semelhantes",
+      "Selecionar Todas Mesma Foto",
+      "Mover Todas Selecionadas",
+      "Excluir Todas Selecionadas",
+      "Grupos verificados (0)",
+      "← Anterior (F1)",
+      "Próximo (F2) →",
+      "Selecionar Idênticas",
+      "Selecionar Semelhantes",
+      "Selecionar Mesma foto",
+      "Marcar verificado ✓",
+      "Mover Selecionadas",
+      "Excluir Selecionadas",
+      "Selecionar Idênticas",
+      "Selecionar Mesma foto",
+      "Marcar verificado ✓",
+      "Mover Selecionadas",
+      "Excluir Selecionadas"
+    ],
+    "rows": {
+      "0:0": [
+        "[ALVO] (raiz)",
+        "Status: Idêntica   |   Resolução: 128 x 128 (0,0 MP)"
+      ],
+      "0:1": [
+        "[ALVO] (raiz)",
+        "Status: Mesma foto   |   Resolução: 128 x 128 (0,0 MP)"
+      ],
+      "0:2": [
+        "[REF] (raiz)",
+        "Status: Idêntica   |   Resolução: 128 x 128 (0,0 MP)"
+      ],
+      "1:0": [
+        "[ALVO] (raiz)",
+        "Status: Idêntica   |   Resolução: 128 x 128 (0,0 MP)"
+      ],
+      "1:1": [
+        "[ALVO] (raiz)",
+        "Status: Idêntica   |   Resolução: 128 x 128 (0,0 MP)"
+      ],
+      "1:2": [
+        "[REF] (raiz)",
+        "Status: Idêntica   |   Resolução: 128 x 128 (0,0 MP)"
+      ],
+      "1:3": [
+        "[REF] (raiz)",
+        "Status: Idêntica   |   Resolução: 128 x 128 (0,0 MP)"
+      ]
+    },
+    "statuses": [
+      [
+        "Idêntica",
+        "Mesma foto",
+        "Idêntica"
+      ],
+      [
+        "Idêntica",
+        "Idêntica",
+        "Idêntica",
+        "Idêntica"
+      ]
+    ]
+  },
+  "referencia_sem_duplicata": {
+    "dialogs": [
+      [
+        "showinfo",
+        "Escaneamento Concluído",
+        "✓ 3 de 3 imagens processadas com sucesso!\nSendo 1 da pasta alvo e 2 da referência (protegida).\n\n⚠️ Ao clicar em OK, o carregamento pode demorar alguns minutos.\nPor favor, aguarde."
+      ],
+      [
+        "showinfo",
+        "Resultado",
+        "Nenhuma imagem da pasta alvo é duplicata do acervo de referência nem de outra imagem da pasta alvo."
+      ]
+    ],
+    "progress_titles": [
+      "Escaneando Imagens",
+      "Agrupando Imagens"
+    ],
+    "scan_in_progress": false,
+    "has_groups_window": false
+  },
+  "referencia_sem_grupos": {
+    "dialogs": [
+      [
+        "showinfo",
+        "Escaneamento Concluído",
+        "✓ 2 de 2 imagens processadas com sucesso!\nSendo 1 da pasta alvo e 1 da referência (protegida).\n\n⚠️ Ao clicar em OK, o carregamento pode demorar alguns minutos.\nPor favor, aguarde."
+      ],
+      [
+        "showinfo",
+        "Resultado",
+        "Nenhuma imagem similar encontrada."
+      ]
+    ],
+    "progress_titles": [
+      "Escaneando Imagens",
+      "Agrupando Imagens"
+    ],
+    "scan_in_progress": false,
+    "has_groups_window": false
+  },
+  "confirmacao_descarta_tudo": {
+    "dialogs": [
+      [
+        "showinfo",
+        "Escaneamento Concluído",
+        "✓ 2 de 2 imagens processadas com sucesso!\n\n⚠️ Ao clicar em OK, o carregamento pode demorar alguns minutos.\nPor favor, aguarde."
+      ],
+      [
+        "showinfo",
+        "Resultado",
+        "Nenhuma imagem similar confirmada.\n\nA confirmação por segundo hash descartou 1 grupo(s) candidato(s) como coincidência. Desmarque 'Confirmar semelhantes com segundo hash' para vê-los."
+      ]
+    ],
+    "progress_titles": [
+      "Escaneando Imagens",
+      "Agrupando Imagens",
+      "Verificando Imagens Idênticas",
+      "Confirmando Semelhantes"
+    ],
+    "scan_in_progress": false,
+    "has_groups_window": false
+  },
+  "confirmacao_fixture": {
+    "dialogs": [
+      [
+        "showinfo",
+        "Escaneamento Concluído",
+        "✓ 9 de 9 imagens processadas com sucesso!\n\n⚠️ Ao clicar em OK, o carregamento pode demorar alguns minutos.\nPor favor, aguarde."
+      ]
+    ],
+    "progress_titles": [
+      "Escaneando Imagens",
+      "Agrupando Imagens",
+      "Verificando Imagens Idênticas",
+      "Confirmando Semelhantes",
+      "Identificando 'Mesma foto'"
+    ],
+    "scan_in_progress": false,
+    "has_groups_window": true,
+    "groups": [
+      [
+        [
+          "ALVO/alpha_text.png",
+          0
+        ],
+        [
+          "ALVO/alpha_text_copy.png",
+          0
+        ]
+      ],
+      [
+        [
+          "ALVO/true_a.jpg",
+          0
+        ],
+        [
+          "ALVO/true_a_q30.jpg",
+          1
+        ]
+      ]
+    ],
+    "groups_same_photo": [
+      [
+        null,
+        null
+      ],
+      [
+        0,
+        0
+      ]
+    ],
+    "same_photo_suspect_count": 0,
+    "confirm_stats": {
+      "groups_in": 4,
+      "groups_out": 2,
+      "groups_unchanged": 2,
+      "groups_split": 0,
+      "groups_dropped": 2,
+      "images_in": 9,
+      "images_out": 4,
+      "images_dropped": 5,
+      "images_degenerate": 3,
+      "pairs_checked": 5,
+      "pairs_rejected_dhash": 1,
+      "pairs_rejected_degenerate": 3,
+      "pairs_without_dhash": 0
+    },
+    "same_photo_stats": {
+      "groups_checked": 1,
+      "pairs_hash_rule": 1,
+      "pairs_without_dhash": 0,
+      "pairs_confirmed": 1,
+      "rejected": {},
+      "unions_refused_clique": 0,
+      "classes": 1,
+      "images_in_classes": 2,
+      "classes_suspect": 0
+    },
+    "window_title": "Grupos de Imagens Similares",
+    "labels": {
+      "review": "Verificados 0 / 2",
+      "selection": "Selecionadas: 0 imagem(ns), 0 bytes",
+      "page_info": "Pendentes: página 1 de 1   |   2 pendentes, 0 verificados, 2 no total   |   2º hash descartou 5 img em 2 grupo(s)   |   Mesma foto: 1 classe(s), 2 img"
+    },
+    "group_titles": [
+      "Grupo 1",
+      "Grupo 2"
+    ],
+    "buttons": [
+      "Selecionar Todas Idênticas",
+      "Selecionar Todas Semelhantes",
+      "Selecionar Todas Mesma Foto",
+      "Mover Todas Selecionadas",
+      "Excluir Todas Selecionadas",
+      "Grupos verificados (0)",
+      "← Anterior (F1)",
+      "Próximo (F2) →",
+      "Selecionar Idênticas",
+      "Marcar verificado ✓",
+      "Mover Selecionadas",
+      "Excluir Selecionadas",
+      "Selecionar Semelhantes",
+      "Selecionar Mesma foto",
+      "Marcar verificado ✓",
+      "Mover Selecionadas",
+      "Excluir Selecionadas"
+    ],
+    "rows": {
+      "0:0": [
+        "[ALVO] (raiz)",
+        "Status: Idêntica   |   Resolução: 128 x 128 (0,0 MP)"
+      ],
+      "0:1": [
+        "[ALVO] (raiz)",
+        "Status: Idêntica   |   Resolução: 128 x 128 (0,0 MP)"
+      ],
+      "1:0": [
+        "[ALVO] (raiz)",
+        "Status: Mesma foto   |   Resolução: 128 x 128 (0,0 MP)"
+      ],
+      "1:1": [
+        "[ALVO] (raiz)",
+        "Status: Mesma foto   |   Resolução: 128 x 128 (0,0 MP)"
+      ]
+    },
+    "statuses": [
+      [
+        "Idêntica",
+        "Idêntica"
+      ],
+      [
+        "Mesma foto",
+        "Mesma foto"
+      ]
+    ]
+  },
+  "mesma_foto": {
+    "dialogs": [
+      [
+        "showinfo",
+        "Escaneamento Concluído",
+        "✓ 11 de 11 imagens processadas com sucesso!\n\n⚠️ Ao clicar em OK, o carregamento pode demorar alguns minutos.\nPor favor, aguarde."
+      ]
+    ],
+    "progress_titles": [
+      "Escaneando Imagens",
+      "Agrupando Imagens",
+      "Verificando Imagens Idênticas",
+      "Confirmando Semelhantes",
+      "Identificando 'Mesma foto'"
+    ],
+    "scan_in_progress": false,
+    "has_groups_window": true,
+    "groups": [
+      [
+        [
+          "ALVO/p.jpg",
+          0
+        ],
+        [
+          "ALVO/p_crop.jpg",
+          1
+        ],
+        [
+          "ALVO/p_exif_burst.jpg",
+          2
+        ],
+        [
+          "ALVO/p_exif_edit.jpg",
+          3
+        ],
+        [
+          "ALVO/p_half.jpg",
+          4
+        ],
+        [
+          "ALVO/p_q30.jpg",
+          5
+        ],
+        [
+          "ALVO/p_tiny.jpg",
+          6
+        ]
+      ]
+    ],
+    "groups_same_photo": [
+      [
+        0,
+        null,
+        null,
+        0,
+        0,
+        0,
+        null
+      ]
+    ],
+    "same_photo_suspect_count": 0,
+    "confirm_stats": {
+      "groups_in": 1,
+      "groups_out": 1,
+      "groups_unchanged": 1,
+      "groups_split": 0,
+      "groups_dropped": 0,
+      "images_in": 7,
+      "images_out": 7,
+      "images_dropped": 0,
+      "images_degenerate": 0,
+      "pairs_checked": 21,
+      "pairs_rejected_dhash": 0,
+      "pairs_rejected_degenerate": 0,
+      "pairs_without_dhash": 0
+    },
+    "same_photo_stats": {
+      "groups_checked": 1,
+      "pairs_hash_rule": 15,
+      "pairs_without_dhash": 0,
+      "pairs_confirmed": 9,
+      "rejected": {
+        "exif": 1,
+        "dimensao": 5
+      },
+      "unions_refused_clique": 1,
+      "classes": 1,
+      "images_in_classes": 4,
+      "classes_suspect": 0
+    },
+    "window_title": "Grupos de Imagens Similares",
+    "labels": {
+      "review": "Verificados 0 / 1",
+      "selection": "Selecionadas: 0 imagem(ns), 0 bytes",
+      "page_info": "Pendentes: página 1 de 1   |   1 pendentes, 0 verificados, 1 no total   |   2º hash descartou 0 img em 0 grupo(s)   |   Mesma foto: 1 classe(s), 4 img"
+    },
+    "group_titles": [
+      "Grupo 1"
+    ],
+    "buttons": [
+      "Selecionar Todas Idênticas",
+      "Selecionar Todas Semelhantes",
+      "Selecionar Todas Mesma Foto",
+      "Mover Todas Selecionadas",
+      "Excluir Todas Selecionadas",
+      "Grupos verificados (0)",
+      "← Anterior (F1)",
+      "Próximo (F2) →",
+      "Selecionar Semelhantes",
+      "Selecionar Mesma foto",
+      "Marcar verificado ✓",
+      "Mover Selecionadas",
+      "Excluir Selecionadas"
+    ],
+    "rows": {
+      "0:0": [
+        "[ALVO] (raiz)",
+        "Status: Mesma foto   |   Resolução: 320 x 240 (0,1 MP)"
+      ],
+      "0:1": [
+        "[ALVO] (raiz)",
+        "Status: Semelhante   |   Resolução: 288 x 216 (0,1 MP)"
+      ],
+      "0:2": [
+        "[ALVO] (raiz)",
+        "Status: Semelhante   |   Resolução: 320 x 240 (0,1 MP)"
+      ],
+      "0:3": [
+        "[ALVO] (raiz)",
+        "Status: Mesma foto   |   Resolução: 320 x 240 (0,1 MP)"
+      ],
+      "0:4": [
+        "[ALVO] (raiz)",
+        "Status: Mesma foto   |   Resolução: 160 x 120 (0,0 MP)"
+      ],
+      "0:5": [
+        "[ALVO] (raiz)",
+        "Status: Mesma foto   |   Resolução: 320 x 240 (0,1 MP)"
+      ],
+      "0:6": [
+        "[ALVO] (raiz)",
+        "Status: Semelhante   |   Resolução: 48 x 36 (0,0 MP)"
+      ]
+    },
+    "statuses": [
+      [
+        "Mesma foto",
+        "Semelhante",
+        "Semelhante",
+        "Mesma foto",
+        "Mesma foto",
+        "Mesma foto",
+        "Semelhante"
+      ]
+    ]
+  },
+  "cancelar_listagem": {
+    "dialogs": [
+      [
+        "showinfo",
+        "Escaneamento Cancelado",
+        "Escaneamento cancelado durante a listagem de arquivos."
+      ]
+    ],
+    "progress_titles": [
+      "Escaneando Imagens"
+    ],
+    "scan_in_progress": false,
+    "has_groups_window": false
+  },
+  "cancelar_hash": {
+    "dialogs": [
+      [
+        "showinfo",
+        "Escaneamento Cancelado",
+        "Escaneamento cancelado. 0 de 7 arquivos foram processados."
+      ]
+    ],
+    "progress_titles": [
+      "Escaneando Imagens"
+    ],
+    "scan_in_progress": false,
+    "has_groups_window": false
+  },
+  "cancelar_agrupamento": {
+    "dialogs": [
+      [
+        "showinfo",
+        "Escaneamento Concluído",
+        "✓ 7 de 7 imagens processadas com sucesso!\n\n⚠️ Ao clicar em OK, o carregamento pode demorar alguns minutos.\nPor favor, aguarde."
+      ],
+      [
+        "showinfo",
+        "Cancelado",
+        "Agrupamento cancelado."
+      ]
+    ],
+    "progress_titles": [
+      "Escaneando Imagens",
+      "Agrupando Imagens"
+    ],
+    "scan_in_progress": false,
+    "has_groups_window": false
+  },
+  "cancelar_md5": {
+    "dialogs": [
+      [
+        "showinfo",
+        "Escaneamento Concluído",
+        "✓ 7 de 7 imagens processadas com sucesso!\n\n⚠️ Ao clicar em OK, o carregamento pode demorar alguns minutos.\nPor favor, aguarde."
+      ],
+      [
+        "showinfo",
+        "Cancelado",
+        "Verificação de imagens idênticas cancelada."
+      ]
+    ],
+    "progress_titles": [
+      "Escaneando Imagens",
+      "Agrupando Imagens",
+      "Verificando Imagens Idênticas"
+    ],
+    "scan_in_progress": false,
+    "has_groups_window": false
+  },
+  "cancelar_dhash": {
+    "dialogs": [
+      [
+        "showinfo",
+        "Escaneamento Concluído",
+        "✓ 7 de 7 imagens processadas com sucesso!\n\n⚠️ Ao clicar em OK, o carregamento pode demorar alguns minutos.\nPor favor, aguarde."
+      ],
+      [
+        "showinfo",
+        "Cancelado",
+        "Confirmação de imagens semelhantes cancelada."
+      ]
+    ],
+    "progress_titles": [
+      "Escaneando Imagens",
+      "Agrupando Imagens",
+      "Verificando Imagens Idênticas",
+      "Confirmando Semelhantes"
+    ],
+    "scan_in_progress": false,
+    "has_groups_window": false
+  },
+  "cancelar_mesma_foto": {
+    "dialogs": [
+      [
+        "showinfo",
+        "Escaneamento Concluído",
+        "✓ 7 de 7 imagens processadas com sucesso!\n\n⚠️ Ao clicar em OK, o carregamento pode demorar alguns minutos.\nPor favor, aguarde."
+      ],
+      [
+        "showinfo",
+        "Cancelado",
+        "Identificação de 'Mesma foto' cancelada."
+      ]
+    ],
+    "progress_titles": [
+      "Escaneando Imagens",
+      "Agrupando Imagens",
+      "Verificando Imagens Idênticas",
+      "Confirmando Semelhantes",
+      "Identificando 'Mesma foto'"
+    ],
+    "scan_in_progress": false,
+    "has_groups_window": false
+  }
+}
