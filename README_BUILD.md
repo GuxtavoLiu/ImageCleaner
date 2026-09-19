@@ -265,6 +265,46 @@ automática mantém a cópia do acervo em vez da mais antiga. Grupos só com
 imagens da referência não são exibidos; a checkbox "Mostrar duplicatas
 internas da pasta alvo" controla os grupos sem par no acervo.
 
+### Vídeos e outros arquivos (caixas "Procurar duplicatas em")
+Na tela inicial: **Fotos** (ligada por padrão), **Vídeos** e **Outros arquivos**.
+- **Fotos** segue como sempre (Idêntica, Mesma foto, Semelhante), com duas diferenças
+  deliberadas: as pastas de sistema `$RECYCLE.BIN` e `System Volume Information` deixaram de
+  ser percorridas (antes, varrer a raiz de um disco listava a Lixeira como duplicata); e os
+  formatos que o Pillow não abre (`PHOTO_BYTES_EXTENSIONS`: HEIC/HEIF do iPhone, RAW de
+  câmera) entram com esta caixa, só como cópia exata (para tirá-los, esvazie a lista: eles
+  passam a contar como "Outros").
+- **Vídeos** (`VIDEO_EXTENSIONS`) e **Outros** (qualquer outra extensão) só têm um status:
+  cópia exata, por comparação de **bytes**. O disco é lido o mínimo possível: 1) arquivos de
+  tamanho único nem são abertos; 2) os primeiros 64 KB eliminam, com uma leitura só, quase
+  todos os que apenas coincidem no tamanho (importante para RAW sem compressão, que tem
+  tamanho fixo por câmera); 3) 64 KB do meio e do fim peneiram quem empatou no começo;
+  4) o MD5 do arquivo **inteiro** só é calculado para quem ainda empata. A amostragem só elimina, nunca confirma: uma cópia com setores zerados
+  no meio (HD recuperado) não vira "idêntica". Arquivo ilegível, em uso ou alterado durante
+  a leitura fica **fora** da comparação (um aviso no fim; caminhos no log).
+- Nunca entram: arquivos vazios, de sistema, só na nuvem (OneDrive: ler baixaria o acervo),
+  atalhos simbólicos, `Thumbs.db`/`desktop.ini`/`.DS_Store`, temporários do Office (`~$`).
+  Hardlinks (o mesmo arquivo no disco com dois nomes) não contam como duplicata. As pastas
+  `$RECYCLE.BIN` e `System Volume Information` não são percorridas.
+- **Cuidado com "Outros"** em pastas de programas ou de projetos: elas têm muitos arquivos
+  iguais de propósito.
+- Na tela de grupos esses grupos vêm depois dos de fotos, com o título "Grupo N (vídeos)",
+  "(fotos)" ou "(arquivos)". A miniatura é a do Explorer (um quadro do vídeo, a 1ª página do
+  PDF, ou o ícone do tipo), carregada em segundo plano: uma placa com a extensão aparece na
+  hora. A linha mostra o tipo e, para vídeos MP4/MOV, dimensões e duração. A pré-visualização
+  tem "Abrir no programa padrão". Um arquivo que **mudou depois da varredura** não é movido
+  nem excluído (a prova valia para o conteúdo antigo).
+- Cache: tabela `files_v1` no mesmo `hash_cache.sqlite` (chave: caminho + tamanho + data);
+  uma segunda varredura não relê nada. Como há programas que alteram o conteúdo preservando
+  tamanho e data (contêiner VeraCrypt, editor de tags com "manter a data"), toda prova que
+  veio do cache é **relida na hora de mover ou excluir** (janela "Reconferindo Cópias"): o
+  arquivo só sai se o MD5 dele ainda bate e se sobra ao menos uma cópia confirmada; o que
+  não se confirmar fica onde está e o cache é consertado. Provas lidas na própria varredura
+  não são relidas. Progresso em MB, com Cancelar respondendo mesmo no
+  meio de um arquivo de vários GB. Ajustes no topo do `main.py`: `BYTE_QUICK_CHUNK`,
+  `BYTE_LARGE_FILE`, `BYTE_LARGE_WORKERS`.
+- Módulos ao lado do `main.py` (o PyInstaller recolhe sozinho): `shellthumb.py` (miniatura
+  do Explorer via ctypes) e `mp4probe.py` (cabeçalho de MP4/MOV em Python puro).
+
 ### Tela de grupos: como revisar rápido
 - **Fila de revisão**: "Selecionar Idênticas/Semelhantes" ou "Marcar verificado ✓" de
   um grupo tira o grupo dos pendentes; o próximo sobe para o mesmo lugar. Os
@@ -317,15 +357,20 @@ internas da pasta alvo" controla os grupos sem par no acervo.
 ImageCleaner.exe --selftest PASTA
 ImageCleaner.exe --selftest PASTA --ref PASTA_DE_REFERENCIA
 ImageCleaner.exe --selftest PASTA --no-confirm      # sem a confirmação por dhash
+ImageCleaner.exe --selftest PASTA --videos --others # também compara vídeos e outros por bytes
 ```
 Roda o pipeline inteiro (listar, hash, agrupar, MD5, confirmação) sem alterar
-nada nem usar o cache, e imprime um resumo (também gravado no log).
+nada nem usar o cache, e imprime um resumo (também gravado no log). Quando há
+arquivos comparados por bytes, o resumo ganha o trecho `| BYTES: ...`.
 
 ### Testes automatizados
 `python -m pytest tests -q` (o `testar_antes_build.bat` roda isso se o pytest
 estiver instalado). Inclui snapshots dourados do modo de uma pasta com e sem
 a confirmação; regenerá-los só quando uma mudança de comportamento for
 intencional (ver docstring de `tests/test_regression_single_mode.py`).
+`tests/test_caracterizacao_fluxo.py` fotografa o fluxo completo da interface
+(diálogos, janelas de progresso, grupos, barra de status) em 17 cenários, e
+exige que vídeos e outros arquivos na pasta não mudem nada com só Fotos marcado.
 
 ### Para incluir um README junto:
 ```bash

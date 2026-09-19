@@ -10,15 +10,20 @@ import shutil
 import sqlite3
 import stat
 import sys
+import threading
 import time
 import traceback
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from PIL import Image, ImageTk, ImageFile
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
+from PIL import Image, ImageDraw, ImageFont, ImageTk, ImageFile
 import imagehash
 import numpy as np
 from datetime import datetime
+
+# Módulos-folha do próprio projeto (não importam nada daqui)
+import mp4probe
+import shellthumb
 
 # Exclusão só pela Lixeira do Windows. Sem o send2trash o app RECUSA excluir
 # (nunca cai para exclusão definitiva).
@@ -58,6 +63,99 @@ HASH_CACHE_VERSION = 1
 
 # Extensões de imagem consideradas no escaneamento (comparação case-insensitive).
 VALID_EXTENSIONS = [".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".tif", ".tiff"]
+
+# ---------------------------------------------------------------------------
+# Comparação por BYTES (vídeos, outros arquivos e fotos que o Pillow não abre).
+# Só existe um status aqui: "Idêntica", e só com MD5 do arquivo INTEIRO igual.
+# A amostragem (chave rápida) serve para eliminar, nunca para confirmar: uma
+# cópia com setores zerados no meio (HD recuperado) passaria numa amostragem.
+# ---------------------------------------------------------------------------
+
+# Chave rápida: BYTE_QUICK_CHUNK bytes do início, do meio e do fim. Arquivos de
+# até 3 blocos são lidos inteiros de uma vez (e isso já é o MD5 de verdade).
+BYTE_QUICK_CHUNK = 64 * 1024
+
+# Arquivos a partir deste tamanho são lidos com poucos workers: várias leituras
+# sequenciais longas ao mesmo tempo viram "tempestade de seeks" num HD.
+BYTE_LARGE_FILE = 32 * 1024 * 1024
+BYTE_LARGE_WORKERS = 2
+
+# Fotos que o Pillow não abre (HEIC do iPhone, RAW de câmera): entram com a
+# caixa "Fotos", mas só por bytes (nunca "Semelhante" nem "Mesma foto").
+PHOTO_BYTES_EXTENSIONS = [".heic", ".heif", ".cr2", ".cr3", ".nef", ".arw", ".dng",
+                          ".orf", ".rw2", ".raf"]
+VIDEO_EXTENSIONS = [".mp4", ".mov", ".m4v", ".3gp", ".3g2", ".avi", ".mkv", ".wmv", ".mpg",
+                    ".mpeg", ".mts", ".m2ts", ".webm", ".flv", ".vob", ".asf", ".divx", ".ogv"]
+# Qualquer outra extensão é "outro". Nunca entram: arquivos de sistema/miniatura
+# e temporários do Office; pastas de sistema do Windows não são percorridas.
+IGNORED_FILE_NAMES = {"thumbs.db", "ehthumbs.db", "desktop.ini", ".ds_store"}
+IGNORED_DIR_NAMES = {"$recycle.bin", "system volume information"}
+
+KIND_PHOTO = "photo"              # pipeline de aparência (phash), como sempre
+KIND_PHOTO_BYTES = "photo_bytes"  # foto comparada só por bytes
+KIND_VIDEO = "video"
+KIND_OTHER = "other"
+
+# Atributos do Windows que tiram um arquivo da comparação por bytes: de sistema,
+# ou só na nuvem (OneDrive): ler dispararia o download do acervo inteiro.
+_FILE_ATTRIBUTE_SYSTEM = 0x4
+_FILE_ATTRIBUTE_OFFLINE = 0x1000
+_FILE_ATTRIBUTE_RECALL_ON_OPEN = 0x40000
+_FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS = 0x400000
+_BYTE_SKIP_ATTRIBUTES = (_FILE_ATTRIBUTE_SYSTEM | _FILE_ATTRIBUTE_OFFLINE
+                         | _FILE_ATTRIBUTE_RECALL_ON_OPEN | _FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)
+
+
+def classify_file(name):
+    """Tipo de um arquivo pela extensão: KIND_PHOTO, KIND_PHOTO_BYTES,
+       KIND_VIDEO ou KIND_OTHER."""
+    ext = os.path.splitext(name)[1].lower()
+    if ext in _PHOTO_EXT_SET:
+        return KIND_PHOTO
+    if ext in _PHOTO_BYTES_EXT_SET:
+        return KIND_PHOTO_BYTES
+    if ext in _VIDEO_EXT_SET:
+        return KIND_VIDEO
+    return KIND_OTHER
+
+
+_PHOTO_EXT_SET = frozenset(VALID_EXTENSIONS)
+_PHOTO_BYTES_EXT_SET = frozenset(PHOTO_BYTES_EXTENSIONS)
+_VIDEO_EXT_SET = frozenset(VIDEO_EXTENSIONS)
+
+
+def byte_file_ok(entry, st):
+    """Um arquivo só entra na comparação por bytes se dá para lê-lo com
+       segurança: tem stat, não é vazio, não é atalho simbólico (apagar o alvo
+       e manter o link seria perda de dados), não é de sistema nem está só na
+       nuvem, e não é miniatura/temporário conhecido."""
+    name = entry.name.lower()
+    if name in IGNORED_FILE_NAMES or name.startswith("~$"):
+        return False
+    if st is None or not st.st_size:
+        return False
+    try:
+        if entry.is_symlink():
+            return False
+    except OSError:
+        return False
+    return not (getattr(st, "st_file_attributes", 0) & _BYTE_SKIP_ATTRIBUTES)
+
+
+def make_scan_accept(photos=True, videos=False, others=False):
+    """
+    Predicado accept(entry, st) para list_image_files listar, numa única
+    caminhada pelo disco, tudo o que as caixas da tela inicial pedem. Para as
+    fotos do pipeline de aparência a regra é a de sempre (só a extensão; stat
+    com erro ainda lista). Para o resto vale byte_file_ok.
+    """
+    def accept(entry, st):
+        kind = classify_file(entry.name)
+        if kind == KIND_PHOTO:
+            return photos
+        wanted = photos if kind == KIND_PHOTO_BYTES else videos if kind == KIND_VIDEO else others
+        return wanted and byte_file_ok(entry, st)
+    return accept
 
 # Quantidade de miniaturas exibidas por vez dentro de um grupo. Grupos maiores
 # ganham botões "anteriores/seguintes" dentro do próprio grupo (para grupos com
@@ -145,6 +243,96 @@ def format_resolution(dims):
     mp = w * h / 1e6
     mp_str = (f"{mp:.1f}" if mp < 10 else f"{mp:.0f}").replace(".", ",")
     return f"{w} x {h} ({mp_str} MP)"
+
+
+# Quando o resultado tem vídeos ou outros arquivos, os textos da tela falam em
+# "arquivos" (com a concordância certa). Só com fotos, NADA é trocado: os
+# textos de sempre ficam byte a byte iguais. Ordem importa: frases primeiro.
+FILE_WORDING = [
+    ("imagens idênticas foram selecionadas (mantendo a mais antiga",
+     "arquivos idênticos foram selecionados (mantendo o mais antigo"),
+    ("imagens idênticas foram selecionadas", "arquivos idênticos foram selecionados"),
+    ("Imagens da referência nunca são selecionadas", "Arquivos da referência nunca são selecionados"),
+    ("imagem(ns) da referência foram ignoradas (protegidas)",
+     "arquivo(s) da referência foram ignorados (protegidos)"),
+    ("Nenhuma imagem selecionada", "Nenhum arquivo selecionado"),
+    ("imagens selecionadas", "arquivos selecionados"),
+    ("imagem(ns) selecionada(s)", "arquivo(s) selecionado(s)"),
+    ("imagens enviadas", "arquivos enviados"),
+    ("imagem(ns) enviada(s)", "arquivo(s) enviado(s)"),
+    ("imagens movidas", "arquivos movidos"),
+    ("imagem(ns) movida(s)", "arquivo(s) movido(s)"),
+    ("imagem(ns) devolvida(s)", "arquivo(s) devolvido(s)"),
+    ("(e selecionada(s) de novo)", "(e selecionado(s) de novo)"),
+    ("imagem(ns) ignorada(s)", "arquivo(s) ignorado(s)"),
+    ("ignorada(s):", "ignorado(s):"),
+    ("restaurá-las", "restaurá-los"),
+    ("não puderam ser devolvidas", "não puderam ser devolvidos"),
+    ("não selecionada", "não selecionado"),
+    ("SELECIONADA", "SELECIONADO"),
+    ("(continuam selecionadas)", "(continuam selecionados)"),
+    ("selecionada(s) no total", "selecionado(s) no total"),
+    ("Selecionadas neste grupo", "Selecionados neste grupo"),
+    ("Selecionadas:", "Selecionados:"),
+    ("Grupos de Imagens Similares", "Grupos de Arquivos Duplicados"),
+    ("Abrir imagem", "Abrir arquivo"),
+    ("imagem(ns)", "arquivo(s)"),
+    ("imagens", "arquivos"),
+    ("imagem", "arquivo"),
+]
+
+
+def is_file_kind(kind):
+    """True para o que a tela chama de "arquivo" (vídeo, outro). Foto HEIC/RAW
+       é comparada por bytes, mas continua sendo foto: o vocabulário não muda."""
+    return kind in (KIND_VIDEO, KIND_OTHER)
+
+
+def file_wording(text):
+    """Troca o vocabulário de 'imagens' pelo de 'arquivos' (ver FILE_WORDING)."""
+    for old, new in FILE_WORDING:
+        text = text.replace(old, new)
+    return text
+
+
+def media_summary(kind, filepath, info):
+    """Texto curto que ocupa o lugar de 'Resolução' nas linhas que não são
+       foto: 'Vídeo 1280 x 720, 0:33' ou 'Arquivo MP4'."""
+    ext = os.path.splitext(filepath)[1].lstrip(".").upper() or "sem extensão"
+    if kind == KIND_VIDEO:
+        parts = []
+        if info and info.get("width"):
+            parts.append(f"{info['width']} x {info['height']}")
+        if info and info.get("duration"):
+            parts.append(mp4probe.format_duration(info["duration"]))
+        return f"Vídeo {ext}" + (": " + ", ".join(parts) if parts else "")
+    if kind == KIND_PHOTO_BYTES:
+        return f"Foto {ext} (comparada só por conteúdo)"
+    return f"Arquivo {ext}"
+
+
+_PLATE_COLORS = {KIND_VIDEO: "#37474F", KIND_PHOTO_BYTES: "#4E342E", KIND_OTHER: "#607D8B"}
+
+
+def extension_plate(filepath, kind, width, height):
+    """Placa com a extensão em destaque: o que aparece na hora para um arquivo
+       que não é foto, até (e se) a miniatura do Explorer chegar."""
+    img = Image.new("RGB", (max(16, width), max(16, height)), _PLATE_COLORS.get(kind, "#607D8B"))
+    text = (os.path.splitext(filepath)[1].lstrip(".").upper() or "?")[:6]
+    draw = ImageDraw.Draw(img)
+    font = None
+    for name in ("segoeuib.ttf", "arialbd.ttf"):
+        try:
+            font = ImageFont.truetype(name, max(12, min(width, height) // 4))
+            break
+        except OSError:
+            continue
+    if font is None:
+        font = ImageFont.load_default()
+    box = draw.textbbox((0, 0), text, font=font)
+    draw.text(((img.width - (box[2] - box[0])) // 2 - box[0],
+               (img.height - (box[3] - box[1])) // 2 - box[1]), text, fill="white", font=font)
+    return img
 
 
 BADGE_STYLES = {
@@ -354,6 +542,9 @@ DEFAULT_SETTINGS = {
     "confirm_similar": 1,
     "same_photo": 1,
     "show_target_only": 1,
+    "scan_photos": 1,            # tipos procurados (caixas da tela inicial)
+    "scan_videos": 0,
+    "scan_others": 0,
 }
 RECENT_LIMIT = 5
 
@@ -809,6 +1000,130 @@ class SamePhotoCache:
             self.conn = None
 
 
+class FileHashCache:
+    """
+    Cache da comparação por bytes, em tabela própria (mesmo arquivo SQLite do
+    HashCache, tabela files_v1): chave rápida, MD5 do arquivo inteiro e, para
+    vídeos, hash dos fluxos e dados do cabeçalho. Mesmo desenho do
+    SamePhotoCache: consulta só por lote de caminhos candidatos (a grande
+    maioria dos arquivos tem tamanho único e nunca chega aqui) e gravação em
+    lote, sempre na thread principal. Registro com tamanho ou data diferentes
+    do arquivo atual é ignorado e, na gravação seguinte, zerado por inteiro.
+    """
+    TABLE = "files_v1"
+    FIELDS = ("head", "quick", "md5", "stream", "probe")
+
+    def __init__(self, path=None):
+        self.conn = None
+        self.pending = []
+        self.path = path or get_hash_cache_path()
+        try:
+            self.conn = sqlite3.connect(self.path, timeout=5)
+            try:
+                self.conn.execute("PRAGMA journal_mode=WAL")
+                self.conn.execute("PRAGMA busy_timeout=5000")
+            except Exception as e:
+                log.warning("Cache de arquivos: PRAGMA falhou: %s", e)
+            self.conn.execute(
+                f"CREATE TABLE IF NOT EXISTS {self.TABLE} ("
+                "path TEXT PRIMARY KEY, size INTEGER, mtime_ns INTEGER, "
+                + ", ".join(f"{name} TEXT" for name in self.FIELDS) + ")"
+            )
+            # Banco criado por uma versão com menos campos: acrescenta os que
+            # faltam (ADD COLUMN não reescreve as linhas já gravadas)
+            have = {r[1] for r in self.conn.execute(f"PRAGMA table_info({self.TABLE})")}
+            for name in self.FIELDS:
+                if name not in have:
+                    self.conn.execute(f"ALTER TABLE {self.TABLE} ADD COLUMN {name} TEXT")
+            self.conn.commit()
+        except Exception as e:
+            log.warning("Cache de arquivos desativado: %s", e)
+            self.conn = None
+
+    @property
+    def active(self):
+        return self.conn is not None
+
+    def lookup_many(self, items):
+        """items: lista de (filepath, size, mtime_ns). Retorna {filepath: dict
+           com as chaves de FIELDS} só para registros válidos (size/mtime iguais)."""
+        out = {}
+        if self.conn is None or not items:
+            return out
+        by_key = {cache_key(fp): (fp, size, mt) for fp, size, mt in items}
+        keys = list(by_key)
+        cols = ", ".join(self.FIELDS)
+        for start in range(0, len(keys), 400):
+            chunk = keys[start:start + 400]
+            marks = ",".join("?" * len(chunk))
+            try:
+                rows = self.conn.execute(
+                    f"SELECT path, size, mtime_ns, {cols} FROM {self.TABLE} "
+                    f"WHERE path IN ({marks})", chunk).fetchall()
+            except Exception as e:
+                log.warning("Cache de arquivos: consulta falhou: %s", e)
+                return out
+            for row in rows:
+                fp, want_size, want_mt = by_key[row[0]]
+                if row[1] == want_size and row[2] == want_mt:
+                    out[fp] = dict(zip(self.FIELDS, row[3:]))
+        return out
+
+    def store(self, filepath, size, mtime_ns, **fields):
+        """Agenda a gravação dos campos informados (os não informados são
+           preservados, desde que o registro seja do mesmo tamanho e data)."""
+        if self.conn is None or size is None or mtime_ns is None:
+            return   # sem tamanho E data não há como saber depois se o registro ainda vale
+        unknown = set(fields) - set(self.FIELDS)
+        if unknown:
+            raise ValueError(f"campos desconhecidos: {sorted(unknown)}")
+        self.pending.append((cache_key(filepath), size, mtime_ns)
+                            + tuple(fields.get(name) for name in self.FIELDS))
+        if len(self.pending) >= 500:
+            self.flush()
+
+    def flush(self):
+        if self.conn is None or not self.pending:
+            return
+        rows = self.pending
+        self.pending = []
+        t = self.TABLE
+        same = f"{t}.size = excluded.size AND {t}.mtime_ns = excluded.mtime_ns"
+        keep = ", ".join(
+            f"{name} = CASE WHEN {same} THEN COALESCE(excluded.{name}, {t}.{name}) "
+            f"ELSE excluded.{name} END" for name in self.FIELDS)
+        sql = (f"INSERT INTO {t} (path, size, mtime_ns, {', '.join(self.FIELDS)}) "
+               f"VALUES (?,?,?,{','.join('?' * len(self.FIELDS))}) "
+               f"ON CONFLICT(path) DO UPDATE SET {keep}, "
+               "size = excluded.size, mtime_ns = excluded.mtime_ns")
+        try:
+            self.conn.executemany(sql, rows)
+            self.conn.commit()
+        except Exception as e:
+            log.warning("Cache de arquivos: lote de %d falhou (%s); um a um", len(rows), e)
+            dropped = 0
+            for row in rows:
+                try:
+                    self.conn.execute(sql, row)
+                except Exception:
+                    dropped += 1
+            try:
+                self.conn.commit()
+            except Exception as e2:
+                log.warning("Cache de arquivos: commit falhou: %s", e2)
+            if dropped:
+                log.warning("Cache de arquivos: %d registro(s) descartado(s)", dropped)
+
+    def close(self):
+        self.flush()
+        if self.conn is not None:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+            self.conn = None
+
+
 class ScanCancelled(Exception):
     """Levantada quando o usuário cancela durante o agrupamento."""
 
@@ -1042,7 +1357,8 @@ def categorize_scan_error(filepath, e):
     }
 
 
-def list_image_files(root, recursive, extensions=None, progress_cb=None, cancel_check=None):
+def list_image_files(root, recursive, extensions=None, progress_cb=None, cancel_check=None,
+                     accept=None):
     """
     Lista as imagens de `root` na MESMA ordem que os.walk (top-down: arquivos da
     pasta, depois cada subpasta na ordem do sistema), já capturando tamanho e
@@ -1051,13 +1367,28 @@ def list_image_files(root, recursive, extensions=None, progress_cb=None, cancel_
     Retorna lista de tuplas (filepath, size, mtime_ns). Se o stat falhar,
     size/mtime ficam None (o arquivo ainda será processado normalmente).
     Pastas sem permissão são ignoradas, como no os.walk.
+
+    accept(entry, st_ou_None), se informado, substitui o teste de extensão
+    (ver make_scan_accept): fotos, vídeos e outros saem da MESMA caminhada,
+    na mesma ordem relativa de sempre.
     """
     exts = set(e.lower() for e in (extensions or VALID_EXTENSIONS))
     entries = []
 
-    def add_entry(entry):
+    def wanted(entry):
+        """(entra?, stat já lido ou None)"""
+        if accept is None:
+            return os.path.splitext(entry.name)[1].lower() in exts, None
         try:
             st = entry.stat()
+        except OSError:
+            st = None
+        return accept(entry, st), st
+
+    def add_entry(entry, st=None):
+        try:
+            if st is None:
+                st = entry.stat()
             entries.append((entry.path, st.st_size, st.st_mtime_ns))
         except OSError:
             entries.append((entry.path, None, None))
@@ -1094,11 +1425,14 @@ def list_image_files(root, recursive, extensions=None, progress_cb=None, cancel_
             for entry in children:
                 try:
                     if entry.is_dir():
-                        if not entry.is_symlink() and not is_reparse_point(entry):
+                        if (not entry.is_symlink() and not is_reparse_point(entry)
+                                and entry.name.lower() not in IGNORED_DIR_NAMES):
                             subdirs.append(entry.path)
                         continue
-                    if entry.is_file() and os.path.splitext(entry.name)[1].lower() in exts:
-                        add_entry(entry)
+                    if entry.is_file():
+                        ok, st = wanted(entry)
+                        if ok:
+                            add_entry(entry, st)
                 except OSError:
                     continue
             # Empilha em ordem inversa: o primeiro subdiretório é processado primeiro
@@ -1111,8 +1445,10 @@ def list_image_files(root, recursive, extensions=None, progress_cb=None, cancel_
             with os.scandir(root) as it:
                 for entry in it:
                     try:
-                        if entry.is_file() and os.path.splitext(entry.name)[1].lower() in exts:
-                            add_entry(entry)
+                        if entry.is_file():
+                            ok, st = wanted(entry)
+                            if ok:
+                                add_entry(entry, st)
                     except OSError:
                         continue
     except ScanCancelled:
@@ -1153,6 +1489,50 @@ def _run_parallel_bounded(items, worker, on_result, workers, cancel_check=None):
         raise
     finally:
         # Cancelado (ou erro): descarta o que não começou e não espera o resto
+        executor.shutdown(wait=not cancelled, cancel_futures=True)
+    return cancelled
+
+
+def _run_parallel_ticking(items, worker, on_result, workers, tick=None, cancel_event=None,
+                          interval=0.1):
+    """
+    Variante do _run_parallel_bounded para tarefas LONGAS (ler arquivos de GB,
+    esperar um ffmpeg). O executor original só devolve o controle à thread
+    principal quando uma tarefa termina; com tarefas de minutos a janela
+    congelaria e o botão Cancelar não responderia. Aqui a thread principal
+    acorda a cada `interval` segundos e chama tick() (atualizar o progresso,
+    processar cliques, pedir cancelamento) mesmo sem nenhuma conclusão.
+
+    cancel_event (threading.Event) é a via de cancelamento: quem quiser
+    cancelar liga o evento (normalmente o próprio tick); os workers devem
+    consultá-lo entre blocos para parar logo. on_result(retorno) roda na
+    thread principal. Retorna True se cancelado.
+    """
+    cancelled = False
+    executor = ThreadPoolExecutor(max_workers=workers)
+    in_flight = set()
+    next_pos = 0
+    max_in_flight = workers * 2
+    try:
+        while next_pos < len(items) or in_flight:
+            while next_pos < len(items) and len(in_flight) < max_in_flight:
+                in_flight.add(executor.submit(worker, items[next_pos]))
+                next_pos += 1
+            done, _ = wait(in_flight, timeout=interval, return_when=FIRST_COMPLETED)
+            for future in done:
+                in_flight.discard(future)
+                on_result(future.result())
+            if tick:
+                tick()
+            if cancel_event is not None and cancel_event.is_set():
+                cancelled = True
+                break
+    except BaseException:
+        cancelled = True
+        if cancel_event is not None:
+            cancel_event.set()   # solta os workers que estão no meio de um arquivo
+        raise
+    finally:
         executor.shutdown(wait=not cancelled, cancel_futures=True)
     return cancelled
 
@@ -1479,6 +1859,369 @@ def is_protected_path(filepath, reference_keys, reference_prefix):
     if reference_keys and key in reference_keys:
         return True
     return bool(reference_prefix) and key.startswith(reference_prefix)
+
+
+# ---------------------------------------------------------------------------
+# Comparação por bytes: arquivos idênticos (vídeos, outros, fotos que o Pillow
+# não abre). Funções puras, sem interface. Regra de ouro: um grupo só nasce de
+# MD5 do arquivo INTEIRO igual; qualquer dúvida ou erro degrada para "não
+# agrupa" (o arquivo simplesmente não aparece), nunca para "Idêntica".
+# ---------------------------------------------------------------------------
+
+class FileChangedError(OSError):
+    """O arquivo mudou entre a listagem e a leitura, ou durante a leitura."""
+
+
+class _ByteProgress:
+    """Bytes lidos (somados pelos workers, lidos pelo tick da thread principal)."""
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.done = 0
+        self.current = ""
+
+    def add(self, n):
+        with self._lock:
+            self.done += n
+
+
+def _stat_before_read(filepath, size, mtime_ns=None):
+    """stat logo antes de ler: o arquivo tem de ser o MESMO que foi listado
+       (tamanho igual e, quando informada, data igual com a folga de 2 s do
+       FAT). Sem isso, um arquivo regravado entre a listagem e a leitura iria
+       para o cache com o conteúdo novo sob a data velha."""
+    st = os.stat(filepath)
+    if st.st_size != size:
+        raise FileChangedError(f"tamanho mudou desde a listagem ({size} -> {st.st_size} bytes)")
+    if mtime_ns is not None and abs(st.st_mtime_ns - mtime_ns) > 2_000_000_000:
+        raise FileChangedError("data de modificação mudou desde a listagem")
+    return st
+
+
+def _check_unchanged(filepath, before):
+    after = os.stat(filepath)
+    if (after.st_size, after.st_mtime_ns) != (before.st_size, before.st_mtime_ns):
+        raise FileChangedError("arquivo alterado durante a leitura")
+
+
+def file_quick_key(filepath, size, on_bytes=None, mtime_ns=None, part="head"):
+    """
+    Chave barata para ELIMINAR arquivos de mesmo tamanho que diferem.
+    Retorna (tipo, valor):
+      ("md5", hex)     arquivo de até 3 blocos: lido inteiro, é o MD5 de verdade;
+      ("head", valor)  part="head": só o 1º bloco. É a primeira peneira: o
+                       começo (cabeçalho, EXIF, data de gravação) quase sempre
+                       já separa arquivos diferentes com UMA leitura;
+      ("quick", valor) part="rest": blocos do meio e do fim, para quem empatou
+                       no começo.
+    O valor traz o tamanho do bloco na frente ("65536:<hex>"): chaves gravadas
+    no cache com outro BYTE_QUICK_CHUNK nunca são comparadas com as novas.
+    Levanta FileChangedError se o arquivo não é mais o que foi listado.
+    """
+    before = _stat_before_read(filepath, size, mtime_ns)
+    chunk = BYTE_QUICK_CHUNK
+    h = hashlib.md5()
+    with open(filepath, "rb") as f:
+        if size <= 3 * chunk:
+            data = f.read(size + 1)
+            if len(data) != size:
+                raise FileChangedError("tamanho lido diferente do listado")
+            h.update(data)
+            kind, read = "md5", size
+        else:
+            offsets = (0,) if part == "head" else ((size - chunk) // 2, size - chunk)
+            for offset in offsets:
+                f.seek(offset)
+                data = f.read(chunk)
+                if len(data) != chunk:
+                    raise FileChangedError("arquivo encolheu durante a leitura")
+                h.update(data)
+            kind, read = ("head" if part == "head" else "quick"), chunk * len(offsets)
+    if on_bytes:
+        on_bytes(read)
+    _check_unchanged(filepath, before)
+    return kind, (h.hexdigest() if kind == "md5" else f"{chunk}:{h.hexdigest()}")
+
+
+def file_full_md5(filepath, size, cancel_event=None, on_bytes=None, mtime_ns=None):
+    """
+    MD5 do arquivo inteiro, em blocos, consultando cancel_event entre blocos
+    (levanta ScanCancelled) e informando os bytes lidos a on_bytes. Só devolve
+    o hash se leu exatamente `size` bytes e o arquivo não mudou no caminho.
+    """
+    before = _stat_before_read(filepath, size, mtime_ns)
+    h = hashlib.md5()
+    total = 0
+    with open(filepath, "rb") as f:
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                raise ScanCancelled()
+            data = f.read(MD5_CHUNK_SIZE)
+            if not data:
+                break
+            h.update(data)
+            total += len(data)
+            if on_bytes:
+                on_bytes(len(data))
+    if total != size:
+        raise FileChangedError(f"lidos {total} bytes de {size}")
+    _check_unchanged(filepath, before)
+    return h.hexdigest()
+
+
+def _split_groups(groups, key_by_idx):
+    """Divide cada grupo pela chave de cada índice. Índice sem chave (erro)
+       sai; subgrupo com um só sai. Ordem de primeira aparição preservada."""
+    out = []
+    for group in groups:
+        buckets = {}
+        for i in group:
+            key = key_by_idx.get(i)
+            if key is not None:
+                buckets.setdefault(key, []).append(i)
+        out.extend(b for b in buckets.values() if len(b) > 1)
+    return out
+
+
+def _collapse_hardlinks(groups, entries, stats):
+    """Dois caminhos para o MESMO arquivo no disco (hardlink) não são
+       duplicata: excluir um não libera espaço. Fica só o primeiro."""
+    out = []
+    for group in groups:
+        seen = set()
+        kept = []
+        for i in group:
+            ident = None
+            try:
+                st = os.stat(entries[i][0])
+                if st.st_ino:
+                    ident = (st.st_dev, st.st_ino)
+            except OSError:
+                pass
+            if ident is not None:
+                if ident in seen:
+                    stats["hardlinks"] += 1
+                    log.info("Hardlink ignorado (mesmo arquivo no disco): %s", entries[i][0])
+                    continue
+                seen.add(ident)
+            kept.append(i)
+        if len(kept) > 1:
+            out.append(kept)
+    return out
+
+
+def _new_byte_stats():
+    return {"files": 0, "no_size": 0, "size_candidates": 0, "head_computed": 0,
+            "quick_computed": 0, "full_computed": 0, "bytes_read": 0, "hardlinks": 0,
+            "errors": [], "groups": 0, "identical_files": 0, "md5_from_cache": []}
+
+
+def find_identical_files(entries, cache=None, workers=HASH_WORKERS, reference_keys=None,
+                         hide_target_only=False, progress_cb=None, phase_cb=None,
+                         cancel_check=None):
+    """
+    Acha arquivos bit a bit idênticos lendo o mínimo possível do disco:
+      1. grupos por TAMANHO (tamanho único = impossível ser idêntico: nem abre);
+      2. o 1º bloco de 64 KB ("head") elimina quase todos os que só coincidem
+         no tamanho, com UMA leitura por arquivo;
+      3. os blocos do meio e do fim ("quick") peneiram quem empatou no começo;
+      4. MD5 do arquivo inteiro só de quem ainda empata.
+    No modo de comparação (reference_keys não None), grupos só da referência
+    (e, com hide_target_only, os só do alvo) caem ANTES de qualquer leitura e
+    de novo depois de cada refinamento (um balde dividido pode virar só-alvo).
+
+    entries: lista de (filepath, size, mtime_ns), como a de list_image_files.
+    cache: FileHashCache ou None. progress_cb(bytes_feitos, bytes_total, caminho);
+    phase_cb(fase, n_arquivos, bytes_total) com fase "head", "quick" ou "full".
+    Retorna (groups_idx, md5_by_idx, stats, cancelled): grupos como listas de
+    índices em `entries`, na ordem de primeira aparição; md5_by_idx tem o MD5
+    real de todo índice agrupado. stats["md5_from_cache"] lista os caminhos
+    agrupados cujo MD5 NÃO foi lido nesta rodada (veio do cache): quem for
+    apagar com base neles deve reconferir antes (ver verify_cached_proof).
+    """
+    stats = _new_byte_stats()
+    stats["files"] = len(entries)
+    cancel_event = threading.Event()
+    chunk_tag = f"{BYTE_QUICK_CHUNK}:"
+
+    def ref_filter(groups):
+        if reference_keys is None:
+            return groups
+        return filter_groups_for_reference(groups, entries, reference_keys,
+                                           hide_target_only=hide_target_only)
+
+    def run_stage(phase, todo, job, cost_of, store, split_large):
+        """Roda job(idx, on_bytes) para cada idx de `todo`; devolve {idx: valor}."""
+        results = {}
+        if not todo:
+            return results
+        total = sum(cost_of(i) for i in todo)
+        progress = _ByteProgress()
+        if phase_cb:
+            phase_cb(phase, len(todo), total)
+
+        def worker(i):
+            progress.current = entries[i][0]
+            try:
+                return i, job(i, progress.add), None
+            except ScanCancelled:
+                return i, None, None
+            except Exception as e:
+                return i, None, e
+
+        def on_result(result):
+            i, value, err = result
+            if err is not None:
+                # Sem leitura confiável não há prova: o arquivo fica fora
+                log.warning("Comparação por bytes: %s ignorado: %s", entries[i][0], err)
+                stats["errors"].append({'filepath': entries[i][0], 'message': str(err)})
+            elif value is not None:
+                results[i] = value
+                store(i, value)
+
+        def tick():
+            if progress_cb:
+                progress_cb(min(progress.done, total), total, progress.current)
+            if cancel_check and cancel_check():
+                cancel_event.set()
+
+        if split_large:
+            batches = (([i for i in todo if entries[i][1] < BYTE_LARGE_FILE], workers),
+                       ([i for i in todo if entries[i][1] >= BYTE_LARGE_FILE],
+                        min(workers, BYTE_LARGE_WORKERS)))
+        else:
+            batches = ((todo, workers),)
+        for batch, n_workers in batches:
+            if batch and not cancel_event.is_set():
+                _run_parallel_ticking(batch, worker, on_result, n_workers, tick, cancel_event)
+        tick()
+        stats["bytes_read"] += progress.done
+        return results
+
+    try:
+        # 1) Tamanho
+        by_size = {}
+        for i, (_, size, _) in enumerate(entries):
+            if not size:
+                stats["no_size"] += 1   # desconhecido (stat falhou) ou vazio: sem prova possível
+                continue
+            by_size.setdefault(size, []).append(i)
+        groups = ref_filter([g for g in by_size.values() if len(g) > 1])
+        candidates = [i for g in groups for i in g]
+        stats["size_candidates"] = len(candidates)
+        if not candidates:
+            return [], {}, stats, False
+        cached = cache.lookup_many([entries[i] for i in candidates]) if cache is not None else {}
+
+        def cached_field(i, name):
+            value = (cached.get(entries[i][0]) or {}).get(name)
+            if value and name in ("head", "quick") and not value.startswith(chunk_tag):
+                return None   # gravada com outro tamanho de bloco: não é comparável
+            return value
+
+        md5_by_idx = {}
+        cached_md5 = set()
+        for i in candidates:
+            if cached_field(i, "md5"):
+                md5_by_idx[i] = cached_field(i, "md5")
+                cached_md5.add(i)
+
+        def small(i):
+            return entries[i][1] <= 3 * BYTE_QUICK_CHUNK
+
+        def sample_stage(phase, part, members, cost):
+            """Chave de amostra (cache ou leitura) para cada índice de `members`."""
+            keys, todo = {}, []
+            for i in members:
+                if small(i) and i in md5_by_idx:
+                    keys[i] = ("md5", md5_by_idx[i])
+                elif not small(i) and cached_field(i, phase):
+                    keys[i] = (phase, cached_field(i, phase))
+                else:
+                    todo.append(i)
+
+            def job(i, on_bytes):
+                return file_quick_key(entries[i][0], entries[i][1], on_bytes,
+                                      mtime_ns=entries[i][2], part=part)
+
+            def store(i, value):
+                kind, digest = value
+                if kind == "md5":
+                    md5_by_idx[i] = digest
+                if cache is not None:
+                    cache.store(*entries[i], **{kind: digest})
+
+            computed = run_stage(phase, todo, job,
+                                 lambda i: min(entries[i][1], cost * BYTE_QUICK_CHUNK) if not small(i)
+                                 else entries[i][1], store, split_large=False)
+            stats[phase + "_computed"] = len(computed)
+            keys.update(computed)
+            return keys
+
+        # 2) Começo do arquivo (para os pequenos, já é o MD5 do arquivo inteiro)
+        keys = sample_stage("head", "head", candidates, 1)
+        if cancel_event.is_set():
+            return [], {}, stats, True
+        groups = ref_filter(_split_groups(groups, keys))
+
+        # 3) Meio e fim, só para os grandes que empataram no começo
+        large = [i for g in groups for i in g if not small(i)]
+        keys.update(sample_stage("quick", "rest", large, 2))
+        if cancel_event.is_set():
+            return [], {}, stats, True
+        groups = ref_filter(_split_groups(groups, keys))
+
+        # 4) MD5 do arquivo inteiro para quem ainda empata
+        todo = [i for g in groups for i in g if i not in md5_by_idx]
+
+        def full_job(i, on_bytes):
+            return file_full_md5(entries[i][0], entries[i][1], cancel_event, on_bytes,
+                                 mtime_ns=entries[i][2])
+
+        def full_store(i, digest):
+            md5_by_idx[i] = digest
+            if cache is not None:
+                cache.store(*entries[i], md5=digest)
+
+        computed = run_stage("full", todo, full_job, lambda i: entries[i][1],
+                             full_store, split_large=True)
+        stats["full_computed"] = len(computed)
+        if cancel_event.is_set():
+            return [], {}, stats, True
+        groups = ref_filter(_split_groups(groups, md5_by_idx))
+        groups = ref_filter(_collapse_hardlinks(groups, entries, stats))
+        groups.sort(key=lambda g: g[0])
+        stats["groups"] = len(groups)
+        stats["identical_files"] = sum(len(g) for g in groups)
+        stats["md5_from_cache"] = [entries[i][0] for g in groups for i in g if i in cached_md5]
+        return groups, {i: md5_by_idx[i] for g in groups for i in g}, stats, False
+    finally:
+        if cache is not None:
+            cache.flush()
+
+
+def verify_cached_proof(filepath, size, expected_md5, cancel_event=None, on_bytes=None):
+    """
+    Reconfere, lendo o arquivo inteiro AGORA, uma prova de "cópia exata" que
+    veio do cache. O cache vale por caminho + tamanho + data, e há programas
+    que alteram o conteúdo preservando os três (contêiner VeraCrypt, editor de
+    tags com "manter a data"). Antes de apagar com base numa prova antiga, o
+    MD5 tem de bater de novo. Retorna (ok, md5_atual_ou_None); erro de leitura
+    ou arquivo alterado = (False, None). ScanCancelled propaga.
+    """
+    try:
+        current = file_full_md5(filepath, size, cancel_event, on_bytes)
+    except ScanCancelled:
+        raise
+    except Exception as e:
+        log.warning("Reconferência falhou para %s: %s", filepath, e)
+        return False, None
+    return current == expected_md5, current
+
+
+def build_byte_groups(entries, groups_idx, md5_by_idx):
+    """Grupos de bytes no formato da interface: (filepath, None, md5). O lugar
+       do ImageHash fica vazio: nada depois de build_groups lê esse campo."""
+    return [[(entries[i][0], None, md5_by_idx[i]) for i in group] for group in groups_idx]
 
 
 # ---------------------------------------------------------------------------
@@ -2208,6 +2951,10 @@ class ImageCleaner:
         self.groups_same_photo = None   # por grupo, classe "mesma foto" de cada imagem (ou None)
         self.same_photo_suspect = set() # classes com cópia "ampliada?"
         self.same_photo_stats = None
+        self.byte_groups = []           # grupos de arquivos idênticos por bytes (vídeos, outros)
+        self.byte_stats = None
+        self.byte_entry_count = 0
+        self.byte_cached_proof = set()
         self.session_report = SessionReport()   # CSV criado no primeiro registro
         self.action_log = []            # lotes de ações desta sessão (para "Desfazer")
         self.settings = load_settings()
@@ -2222,6 +2969,10 @@ class ImageCleaner:
         self.confirm_similar_var.set(st["confirm_similar"] if CONFIRM_SIMILAR else 0)
         self.same_photo_var.set(st["same_photo"] if SAME_PHOTO_ENABLED else 0)
         self.show_target_only_var.set(st["show_target_only"])
+        self.scan_photos_var.set(st["scan_photos"])
+        self.scan_videos_var.set(st["scan_videos"])
+        self.scan_others_var.set(st["scan_others"])
+        self._on_kinds_changed()
         targets = [f for f in st["recent_targets"] if os.path.isdir(f)]
         refs = [f for f in st["recent_references"] if os.path.isdir(f)]
         if targets:
@@ -2237,6 +2988,9 @@ class ImageCleaner:
         st["confirm_similar"] = self.confirm_similar_var.get()
         st["same_photo"] = self.same_photo_var.get()
         st["show_target_only"] = self.show_target_only_var.get()
+        st["scan_photos"] = self.scan_photos_var.get()
+        st["scan_videos"] = self.scan_videos_var.get()
+        st["scan_others"] = self.scan_others_var.get()
         if self.selected_folder:
             st["recent_targets"] = push_recent(st["recent_targets"], self.selected_folder)
         if self.reference_folder:
@@ -2255,8 +3009,8 @@ class ImageCleaner:
     def create_widgets(self):
         # Janela inicial: tamanho decente e centralizada (só aparência; o
         # fluxo de botões/opções abaixo é o mesmo de sempre).
-        width, height = 700, 580
-        self.master.minsize(660, 540)
+        width, height = 700, 620
+        self.master.minsize(660, 580)
         try:
             sw = self.master.winfo_screenwidth()
             sh = self.master.winfo_screenheight()
@@ -2273,7 +3027,7 @@ class ImageCleaner:
 
         steps = tk.Label(
             self.master, justify="left", fg="#444444", font=("Segoe UI", 9),
-            text=("1. Selecione a pasta com as fotos a limpar.\n"
+            text=("1. Selecione a pasta a limpar e marque o que procurar (fotos, vídeos, outros arquivos).\n"
                   "2. (Opcional) Selecione uma pasta de referência já organizada: nada dela será alterado.\n"
                   "3. Clique em Iniciar e revise os grupos encontrados antes de mover ou excluir.")
         )
@@ -2296,10 +3050,37 @@ class ImageCleaner:
         # Frame das opções (inicialmente oculto): duas linhas, para caber na
         # largura padrão da janela
         self.subfolder_frame = tk.Frame(self.master)
+        kinds_row = tk.Frame(self.subfolder_frame)
+        kinds_row.pack(anchor="w", pady=(0, 4))
         options_row1 = tk.Frame(self.subfolder_frame)
         options_row1.pack(anchor="w")
         options_row2 = tk.Frame(self.subfolder_frame)
         options_row2.pack(anchor="w", pady=(4, 0))
+
+        # O que procurar. Fotos: por aparência (como sempre). Vídeos e outros:
+        # só cópias exatas, comparando o conteúdo byte a byte.
+        tk.Label(kinds_row, text="Procurar duplicatas em:", font=FONT_BOLD).pack(side="left")
+        self.scan_photos_var = tk.IntVar(value=1)
+        self.scan_videos_var = tk.IntVar(value=0)
+        self.scan_others_var = tk.IntVar(value=0)
+        self.kind_checks = []
+        for text, var in (("Fotos", self.scan_photos_var), ("Vídeos", self.scan_videos_var),
+                          ("Outros arquivos", self.scan_others_var)):
+            chk = tk.Checkbutton(kinds_row, text=text, variable=var, command=self._on_kinds_changed)
+            chk.pack(side="left", padx=(10, 0))
+            self.kind_checks.append(chk)
+        self.kinds_info_label = tk.Label(kinds_row, text="ℹ️", fg="blue", cursor="hand2")
+        self.kinds_info_label.pack(side="left", padx=5)
+        self.create_tooltip(self.kinds_info_label,
+                            "Fotos: acha cópias idênticas, a mesma foto em outra versão e fotos\n"
+                            "semelhantes. Formatos que o programa não abre (HEIC, RAW) entram\n"
+                            "só como cópia exata.\n"
+                            "Vídeos e Outros arquivos: só cópias EXATAS (mesmo conteúdo, byte a\n"
+                            "byte). O programa lê o mínimo possível: arquivos de tamanho único\n"
+                            "nem são abertos.\n"
+                            "Cuidado com 'Outros' em pastas de programas ou de projetos: eles\n"
+                            "têm muitos arquivos iguais de propósito, e apagar um deles pode\n"
+                            "quebrar o programa. Use em pastas de documentos e acervos.")
 
         # Checkbox para escanear subpastas (marcada por padrão)
         self.scan_subfolders_var = tk.IntVar(value=1)
@@ -2413,6 +3194,20 @@ class ImageCleaner:
                                      font=("Segoe UI", 10, "bold"), padx=18, pady=6)
         # Não exibe o botão nem o frame de subpastas inicialmente
 
+    def _scan_kinds(self):
+        """(fotos, vídeos, outros) marcados na tela inicial."""
+        return (self.scan_photos_var.get() == 1, self.scan_videos_var.get() == 1,
+                self.scan_others_var.get() == 1)
+
+    def _on_kinds_changed(self):
+        """As opções de 2º hash e 'Mesma foto' só fazem sentido com Fotos."""
+        state = "normal" if self.scan_photos_var.get() == 1 else "disabled"
+        for chk in (self.confirm_check, self.same_photo_check):
+            try:
+                chk.config(state=state)
+            except tk.TclError:
+                pass
+
     def _make_recent_menubutton(self, parent, key, apply):
         mb = tk.Menubutton(parent, text="Recentes ▾", relief="flat", bg="#E0E0E0",
                            activebackground="#BDBDBD", padx=8, pady=4, cursor="hand2")
@@ -2511,6 +3306,10 @@ class ImageCleaner:
                     messagebox.showerror("Pastas em conflito",
                                          f"Não é possível iniciar: {reason}.")
                     return
+            if not any(self._scan_kinds()):
+                messagebox.showerror("Nada para procurar",
+                                     "Marque pelo menos um tipo: Fotos, Vídeos ou Outros arquivos.")
+                return
             self._save_settings()
             self.scan_cancelled = False
             self.close_requested = False
@@ -2683,6 +3482,10 @@ class ImageCleaner:
         self.reference_keys = set()
         self.reference_prefix = None
         self.scan_origin_counts = None  # (n_alvo, n_referência) no modo comparação
+        self.byte_groups = []
+        self.byte_stats = None
+        self.byte_entry_count = 0       # quantos arquivos foram para a comparação por bytes
+        self.byte_cached_proof = set()  # cache_key dos agrupados cuja prova veio do cache
         ref = self.reference_folder
         scan_started = time.time()
         log.info("Iniciando escaneamento de: %s (subpastas=%s, cache=%s, threads=%d, "
@@ -2700,7 +3503,7 @@ class ImageCleaner:
         # Cache de hashes (opcional)
         use_cache = self.use_cache_var.get() == 1
         self.hash_cache = None
-        if use_cache:
+        if use_cache and self._scan_kinds()[0]:   # sem Fotos, o cache de fotos nem é carregado
             self.hash_cache = HashCache()
             self.hash_cache.load_prefix(self.selected_folder)
             if ref:
@@ -2718,9 +3521,15 @@ class ImageCleaner:
                     self.progress_label.config(text=f"Contando arquivos... {count}")
                     self.progress_window.update()
 
+            # Uma única caminhada pelo disco lista tudo o que as caixas pedem;
+            # as fotos saem na mesma ordem relativa de sempre.
+            want_photos, want_videos, want_others = self._scan_kinds()
+            byte_kinds = want_videos or want_others
+            accept = make_scan_accept(want_photos, want_videos, want_others)
             try:
                 entries = list_image_files(self.selected_folder, scan_subfolders,
-                                           VALID_EXTENSIONS, on_listing_progress, cancel_check)
+                                           VALID_EXTENSIONS, on_listing_progress, cancel_check,
+                                           accept=accept)
                 if ref and not self.scan_cancelled:
                     # A referência é sempre listada com subpastas (é um acervo).
                     def on_ref_listing_progress(count):
@@ -2732,11 +3541,15 @@ class ImageCleaner:
                     self.progress_label.config(text="Contando arquivos da referência...")
                     self.progress_window.update()
                     ref_entries = list_image_files(ref, True, VALID_EXTENSIONS,
-                                                   on_ref_listing_progress, cancel_check)
+                                                   on_ref_listing_progress, cancel_check,
+                                                   accept=accept)
                     n_target = len(entries)
+                    # O resumo fala de IMAGENS: conta só as do pipeline de fotos
+                    self.scan_origin_counts = tuple(
+                        sum(1 for (fp, _, _) in lst if classify_file(fp) == KIND_PHOTO)
+                        for lst in (entries, ref_entries))
                     entries, self.reference_keys = merge_scan_entries(entries, ref_entries)
                     self.reference_prefix = folder_prefix(ref)
-                    self.scan_origin_counts = (n_target, len(ref_entries))
                     log.info("Modo referência: %d arquivos no alvo, %d na referência",
                              n_target, len(ref_entries))
             except Exception as e:
@@ -2751,25 +3564,52 @@ class ImageCleaner:
                     messagebox.showinfo("Escaneamento Cancelado", "Escaneamento cancelado durante a listagem de arquivos.")
                 return
 
-            total_files = len(entries)
-            log.info("%d arquivos de imagem listados em %.1fs", total_files, time.time() - scan_started)
-            if total_files == 0:
+            # Fotos seguem para o pipeline de aparência; o resto (vídeos, outros
+            # e fotos que o Pillow não abre) só é comparado por bytes. Uma foto
+            # NUNCA entra nos dois: um caminho aparece em no máximo um grupo.
+            photo_entries = [e for e in entries if classify_file(e[0]) == KIND_PHOTO]
+            byte_entries = [e for e in entries if classify_file(e[0]) != KIND_PHOTO]
+            self.byte_entry_count = len(byte_entries)
+            total_files = len(photo_entries)
+            log.info("%d arquivos de imagem listados em %.1fs (mais %d para comparar por bytes)",
+                     total_files, time.time() - scan_started, len(byte_entries))
+            if not entries:
                 self._close_progress_window()
-                messagebox.showinfo("Resultado", "Nenhuma imagem encontrada.")
+                messagebox.showinfo("Resultado", "Nenhum arquivo encontrado." if byte_kinds
+                                    else "Nenhuma imagem encontrada.")
                 return
 
+            # Todas as entradas: a tela de grupos usa tamanho e data daqui
             self.file_stats = {fp: (size, mtime_ns) for (fp, size, mtime_ns) in entries}
 
             # Segunda passagem: hashes (threads), consultando o cache antes.
             # O MD5 NÃO é calculado aqui: só é necessário para as imagens que
             # caírem em algum grupo (ver group_images), evitando ler o acervo 2x.
             self.progress_started_at = time.time()
-            results, errors_by_idx, cancelled = hash_files(
-                entries, self.hash_cache, HASH_WORKERS,
-                progress_cb=self.update_progress, cancel_check=cancel_check
-            )
+            results, errors_by_idx, cancelled = [], {}, False
+            if photo_entries:
+                results, errors_by_idx, cancelled = hash_files(
+                    photo_entries, self.hash_cache, HASH_WORKERS,
+                    progress_cb=self.update_progress, cancel_check=cancel_check
+                )
+
+            # Comparação por bytes, ainda ANTES do resumo: toda a leitura pesada
+            # acontece de uma vez, sem pedir um clique no meio do caminho.
+            byte_cancelled = False
+            if byte_entries and not (cancelled or self.scan_cancelled):
+                byte_cancelled = self._run_byte_stage(byte_entries, use_cache, cancel_check)
 
             self._close_progress_window()
+
+            if byte_cancelled:
+                log.info("Comparação por bytes cancelada")
+                if not self.close_requested:
+                    messagebox.showinfo(
+                        "Escaneamento Cancelado",
+                        "Comparação de arquivos cancelada."
+                        + ("\n\nO que já foi calculado ficou no cache: ao escanear novamente,\n"
+                           "o programa continua de onde parou." if use_cache else ""))
+                return
 
             if cancelled or self.scan_cancelled:
                 processed = sum(1 for r in results if r is not None) + len(errors_by_idx)
@@ -2798,8 +3638,20 @@ class ImageCleaner:
             for err in self.scan_errors[:200]:
                 log.info("  erro [%s] %s: %s", err['type'], err['filepath'], err['message'])
 
+            byte_errors = self.byte_stats["errors"] if self.byte_stats else []
+            if byte_errors:
+                for err in byte_errors[:200]:
+                    log.info("  fora da comparação por bytes: %s: %s", err['filepath'], err['message'])
+                messagebox.showwarning(
+                    "Comparação incompleta",
+                    f"{len(byte_errors)} arquivo(s) não puderam ser lidos (sem permissão, em uso ou "
+                    "alterados durante a leitura) e ficaram FORA da comparação por conteúdo: o "
+                    "programa nunca chama de 'Idêntica' o que não conseguiu ler inteiro.\n\n"
+                    f"Os caminhos estão no log: {get_log_path()}"
+                )
+
             # Exibe resumo do escaneamento (processadas = sem erro)
-            self.show_scan_summary(total_files, len(self.images_data))
+            self.show_scan_summary(total_files, len(self.images_data), byte_count=len(byte_entries))
 
             # Agrupa (o cache é fechado dentro de group_images)
             self.group_images(threshold=SIMILARITY_THRESHOLD)
@@ -2809,6 +3661,63 @@ class ImageCleaner:
                 self.hash_cache.close()
                 self.hash_cache = None
 
+    def _run_byte_stage(self, byte_entries, use_cache, cancel_check):
+        """Comparação por bytes dentro da janela de progresso já aberta.
+           Preenche self.byte_groups/self.byte_stats. Retorna True se cancelada."""
+        t0 = time.time()
+        self.progress_window.title("Comparando Arquivos")
+        phase_text = {
+            "head": "Comparando o começo dos arquivos de mesmo tamanho...",
+            "quick": "Comparando o meio e o fim dos que empataram no começo...",
+            "full": "Conferindo o conteúdo inteiro dos candidatos a cópia exata...",
+        }
+        state = {"phase": "head"}
+
+        def on_phase(phase, n_files, total_bytes):
+            state["phase"] = phase
+            self.progress_started_at = time.time()
+            self._last_progress_update = 0.0
+            log.info("Comparação por bytes, fase %s: %d arquivos, %s a ler",
+                     phase, n_files, format_bytes(total_bytes))
+
+        def on_progress(done, total, filepath):
+            # Progresso por BYTES: com arquivos de GB, contar arquivos não diz nada
+            div, unit = (1024 * 1024, "MB") if total >= 10 * 1024 * 1024 else (1024, "KB")
+            # arredonda para cima: o fim tem de mostrar "N / N", nunca "0 / 1"
+            self.update_progress(-(-done // div), max(1, -(-total // div)), filepath or "", unit=unit)
+            try:
+                if not self.scan_cancelled and self.progress_window.winfo_exists():
+                    self.progress_label.config(
+                        text=f"{phase_text[state['phase']]}\n{os.path.basename(filepath or '')}")
+            except tk.TclError:
+                pass
+
+        cache = FileHashCache() if use_cache else None
+        try:
+            groups_idx, md5_by_idx, stats, cancelled = find_identical_files(
+                byte_entries, cache, HASH_WORKERS,
+                reference_keys=self.reference_keys if self.reference_folder else None,
+                hide_target_only=self.show_target_only_var.get() == 0,
+                progress_cb=on_progress, phase_cb=on_phase, cancel_check=cancel_check)
+        finally:
+            if cache is not None:
+                cache.close()
+        self.byte_stats = stats
+        if cancelled or self.scan_cancelled:
+            return True
+        self.byte_groups = build_byte_groups(byte_entries, groups_idx, md5_by_idx)
+        # Provas que vieram do cache (não foram lidas nesta rodada): são
+        # reconferidas na hora de mover/excluir (ver _verify_cached_proofs)
+        self.byte_cached_proof = {cache_key(fp) for fp in stats["md5_from_cache"]}
+        log.info("Comparação por bytes em %.1fs: %d arquivos, %d candidatos por tamanho, "
+                 "%d inícios, %d meio/fim, %d MD5 completos, %s lidos, %d provas do cache, "
+                 "%d hardlinks, %d erros, %d grupos com %d arquivos",
+                 time.time() - t0, stats["files"], stats["size_candidates"], stats["head_computed"],
+                 stats["quick_computed"], stats["full_computed"], format_bytes(stats["bytes_read"]),
+                 len(stats["md5_from_cache"]), stats["hardlinks"],
+                 len(stats["errors"]), stats["groups"], stats["identical_files"])
+        return False
+
     def _close_progress_window(self):
         """Fecha a janela de progresso, se existir"""
         try:
@@ -2817,20 +3726,29 @@ class ImageCleaner:
         except tk.TclError:
             pass
 
-    def show_scan_summary(self, total_files, processed_files):
-        """Exibe resumo do escaneamento com detalhes de erros"""
+    def show_scan_summary(self, total_files, processed_files, byte_count=0):
+        """Exibe resumo do escaneamento com detalhes de erros.
+           total_files/processed_files contam só IMAGENS (pipeline de fotos);
+           byte_count é quantos outros arquivos foram comparados por conteúdo
+           (0 = mensagens exatamente como sempre foram)."""
         # Linha extra só no modo de comparação (modo normal: mensagem intocada)
         origin_line = ""
         if self.reference_folder and self.scan_origin_counts:
             n_target, n_ref = self.scan_origin_counts
             origin_line = (f"Sendo {n_target} da pasta alvo e {n_ref} da referência "
                            f"(protegida).\n")
+        byte_line = ""
+        if byte_count:
+            n_groups = len(self.byte_groups)
+            byte_line = (f"✓ {byte_count} arquivo(s) comparados só por conteúdo (vídeos, outros, "
+                         f"fotos HEIC/RAW): {n_groups} grupo(s) de cópias exatas.\n")
 
         if not self.scan_errors:
             # Sem erros
+            photo_line = (f"✓ {processed_files} de {total_files} imagens processadas com sucesso!\n"
+                          + origin_line) if (total_files or not byte_count) else ""
             message = (
-                f"✓ {processed_files} de {total_files} imagens processadas com sucesso!\n"
-                + origin_line +
+                photo_line + byte_line +
                 f"\n⚠️ Ao clicar em OK, o carregamento pode demorar alguns minutos.\n"
                 f"Por favor, aguarde."
             )
@@ -2858,6 +3776,7 @@ class ImageCleaner:
             f"✗ Imagens com erro: {error_count}\n"
             f"📊 Total encontrado: {total_files}"
             + (f"\n{origin_line.rstrip()}" if origin_line else "")
+            + (f"\n{byte_line.rstrip()}" if byte_line else "")
         )
 
         tk.Label(summary_frame, text=summary_text, font=("Arial", 10, "bold"),
@@ -2936,18 +3855,65 @@ class ImageCleaner:
 
     def group_images(self, threshold=SIMILARITY_THRESHOLD):
         """
+        Orquestra o resultado: grupos de fotos (_photo_groups, o pipeline de
+        sempre) seguidos dos grupos de arquivos idênticos por bytes (já
+        calculados em _scan_folder_impl), e exibe a tela de grupos.
+
+        _photo_groups termina em um de três estados:
+          "ok"     há grupos de fotos;
+          "empty"  nada a mostrar, com o (título, texto) que sempre foi
+                   exibido nesse caso: só aparece se também não houver
+                   grupos de bytes;
+          "abort"  cancelado ou janela fechada (a mensagem, se havia, já foi
+                   mostrada): nada mais roda.
+        Só com Fotos marcado, diálogos e resultado são os de sempre.
+        """
+        self.confirm_stats = None
+        self.groups_same_photo = None
+        self.same_photo_suspect = set()
+        self.same_photo_stats = None
+        byte_groups = list(self.byte_groups or [])
+        state, payload = self._photo_groups(threshold)
+        if state == "abort":
+            return
+        photo_groups = payload if state == "ok" else []
+        if not photo_groups and not byte_groups:
+            # Sem nada comparado por bytes, a mensagem é a de sempre das fotos
+            if state == "empty" and not self.byte_entry_count:
+                messagebox.showinfo(*payload)
+            else:
+                messagebox.showinfo("Resultado", "Nenhuma duplicata encontrada.")
+            return
+        if state == "empty" and self.images_data:
+            # Havia fotos e nenhuma ficou em grupo: o motivo (ex.: a confirmação
+            # por segundo hash descartou tudo) não pode sumir só porque há
+            # grupos de outros arquivos para mostrar
+            messagebox.showinfo(payload[0], payload[1] + chr(10) + chr(10)
+                                + "Os grupos exibidos a seguir são de arquivos comparados por conteúdo.")
+        if self.groups_same_photo is not None:
+            # Grupos de bytes não têm classes "Mesma foto": linhas vazias,
+            # para a lista continuar alinhada com self.groups
+            self.groups_same_photo = self.groups_same_photo + [[None] * len(g) for g in byte_groups]
+        self.groups = photo_groups + byte_groups
+        assert self.groups_same_photo is None or len(self.groups_same_photo) == len(self.groups)
+        # A partir daqui não há mais processamento em lote: o "X" da janela
+        # principal volta a fechar o app imediatamente.
+        self.scan_in_progress = False
+        self.show_groups()
+
+    def _photo_groups(self, threshold):
+        """
         Agrupa imagens cuja distância de phash é <= threshold (fechamento
         transitivo via Union-Find, igual à versão original, porém vetorizado),
         depois calcula o MD5 só das imagens agrupadas para rotular
-        Idêntica/Semelhante, e exibe os grupos.
+        Idêntica/Semelhante. Retorna (estado, dado): ver group_images.
         """
         n = len(self.images_data)
         if n == 0:
-            messagebox.showinfo("Resultado", "Nenhuma imagem encontrada.")
-            return
+            return "empty", ("Resultado", "Nenhuma imagem encontrada.")
 
         if self.close_requested:
-            return
+            return "abort", None
 
         hashes = [h for (_, h, _) in self.images_data]
         t0 = time.time()
@@ -2966,17 +3932,13 @@ class ImageCleaner:
             log.info("Agrupamento cancelado")
             if not self.close_requested:
                 messagebox.showinfo("Cancelado", "Agrupamento cancelado.")
-            return
+            return "abort", None
         finally:
             self._close_progress_window()
         log.info("Agrupamento de %d imagens em %.1fs: %d grupos", n, time.time() - t0, len(groups_idx))
 
         if self.close_requested:
-            return
-        self.confirm_stats = None
-        self.groups_same_photo = None
-        self.same_photo_suspect = set()
-        self.same_photo_stats = None
+            return "abort", None
         hide_target_only = self.show_target_only_var.get() == 0
         if self.reference_folder and groups_idx:
             # Modo comparação: descarta grupos só da referência (nada a limpar)
@@ -2989,15 +3951,13 @@ class ImageCleaner:
                      before - len(groups_idx),
                      " ou só alvo" if hide_target_only else "", len(groups_idx))
             if not groups_idx:
-                messagebox.showinfo(
+                return "empty", (
                     "Resultado",
                     "Nenhuma imagem da pasta alvo é duplicata do acervo de referência"
                     + ("" if hide_target_only else " nem de outra imagem da pasta alvo") + "."
                 )
-                return
         if not groups_idx:
-            messagebox.showinfo("Resultado", "Nenhuma imagem similar encontrada.")
-            return
+            return "empty", ("Resultado", "Nenhuma imagem similar encontrada.")
 
         # MD5 apenas para as imagens agrupadas (com pré-filtro por tamanho)
         stats = [self.file_stats.get(fp, (None, None)) for (fp, _, _) in self.images_data]
@@ -3018,7 +3978,7 @@ class ImageCleaner:
             log.info("Verificação de MD5 cancelada")
             if not self.close_requested:
                 messagebox.showinfo("Cancelado", "Verificação de imagens idênticas cancelada.")
-            return
+            return "abort", None
 
         # Confirmação de "Semelhante" por segundo hash (pós-filtro opcional).
         # Desligada, nada daqui executa e o resultado é o de sempre.
@@ -3053,7 +4013,7 @@ class ImageCleaner:
                 log.info("Confirmação de semelhantes cancelada")
                 if not self.close_requested:
                     messagebox.showinfo("Cancelado", "Confirmação de imagens semelhantes cancelada.")
-                return
+                return "abort", None
             self.confirm_stats = confirm_stats
             log.info("Confirmação (dhash<=%d) em %.1fs: %d grupos -> %d (%d divididos, %d descartados), "
                      "%d imagens descartadas, %d degeneradas, %d pares rejeitados, %d pares sem dhash",
@@ -3078,14 +4038,13 @@ class ImageCleaner:
                     f"antigo.\n\nOs caminhos estão no log: {get_log_path()}"
                 )
             if not groups_idx:
-                messagebox.showinfo(
+                return "empty", (
                     "Resultado",
                     "Nenhuma imagem similar confirmada.\n\n"
                     f"A confirmação por segundo hash descartou {confirm_stats['groups_in']} grupo(s) "
                     "candidato(s) como coincidência. Desmarque 'Confirmar semelhantes com segundo "
                     "hash' para vê-los."
                 )
-                return
 
         # "Mesma foto": classes dentro dos grupos (pós-filtro; nada muda desligado)
         same_photo = SAME_PHOTO_ENABLED and self.same_photo_var.get() == 1
@@ -3114,21 +4073,21 @@ class ImageCleaner:
                 log.info("Identificação de 'Mesma foto' cancelada")
                 if not self.close_requested:
                     messagebox.showinfo("Cancelado", "Identificação de 'Mesma foto' cancelada.")
-                return
+                return "abort", None
             self.groups_same_photo = [[class_by_idx.get(i) for i in g] for g in groups_idx]
             self.same_photo_suspect = suspect
             self.same_photo_stats = sp_stats
             log.info("Mesma foto em %.1fs: %s", time.time() - t1, sp_stats)
 
-        self.groups = build_groups(self.images_data, groups_idx, md5_by_idx)
+        photo_groups = build_groups(self.images_data, groups_idx, md5_by_idx)
         n_ident = 0
-        for g in self.groups:
+        for g in photo_groups:
             counts = {}
             for (_, _, m) in g:
                 counts[m] = counts.get(m, 0) + 1
             n_ident += sum(1 for (_, _, m) in g if counts[m] > 1)
         log.info("MD5 concluído em %.1fs: %d imagens idênticas em %d grupos",
-                 time.time() - t0, n_ident, len(self.groups))
+                 time.time() - t0, n_ident, len(photo_groups))
         md5_failures = sum(1 for m in md5_by_idx.values() if m.startswith("ERR:"))
         if md5_failures:
             messagebox.showwarning(
@@ -3137,10 +4096,7 @@ class ImageCleaner:
                 f"idênticas (MD5) e serão exibidos como 'Semelhante'.\n\n"
                 f"Os caminhos estão no log: {get_log_path()}"
             )
-        # A partir daqui não há mais processamento em lote: o "X" da janela
-        # principal volta a fechar o app imediatamente.
-        self.scan_in_progress = False
-        self.show_groups()
+        return "ok", photo_groups
 
     def create_groups_progress_window(self):
         """Cria janela de progresso para inicialização de grupos"""
@@ -3252,6 +4208,9 @@ class ImageCleaner:
                 image_info_list.append({
                     'filepath': filepath,
                     'md5': md5_val,
+                    # KIND_PHOTO = imagem que o Pillow abre; o resto veio da
+                    # comparação por bytes (miniatura do Explorer, sem resolução)
+                    'kind': classify_file(filepath),
                     'var': var,
                     'mtime': self._get_mtime(filepath),
                     # True só no modo comparação, para arquivos vindos da
@@ -3290,6 +4249,17 @@ class ImageCleaner:
         self.badge_frames = {}              # (idx, pos) -> frame dos rótulos de diferença
         self._counter_pending = False
         self.group_expanded = {}            # idx -> True quando o usuário expandiu um grupo grande
+        # Arquivos que não são foto: miniatura do Explorer carregada em segundo
+        # plano (a placa com a extensão aparece na hora) e dados do cabeçalho
+        self.has_non_photos = any(is_file_kind(classify_file(fp)) for g in self.groups for (fp, _, _) in g)
+        self.media_info = {}                # MD5 (ou caminho) -> dict do mp4probe (vídeos)
+        self.preview_photos = {}
+        self.preview_requested = set()
+        self.thumb_labels = {}              # chave da miniatura -> Labels que a exibem agora
+        self._cancel_thumb_poll()           # agendamento de uma janela de grupos anterior
+        self._thumb_loader = shellthumb.ThumbnailLoader()
+        self._thumb_poll_scheduled = False
+        self._thumb_after = None
 
         # Cria janela de progresso
         self.create_groups_progress_window()
@@ -3303,7 +4273,8 @@ class ImageCleaner:
             self.groups_progress_window.destroy()
 
         self.groups_window = tk.Toplevel(self.master)
-        self.groups_window.title("Grupos de Imagens Similares")
+        self.groups_window.title(self._t("Grupos de Imagens Similares"))
+        self.groups_window.bind("<Destroy>", self._cancel_thumb_poll, add="+")
 
         # Frame superior com informações e navegação
         top_frame = tk.Frame(self.groups_window)
@@ -3440,6 +4411,112 @@ class ImageCleaner:
         """Índices dos grupos da vista atual (pendentes ou verificados)."""
         return self.pending_idx if self.view_mode == "pending" else self.verified_idx
 
+    def _t(self, text, files=None):
+        """Texto da tela com o vocabulário certo: 'imagens' só com fotos (sem
+           tocar em nada), 'arquivos' quando há outros tipos. files=True/False
+           força a escolha (ex.: texto de UM grupo)."""
+        if files is None:
+            files = getattr(self, 'has_non_photos', False)
+        return file_wording(text) if files else text
+
+    def _media_info(self, filepath, kind, share_key=None):
+        """Dados do cabeçalho de um vídeo MP4/MOV (mp4probe), lidos uma vez por
+           CONTEÚDO: cópias idênticas (mesmo MD5) dividem a leitura. Outros
+           contêineres (avi, mkv...) nem são abertos: o leitor não os entende."""
+        if kind != KIND_VIDEO or os.path.splitext(filepath)[1].lower() not in mp4probe.MP4_EXTENSIONS:
+            return None
+        key = share_key or filepath
+        info = self.media_info.get(key)
+        if info is None:
+            info = mp4probe.probe(filepath)
+            self.media_info[key] = info
+        return info
+
+    def _load_file_thumbnail(self, filepath, kind, share_key, label=None):
+        """
+        Miniatura de um arquivo que NÃO é foto. Devolve na hora a placa com a
+        extensão e pede a miniatura do Explorer à thread de miniaturas; quando
+        ela chega, os Labels registrados em thumb_labels são atualizados.
+        share_key: arquivos idênticos (mesmo MD5) dividem uma miniatura só.
+        """
+        key = ("md5", share_key) if share_key else ("path", filepath)
+        if label is not None:
+            # só Labels vivos: um grupo redesenhado deixa os antigos para trás
+            alive = [l for l in self.thumb_labels.get(key, []) if self._widget_alive(l)]
+            self.thumb_labels[key] = alive + [label]
+        cache = self.thumb_cache
+        if key in cache:
+            return cache[key]
+        plate = ImageTk.PhotoImage(extension_plate(filepath, kind, THUMB_SIZE, int(THUMB_SIZE * 0.62)))
+        if len(cache) >= THUMB_CACHE_SIZE:
+            cache.pop(next(iter(cache)))
+        cache[key] = plate
+        if shellthumb.available():
+            self._thumb_loader.request(key, filepath, THUMB_SIZE)
+            self._schedule_thumb_poll()
+        return plate
+
+    @staticmethod
+    def _widget_alive(widget):
+        try:
+            return bool(widget.winfo_exists())
+        except tk.TclError:
+            return False
+
+    def _schedule_thumb_poll(self):
+        if self._thumb_poll_scheduled:
+            return
+        win = getattr(self, 'groups_window', None)
+        if win is None:
+            return   # a janela ainda está sendo montada: render_page agenda depois
+        try:
+            self._thumb_poll_scheduled = True
+            self._thumb_after = (win, win.after(60, self._poll_thumbnails))
+        except tk.TclError:
+            self._thumb_poll_scheduled = False
+
+    def _cancel_thumb_poll(self, event=None):
+        """A janela de grupos está sendo destruída: cancela o agendamento
+           pendente (senão o Tcl reclama de um comando que não existe mais)."""
+        if event is not None and event.widget is not getattr(self, 'groups_window', None):
+            return   # <Destroy> de um filho: ignora
+        pending = getattr(self, '_thumb_after', None)
+        self._thumb_after = None
+        self._thumb_poll_scheduled = False
+        if pending:
+            try:
+                pending[0].after_cancel(pending[1])
+            except tk.TclError:
+                pass
+
+    def _poll_thumbnails(self):
+        """Thread principal: transforma as miniaturas prontas em PhotoImage e
+           troca a placa nos Labels que ainda existem."""
+        self._thumb_poll_scheduled = False
+        self._thumb_after = None
+        for key, image, err in self._thumb_loader.drain():
+            if image is None:
+                log.info("Sem miniatura do Explorer para %s: %s", key[1], err)
+                continue
+            try:
+                photo = ImageTk.PhotoImage(image)
+            except Exception as e:
+                log.warning("Miniatura inválida para %s: %s", key[1], e)
+                continue
+            if key[0] == "preview":
+                self.preview_photos[key] = photo   # fora do cache de miniaturas (é grande)
+            else:
+                self.thumb_cache[key] = photo
+            for lbl in self.thumb_labels.get(key, []):
+                try:
+                    if lbl.winfo_exists():
+                        lbl.config(image=photo)
+                        lbl.image = photo
+                except tk.TclError:
+                    pass
+        if self._thumb_loader.pending:
+            self._schedule_thumb_poll()
+
     def _load_thumbnail(self, filepath):
         """
         Miniatura THUMB_SIZE x THUMB_SIZE como PhotoImage, com cache. JPEGs são decodificados
@@ -3505,6 +4582,11 @@ class ImageCleaner:
         self.group_frames = {}
         self.row_widgets = {}
         self.badge_frames = {}
+        self.thumb_labels = {}   # os Labels da página antiga vão ser destruídos
+        # Pedidos de miniatura que ainda não começaram eram da página antiga:
+        # descarta (e tira a placa do cache, senão nunca seriam pedidos de novo)
+        for key in self._thumb_loader.discard_pending():
+            self.thumb_cache.pop(key, None)
 
         total, _ = self._update_page_info()
         visible = self._visible_groups()
@@ -3578,7 +4660,15 @@ class ImageCleaner:
         md5_count = group_data['md5_count']
         images = group_data['images']
 
-        title = f"Grupo {idx + 1}" + (" ✓ verificado" if verified_view else "")
+        # Grupo de fotos: título de sempre. Grupo vindo da comparação por
+        # bytes: diz o que é (todos os membros têm o mesmo conteúdo).
+        kinds = {im.get('kind', KIND_PHOTO) for im in images}
+        group_files = kinds != {KIND_PHOTO}
+        kind_tag = ""
+        if group_files:
+            kind_tag = (" (vídeos)" if kinds == {KIND_VIDEO}
+                        else " (fotos)" if kinds == {KIND_PHOTO_BYTES} else " (arquivos)")
+        title = f"Grupo {idx + 1}" + kind_tag + (" ✓ verificado" if verified_view else "")
         frame = tk.LabelFrame(self.content_frame, text=title, padx=10, pady=10)
         frame.pack(padx=10, pady=10, fill="x", expand=True)
         self.group_frames[idx] = frame
@@ -3646,13 +4736,15 @@ class ImageCleaner:
         # Miniaturas primeiro (preenche image_dims), badges depois: assim as
         # linhas sem rótulo não criam widgets extras.
         for img_info in rows:
-            self._load_thumbnail(img_info['filepath'])
+            if img_info.get('kind', KIND_PHOTO) == KIND_PHOTO:
+                self._load_thumbnail(img_info['filepath'])
         badges = self._badges_for_group(images)
         for pos, img_info in enumerate(rows, start=offset):
             filepath = img_info['filepath']
             md5_val = img_info['md5']
             var = img_info['var']
             is_ref = img_info.get('is_reference', False)
+            kind = img_info.get('kind', KIND_PHOTO)
 
             # Monta um frame interno para cada imagem
             item_frame = tk.Frame(frame)
@@ -3666,12 +4758,20 @@ class ImageCleaner:
             row_widgets = [item_frame]
 
             # Miniatura (clique abre a pré-visualização grande)
-            photo = self._load_thumbnail(filepath)
-            if photo is not None:
-                lbl_img = tk.Label(item_frame, image=photo, cursor="hand2")
-                lbl_img.image = photo
+            if kind == KIND_PHOTO:
+                photo = self._load_thumbnail(filepath)
+                if photo is not None:
+                    lbl_img = tk.Label(item_frame, image=photo, cursor="hand2")
+                    lbl_img.image = photo
+                else:
+                    lbl_img = tk.Label(item_frame, text="(Erro ao carregar)", cursor="hand2")
             else:
-                lbl_img = tk.Label(item_frame, text="(Erro ao carregar)", cursor="hand2")
+                # Não é foto: placa com a extensão agora; a miniatura do
+                # Explorer chega depois, sem travar a tela
+                lbl_img = tk.Label(item_frame, cursor="hand2")
+                photo = self._load_file_thumbnail(filepath, kind, md5_val, label=lbl_img)
+                lbl_img.config(image=photo)
+                lbl_img.image = photo
             lbl_img.pack(side="left", padx=5)
             lbl_img.bind("<Button-1>",
                          lambda e, g=idx, p=pos: self.open_preview(g, p))
@@ -3730,21 +4830,27 @@ class ImageCleaner:
 
             # Metadados do arquivo (protegido: o arquivo pode ter sido
             # movido/excluído por uma ação anterior nesta mesma tela)
-            resolution = format_resolution(self.image_dims.get(filepath))
+            if kind == KIND_PHOTO:
+                status_line = (f"Status: {status}   |   "
+                               f"Resolução: {format_resolution(self.image_dims.get(filepath))}")
+            else:
+                # Sem "Resolução": no lugar, o tipo e (vídeo) dimensões e duração
+                status_line = (f"Status: Cópia exata   |   "
+                               f"{media_summary(kind, filepath, self._media_info(filepath, kind, md5_val))}")
             try:
                 st = os.stat(filepath)
                 ctime_str = datetime.fromtimestamp(st.st_ctime).strftime("%Y-%m-%d %H:%M:%S")
                 mtime_str = datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
                 info_text = (
                     f"{where}\n"
-                    f"Status: {status}   |   Resolução: {resolution}\n"
+                    f"{status_line}\n"
                     f"Tamanho: {format_bytes(st.st_size)} ({st.st_size} bytes)\n"
                     f"Criado em: {ctime_str}   |   Modificado em: {mtime_str}"
                 )
             except OSError:
                 info_text = (
                     f"{where}\n"
-                    f"Status: {status}   |   Resolução: {resolution}\n"
+                    f"{status_line}\n"
                     f"Arquivo não encontrado (movido ou excluído)"
                 )
 
@@ -3770,8 +4876,9 @@ class ImageCleaner:
             strip = tk.Frame(frame, bg="#FFF8E1", padx=8, pady=6)
             strip.pack(fill="x", pady=(4, 0))
             tk.Label(strip, bg="#FFF8E1", fg="#6D4C00", anchor="w", justify="left",
-                     text=(f"… e mais {hidden} imagem(ns) neste grupo ({selected} selecionada(s) no total). "
-                           "As ações de selecionar, mover e excluir valem para o grupo inteiro.")
+                     text=self._t(f"… e mais {hidden} imagem(ns) neste grupo ({selected} selecionada(s) no total). "
+                                  "As ações de selecionar, mover e excluir valem para o grupo inteiro.",
+                                  files=any(is_file_kind(k) for k in kinds))
                      ).pack(side="left", fill="x", expand=True)
             make_button(strip, f"Expandir ({len(images)})", "light",
                         command=lambda g=idx: self.set_group_expanded(g, True)).pack(side="right")
@@ -3887,14 +4994,16 @@ class ImageCleaner:
             self.review_label.config(text=f"Verificados {verified} / {total}")
             n_txt = f"{n_sel:,}".replace(",", ".")   # separador de milhar pt-BR
             self.selection_label.config(
-                text=f"Selecionadas: {n_txt} imagem(ns), {format_bytes(bytes_sel)}")
+                text=self._t(f"Selecionadas: {n_txt} imagem(ns), {format_bytes(bytes_sel)}"))
         except tk.TclError:
             pass
 
     def _show_row_menu(self, event, filepath, group_idx, pos):
         menu = tk.Menu(self.groups_window, tearoff=0)
         menu.add_command(label="Pré-visualizar", command=lambda: self.open_preview(group_idx, pos))
-        menu.add_command(label="Abrir imagem", command=lambda: self.open_image(filepath))
+        is_file = is_file_kind(classify_file(filepath))
+        menu.add_command(label=self._t("Abrir imagem", files=is_file),
+                         command=lambda: self.open_image(filepath))
         menu.add_command(label="Abrir pasta no Explorer", command=lambda: self.open_in_explorer(filepath))
         menu.add_separator()
         menu.add_command(label="Copiar caminho", command=lambda: self.copy_path(filepath))
@@ -3908,7 +5017,8 @@ class ImageCleaner:
         try:
             os.startfile(filepath)
         except OSError as e:
-            messagebox.showerror("Abrir imagem", f"Não foi possível abrir:\n{filepath}\n\n{e}")
+            messagebox.showerror(self._t("Abrir imagem", files=is_file_kind(classify_file(filepath))),
+                                 f"Não foi possível abrir:\n{filepath}\n\n{e}")
 
     def open_in_explorer(self, filepath):
         """Abre o Explorer com o arquivo selecionado."""
@@ -4041,6 +5151,8 @@ class ImageCleaner:
             self.preview_window = None
         win = tk.Toplevel(self.groups_window)
         self.preview_window = win
+        self.preview_photos = {}        # miniaturas grandes já recebidas nesta janela
+        self.preview_requested = set()
         dark, panel, fg = "#111111", "#1E1E1E", "#EEEEEE"
         win.configure(bg=dark)
         win.transient(self.groups_window)
@@ -4079,7 +5191,23 @@ class ImageCleaner:
                               'mtime': None if mt in (None, float("inf")) else mt})
             return plan_badges(metas)
 
-        def load_photo(fp):
+        def load_photo(fp, kind=KIND_PHOTO, label=None):
+            if kind != KIND_PHOTO:
+                # Não é foto: a miniatura grande do Explorer (um quadro do vídeo,
+                # a 1ª página do PDF...), pedida à thread de miniaturas para não
+                # travar a janela (um vídeo 4K a frio pode levar segundos).
+                # Enquanto não chega (ou se não existir), a placa com a extensão.
+                key = ("preview", fp, max(64, min(col_w, img_h)))
+                ready = self.preview_photos.get(key)
+                if ready is not None:
+                    return ready
+                if label is not None:
+                    self.thumb_labels.setdefault(key, []).append(label)
+                if key not in self.preview_requested and shellthumb.available():
+                    self.preview_requested.add(key)
+                    self._thumb_loader.request(key, fp, key[2])
+                    self._schedule_thumb_poll()
+                return ImageTk.PhotoImage(extension_plate(fp, kind, min(col_w, 480), min(img_h, 300)))
             with Image.open(fp) as im:
                 self.image_dims[fp] = im.size
                 if im.format == "JPEG":
@@ -4119,8 +5247,9 @@ class ImageCleaner:
                 col.bind("<Button-1>", lambda e, k=i: set_cur(k))
                 lbl_img = tk.Label(col, bg=panel)
                 lbl_img.pack(pady=(8, 4))
+                kind = info.get('kind', KIND_PHOTO)
                 try:
-                    photo = load_photo(fp)
+                    photo = load_photo(fp, kind, lbl_img)
                     lbl_img.config(image=photo)
                     lbl_img.image = photo
                 except Exception as e:
@@ -4140,7 +5269,12 @@ class ImageCleaner:
                 tk.Label(col, text=name, fg=fg, bg=panel, font=FONT_BOLD, wraplength=col_w).pack()
                 tk.Label(col, text=(f"[{tag}] " if tag else "") + (rel_dir or "(raiz)"),
                          fg="#9E9E9E", bg=panel, wraplength=col_w).pack()
-                tk.Label(col, text=(f"{status}   |   {format_resolution(dims)}   |   "
+                if kind == KIND_PHOTO:
+                    summary = f"{status}   |   {format_resolution(dims)}"
+                else:
+                    summary = (f"Cópia exata   |   "
+                               f"{media_summary(kind, fp, self._media_info(fp, kind, info['md5']))}")
+                tk.Label(col, text=(f"{summary}   |   "
                                     f"{format_bytes(size)}\nModificado em: {mt_str}"),
                          fg=fg, bg=panel, justify="center").pack(pady=(4, 2))
                 badge_row = tk.Frame(col, bg=panel)
@@ -4152,7 +5286,8 @@ class ImageCleaner:
                 if ref:
                     tk.Label(col, text="REFERÊNCIA (protegida)", fg="white", bg=PALETTE["primary"],
                              font=FONT_BOLD, padx=6).pack(pady=(4, 0))
-                state_lbl = tk.Label(col, text=("SELECIONADA" if sel else "não selecionada"),
+                state_lbl = tk.Label(col, text=self._t("SELECIONADA" if sel else "não selecionada",
+                                                       files=is_file_kind(kind)),
                                      fg=("#A5D6A7" if sel else "#BDBDBD"), bg=panel, font=FONT_BOLD)
                 state_lbl.pack(pady=(4, 2))
                 btns = tk.Frame(col, bg=panel)
@@ -4162,11 +5297,16 @@ class ImageCleaner:
                                 command=lambda k=i: toggle(k)).pack(side="left", padx=4)
                 make_button(btns, "Manter esta (selecionar as outras)", "move",
                             command=lambda k=i: keep_this(k)).pack(side="left", padx=4)
+                if kind != KIND_PHOTO:
+                    # Vídeo/outro: o jeito de conferir é abrir (tocar o vídeo, ler o PDF)
+                    make_button(btns, "Abrir no programa padrão", "light",
+                                command=lambda p=fp: self.open_image(p)).pack(side="left", padx=4)
                 for wdg in (badge_row, btns, state_lbl):
                     background_widgets.add(wdg)
             cur = images[state['cur']]
-            header.config(text=f"Grupo {group_idx + 1}: imagem {state['cur'] + 1} de {n}   |   "
-                               f"{os.path.basename(cur['filepath'])}")
+            header.config(text=self._t(f"Grupo {group_idx + 1}: imagem {state['cur'] + 1} de {n}   |   ",
+                                       files=is_file_kind(cur.get('kind', KIND_PHOTO)))
+                               + os.path.basename(cur['filepath']))
             win.title(f"Pré-visualização: {os.path.basename(cur['filepath'])}")
 
         def set_cur(i):
@@ -4223,9 +5363,10 @@ class ImageCleaner:
         nav = tk.Frame(frame, bg="#fff3cd", padx=5, pady=4)
         nav.pack(fill="x", pady=(0, 5))
 
-        info = (f"⚠️ Grupo com {total} imagens: exibindo {offset + 1} a {end}. "
-                f"Selecionadas neste grupo: {selected} (as ações de selecionar, mover e "
-                f"excluir valem para o grupo inteiro; use os botões para ver as demais).")
+        info = self._t(f"⚠️ Grupo com {total} imagens: exibindo {offset + 1} a {end}. "
+                       f"Selecionadas neste grupo: {selected} (as ações de selecionar, mover e "
+                       f"excluir valem para o grupo inteiro; use os botões para ver as demais).",
+                       files=any(is_file_kind(im.get('kind', KIND_PHOTO)) for im in images))
         tk.Label(nav, text=info, fg="#856404", bg="#fff3cd", justify="left",
                  anchor="w", wraplength=800).pack(side="left", fill="x", expand=True)
 
@@ -4269,6 +5410,8 @@ class ImageCleaner:
             fp = info['filepath']
             if info.get('size') is None:
                 info['size'] = self.file_stats.get(fp, (None, None))[0]
+            if info.get('kind', KIND_PHOTO) != KIND_PHOTO:
+                continue   # vídeo/outro: sem resolução (e nunca passa pelo Pillow)
             if info.get('pixels') is None:
                 dims = self.image_dims.get(fp)
                 if dims is None:
@@ -4347,9 +5490,9 @@ class ImageCleaner:
                 group_data['images'][i]['var'].set(1)
                 selected_count += 1
 
-        messagebox.showinfo("Seleção Concluída",
+        messagebox.showinfo("Seleção Concluída", self._t(
                            f"{selected_count} imagens idênticas foram selecionadas (mantendo a mais antiga de cada grupo)."
-                           + self._verified_note() + self._reference_selection_note())
+                           + self._verified_note() + self._reference_selection_note()))
 
     def select_similar_images(self):
         """Seleciona automaticamente imagens semelhantes (MD5 diferente) em
@@ -4360,7 +5503,8 @@ class ImageCleaner:
         # Dimensões desconhecidas são lidas do cabeçalho; com muitas, mostra progresso
         unknown = sum(1 for idx in self.pending_idx
                       for im in self.group_check_vars[idx]['images']
-                      if im.get('pixels') is None and im['filepath'] not in self.image_dims)
+                      if im.get('pixels') is None and im['filepath'] not in self.image_dims
+                      and im.get('kind', KIND_PHOTO) == KIND_PHOTO)
         show_progress = unknown > 500
         if show_progress:
             self.scan_cancelled = False
@@ -4400,6 +5544,148 @@ class ImageCleaner:
         return ("\n\nModo comparação: quando existe cópia no acervo de referência, todas as "
                 "cópias da pasta alvo são selecionadas. Imagens da referência nunca são "
                 "selecionadas.")
+
+    def _changed_since_scan(self, item):
+        """
+        Para arquivos comparados por bytes: True se o arquivo mudou depois da
+        varredura (tamanho diferente, ou data diferindo mais de 2 s, que é a
+        precisão de um pendrive FAT). A prova de "cópia exata" vale para o
+        conteúdo lido na varredura; se mudou, o arquivo não é tocado.
+        Fotos ficam de fora: seguem exatamente a regra de sempre.
+        """
+        filepath = item['filepath'] if isinstance(item, dict) else item
+        if classify_file(filepath) == KIND_PHOTO:
+            return False
+        size, mtime_ns = getattr(self, 'file_stats', {}).get(filepath, (None, None))
+        if size is None:
+            return False
+        try:
+            st = os.stat(filepath)
+        except OSError:
+            return False   # sumiu: o erro normal de mover/excluir trata
+        if st.st_size != size or (mtime_ns is not None and abs(st.st_mtime_ns - mtime_ns) > 2_000_000_000):
+            log.warning("Alterado desde a varredura, não será tocado: %s", filepath)
+            return True
+        return False
+
+    def _stale_proofs(self, selected_paths):
+        """
+        Última trava antes de mover/excluir arquivos comparados por bytes.
+        O cache vale por caminho + tamanho + data, e há programas que mudam o
+        conteúdo preservando os três (contêiner VeraCrypt, editor de tags com
+        "manter a data"): a prova guardada pode ter caducado sem sinal nenhum.
+        Para cada conjunto de cópias em que ALGUMA prova veio do cache, relê
+        agora os arquivos envolvidos e só libera um selecionado se (a) o MD5
+        dele ainda é o registrado e (b) sobra ao menos um exemplar NÃO
+        selecionado com esse mesmo MD5 confirmado. Provas lidas nesta varredura
+        já estão cobertas por _changed_since_scan e não são relidas.
+
+        Retorna o set de caminhos selecionados que NÃO podem ser tocados, ou
+        None se o usuário cancelou a reconferência (nada deve ser feito).
+        """
+        cached = getattr(self, 'byte_cached_proof', None)
+        if not cached:
+            return set()
+        selected = set(selected_paths)
+        plan = []    # (md5, selecionados, mantidos) de cada conjunto com prova do cache
+        for group_data in self.group_check_vars.values():
+            by_md5 = {}
+            for im in group_data['images']:
+                if im.get('kind', KIND_PHOTO) != KIND_PHOTO:
+                    by_md5.setdefault(im['md5'], []).append(im['filepath'])
+            for md5, members in by_md5.items():
+                chosen = [fp for fp in members if fp in selected]
+                kept = [fp for fp in members if fp not in selected]
+                # Tudo selecionado: não sobra cópia de qualquer jeito (decisão
+                # explícita do usuário); nada selecionado: nada a conferir
+                if chosen and kept and any(cache_key(fp) in cached for fp in members):
+                    plan.append((md5, chosen, kept))
+        if not plan:
+            return set()
+
+        def needs_read(fp):
+            return cache_key(fp) in cached
+
+        def size_of(fp):
+            return self.file_stats.get(fp, (None, None))[0]
+
+        to_read = [fp for _, chosen, kept in plan for fp in chosen if needs_read(fp)]
+        to_read += [kept[0] for _, _, kept in plan if all(needs_read(fp) for fp in kept)]
+        total = sum(size_of(fp) or 0 for fp in to_read)
+        done = [0]
+        cancel_event = threading.Event()
+        self.scan_cancelled = False
+        self.create_progress_window()
+        self.progress_window.title("Reconferindo Cópias")
+        self.progress_label.config(text="Relendo os arquivos cuja prova veio do cache...")
+        self.progress_window.update()
+        div = 1024 * 1024
+        current = {"fp": ""}
+
+        def on_bytes(n):
+            done[0] += n
+            self.update_progress(-(-done[0] // div), max(1, -(-total // div)), current["fp"], unit="MB")
+            if self.scan_cancelled:
+                cancel_event.set()
+
+        results = {}     # caminho -> True (MD5 confirmado) / False
+        fixes = {}       # caminho -> MD5 de verdade, para corrigir o cache
+
+        def confirmed(fp, md5):
+            if not needs_read(fp):
+                return True          # lido nesta varredura
+            if fp not in results:
+                size = size_of(fp)
+                current["fp"] = fp
+                ok = False
+                if size:
+                    ok, actual = verify_cached_proof(fp, size, md5, cancel_event, on_bytes)
+                    if not ok and actual:
+                        fixes[fp] = actual
+                results[fp] = ok
+                if not ok:
+                    log.warning("Prova do cache NÃO confirmada (conteúdo mudou sem mudar tamanho "
+                                "nem data?): %s", fp)
+            return results[fp]
+
+        stale = set()
+        try:
+            for md5, chosen, kept in plan:
+                # um mantido confirmado basta; os lidos nesta varredura vêm primeiro
+                kept_ok = any(confirmed(fp, md5) for fp in sorted(kept, key=needs_read))
+                for fp in chosen:
+                    if not kept_ok or not confirmed(fp, md5):
+                        stale.add(fp)
+        except ScanCancelled:
+            return None
+        finally:
+            self._close_progress_window()
+        # O que foi confirmado agora passa a valer como lido nesta sessão
+        for fp, ok in results.items():
+            if ok:
+                cached.discard(cache_key(fp))
+        if fixes and self.use_cache_var.get() == 1:
+            # Conserta o cache: a próxima varredura não repete o engano
+            fix_cache = FileHashCache()
+            try:
+                for fp, actual in fixes.items():
+                    size, mtime_ns = self.file_stats.get(fp, (None, None))
+                    fix_cache.store(fp, size, mtime_ns, md5=actual)
+            finally:
+                fix_cache.close()
+        return stale
+
+    @staticmethod
+    def _stale_note(stale):
+        return (f"\n{stale} arquivo(s) NÃO foram tocados: a prova de cópia exata vinha do cache e não "
+                "se confirmou ao reler agora (o conteúdo mudou sem mudar tamanho nem data). "
+                "Escaneie de novo sem o cache." if stale else "")
+
+    @staticmethod
+    def _changed_note(changed):
+        return (f"\n{changed} arquivo(s) mudaram depois da varredura e NÃO serão tocados "
+                "(a comparação valia para o conteúdo antigo; escaneie de novo)."
+                if changed else "")
 
     @staticmethod
     def _protected_note(protected):
@@ -4463,13 +5749,13 @@ class ImageCleaner:
         if last["type"] == "trash":
             messagebox.showinfo(
                 "Desfazer",
-                f"O último lote enviou {len(last['items'])} imagem(ns) para a Lixeira do Windows.\n"
-                "Para restaurá-las, abra a Lixeira, selecione os arquivos e use 'Restaurar'."
+                self._t(f"O último lote enviou {len(last['items'])} imagem(ns) para a Lixeira do Windows.\n"
+                        "Para restaurá-las, abra a Lixeira, selecione os arquivos e use 'Restaurar'.")
             )
             return
         if not messagebox.askyesno(
                 "Desfazer",
-                f"Devolver {len(last['items'])} imagem(ns) movida(s) para a pasta de origem?"):
+                self._t(f"Devolver {len(last['items'])} imagem(ns) movida(s) para a pasta de origem?")):
             return
         self.action_log.pop()
         by_path = {info['filepath']: info for data in self.group_check_vars.values()
@@ -4493,9 +5779,9 @@ class ImageCleaner:
                  "caminho": src, "destino": dst, "tamanho": ""} for _, src, dst in report_items]
         self.session_report.record(rows)
         self.render_page()
-        msg = f"{restored} imagem(ns) devolvida(s) à origem (e selecionada(s) de novo)."
+        msg = self._t(f"{restored} imagem(ns) devolvida(s) à origem (e selecionada(s) de novo).")
         if conflicts:
-            msg += f"\n{conflicts} não puderam ser devolvidas (arquivo já existe na origem ou sumiu do destino)."
+            msg += self._t(f"\n{conflicts} não puderam ser devolvidas (arquivo já existe na origem ou sumiu do destino).")
         if errors:
             msg += "\n\nErros:\n" + "\n".join(errors[:5])
         messagebox.showinfo("Desfazer", msg + self._report_note())
@@ -4529,8 +5815,16 @@ class ImageCleaner:
         moved_count = 0
         skipped_count = 0
         protected = 0
+        changed = 0
         errors = []
         batch = []
+
+        # Provas de "cópia exata" que vieram do cache são relidas agora
+        stale = self._stale_proofs(
+            im['filepath'] for d in self.group_check_vars.values() for im in d['images']
+            if im['var'].get() == 1 and not self._is_protected(im['filepath']))
+        if stale is None:
+            return   # reconferência cancelada: nada foi movido
 
         # Itera sobre todos os grupos
         for group_idx, group_data in self.group_check_vars.items():
@@ -4544,6 +5838,13 @@ class ImageCleaner:
                         protected += 1
                         img_info['var'].set(0)
                         log.warning("Bloqueado: tentativa de mover arquivo da referência: %s", filepath)
+                        continue
+                    if filepath in stale:
+                        img_info['var'].set(0)
+                        continue
+                    if self._changed_since_scan(img_info):
+                        changed += 1
+                        img_info['var'].set(0)
                         continue
                     try:
                         new_path = self._move_file(filepath, dest_folder)
@@ -4560,18 +5861,19 @@ class ImageCleaner:
         # Recarrega a página atual para atualizar a visualização
         self.render_page()
 
-        skipped_msg = (f"\n{skipped_count} imagem(ns) ignorada(s): já estavam na pasta de destino "
-                       f"(continuam selecionadas)." if skipped_count else "")
-        skipped_msg += self._protected_note(protected)
+        skipped_msg = self._t(f"\n{skipped_count} imagem(ns) ignorada(s): já estavam na pasta de destino "
+                              f"(continuam selecionadas)." if skipped_count else "")
+        skipped_msg += (self._t(self._protected_note(protected)) + self._changed_note(changed)
+                        + self._stale_note(len(stale)))
         undo_msg = "\n\nPara devolver: menu 'Mais' > 'Desfazer último lote'." if batch else ""
         if errors:
-            error_msg = (f"{moved_count} imagens movidas.{skipped_msg}\n\nErros:\n"
+            error_msg = (self._t(f"{moved_count} imagens movidas.") + f"{skipped_msg}\n\nErros:\n"
                          + "\n".join(errors[:5]))
             if len(errors) > 5:
                 error_msg += f"\n... e mais {len(errors) - 5} erros."
             messagebox.showwarning("Mover - Concluído com Erros", error_msg + undo_msg + self._report_note())
         else:
-            messagebox.showinfo("Mover", f"{moved_count} imagens movidas com sucesso!{skipped_msg}"
+            messagebox.showinfo("Mover", self._t(f"{moved_count} imagens movidas com sucesso!") + skipped_msg
                                 + undo_msg + self._report_note())
 
     def delete_all_selected(self):
@@ -4580,26 +5882,39 @@ class ImageCleaner:
         # o número prometido na confirmação tem que ser o número executado)
         selected_count = 0
         protected = 0
+        changed_paths = set()   # mudaram desde a varredura: a prova de "idêntico" caducou
         for group_data in self.group_check_vars.values():
             for img_info in group_data['images']:
                 if img_info['var'].get() == 1:
                     if self._is_protected(img_info['filepath']):
                         protected += 1
+                    elif self._changed_since_scan(img_info):
+                        changed_paths.add(img_info['filepath'])
                     else:
                         selected_count += 1
 
         if selected_count == 0:
-            messagebox.showinfo("Excluir", "Nenhuma imagem selecionada."
-                                + self._protected_note(protected))
+            messagebox.showinfo("Excluir", self._t("Nenhuma imagem selecionada."
+                                                   + self._protected_note(protected))
+                                + self._changed_note(len(changed_paths)))
             return
         if self._trash_refused():
             return
 
-        confirm = messagebox.askyesno("Excluir",
+        confirm = messagebox.askyesno("Excluir", self._t(
                                      f"Enviar {selected_count} imagens selecionadas para a Lixeira do Windows?"
-                                     + self._protected_note(protected))
+                                     + self._protected_note(protected)) + self._changed_note(len(changed_paths)))
         if not confirm:
             return
+
+        # Provas de "cópia exata" que vieram do cache são relidas agora, antes
+        # de qualquer arquivo ir para a Lixeira
+        stale = self._stale_proofs(
+            im['filepath'] for d in self.group_check_vars.values() for im in d['images']
+            if im['var'].get() == 1 and not self._is_protected(im['filepath'])
+            and im['filepath'] not in changed_paths)
+        if stale is None:
+            return   # reconferência cancelada: nada foi excluído
 
         deleted_count = 0
         errors = []
@@ -4617,6 +5932,11 @@ class ImageCleaner:
                         img_info['var'].set(0)
                         log.warning("Bloqueado: tentativa de excluir arquivo da referência: %s", filepath)
                         continue
+                    # o diálogo pode ter ficado aberto por minutos: confere de novo
+                    if (filepath in changed_paths or filepath in stale
+                            or self._changed_since_scan(img_info)):
+                        img_info['var'].set(0)
+                        continue
                     try:
                         trash_file(filepath)
                         deleted_count += 1
@@ -4630,14 +5950,16 @@ class ImageCleaner:
         self.render_page()
 
         if errors:
-            error_msg = (f"{deleted_count} imagens enviadas para a Lixeira.\n\nErros:\n"
+            error_msg = (self._t(f"{deleted_count} imagens enviadas para a Lixeira.") + "\n\nErros:\n"
                          + "\n".join(errors[:5]))
             if len(errors) > 5:
                 error_msg += f"\n... e mais {len(errors) - 5} erros."
-            messagebox.showwarning("Excluir - Concluído com Erros", error_msg + self._report_note())
+            messagebox.showwarning("Excluir - Concluído com Erros",
+                                   error_msg + self._stale_note(len(stale)) + self._report_note())
         else:
-            messagebox.showinfo("Excluir", f"{deleted_count} imagens enviadas para a Lixeira do Windows!"
-                                + self._protected_note(protected) + self._report_note())
+            messagebox.showinfo("Excluir", self._t(f"{deleted_count} imagens enviadas para a Lixeira do Windows!"
+                                                   + self._protected_note(protected))
+                                + self._stale_note(len(stale)) + self._report_note())
 
     @staticmethod
     def _move_file(filepath, dest_folder):
@@ -4682,15 +6004,27 @@ class ImageCleaner:
                 "Escolha outro destino."
             )
             return
-        moved = skipped = failed = protected = 0
+        moved = skipped = failed = protected = changed = 0
         batch = []
         group_idx = self._group_index_of(group)
+        files = any(is_file_kind(classify_file(fp)) for (fp, _, _) in group)
+        stale = self._stale_proofs(fp for (fp, _, _), var in zip(group, check_vars)
+                                   if var.get() == 1 and not self._is_protected(fp))
+        if stale is None:
+            return   # reconferência cancelada: nada foi movido
         for (filepath, _, _), var in zip(group, check_vars):
             if var.get() == 1:
                 if self._is_protected(filepath):
                     protected += 1
                     var.set(0)
                     log.warning("Bloqueado: tentativa de mover arquivo da referência: %s", filepath)
+                    continue
+                if filepath in stale:
+                    var.set(0)
+                    continue
+                if self._changed_since_scan(filepath):
+                    changed += 1
+                    var.set(0)
                     continue
                 try:
                     new_path = self._move_file(filepath, dest_folder)
@@ -4703,12 +6037,13 @@ class ImageCleaner:
                     failed += 1
                     log.warning("Erro ao mover %s: %s", filepath, e)
         self._record_batch("mover", batch)
-        msg = f"{moved} imagem(ns) movida(s)."
+        msg = self._t(f"{moved} imagem(ns) movida(s).", files=files)
         if skipped:
-            msg += f"\n{skipped} ignorada(s): já estavam na pasta de destino."
+            msg += self._t(f"\n{skipped} ignorada(s): já estavam na pasta de destino.", files=files)
         if failed:
             msg += f"\n{failed} com erro (detalhes no log)."
-        msg += self._protected_note(protected)
+        msg += (self._t(self._protected_note(protected), files=files) + self._changed_note(changed)
+                + self._stale_note(len(stale)))
         if batch:
             msg += "\n\nPara devolver: menu 'Mais' > 'Desfazer último lote'."
         messagebox.showinfo("Mover", msg + self._report_note())
@@ -4716,15 +6051,20 @@ class ImageCleaner:
     def delete_images(self, group, check_vars):
         selected_count = 0
         protected = 0
+        changed_paths = set()   # mudaram desde a varredura: a prova de "idêntico" caducou
+        files = any(is_file_kind(classify_file(fp)) for (fp, _, _) in group)
         for (filepath, _, _), var in zip(group, check_vars):
             if var.get() == 1:
                 if self._is_protected(filepath):
                     protected += 1
+                elif self._changed_since_scan(filepath):
+                    changed_paths.add(filepath)
                 else:
                     selected_count += 1
         if selected_count == 0:
-            messagebox.showinfo("Excluir", "Nenhuma imagem selecionada neste grupo."
-                                + self._protected_note(protected))
+            messagebox.showinfo("Excluir", self._t("Nenhuma imagem selecionada neste grupo."
+                                                   + self._protected_note(protected), files=files)
+                                + self._changed_note(len(changed_paths)))
             return
         if self._trash_refused():
             return
@@ -4732,11 +6072,16 @@ class ImageCleaner:
         # que não estão na faixa exibida no momento.
         confirm = messagebox.askyesno(
             "Excluir",
-            f"Enviar {selected_count} imagem(ns) selecionada(s) deste grupo para a Lixeira do Windows?"
-            + self._protected_note(protected)
+            self._t(f"Enviar {selected_count} imagem(ns) selecionada(s) deste grupo para a Lixeira do Windows?"
+                    + self._protected_note(protected), files=files) + self._changed_note(len(changed_paths))
         )
         if not confirm:
             return
+        stale = self._stale_proofs(fp for (fp, _, _), var in zip(group, check_vars)
+                                   if var.get() == 1 and not self._is_protected(fp)
+                                   and fp not in changed_paths)
+        if stale is None:
+            return   # reconferência cancelada: nada foi excluído
         deleted = failed = 0
         batch = []
         group_idx = self._group_index_of(group)
@@ -4745,6 +6090,10 @@ class ImageCleaner:
                 if self._is_protected(filepath):
                     var.set(0)
                     log.warning("Bloqueado: tentativa de excluir arquivo da referência: %s", filepath)
+                    continue
+                # o diálogo pode ter ficado aberto por minutos: confere de novo
+                if filepath in changed_paths or filepath in stale or self._changed_since_scan(filepath):
+                    var.set(0)
                     continue
                 try:
                     trash_file(filepath)
@@ -4755,10 +6104,11 @@ class ImageCleaner:
                     failed += 1
                     log.warning("Erro ao excluir %s: %s", filepath, e)
         self._record_batch("lixeira", batch)
-        msg = f"{deleted} imagem(ns) enviada(s) para a Lixeira do Windows."
+        msg = self._t(f"{deleted} imagem(ns) enviada(s) para a Lixeira do Windows.", files=files)
         if failed:
             msg += f"\n{failed} com erro (detalhes no log)."
-        messagebox.showinfo("Excluir", msg + self._protected_note(protected) + self._report_note())
+        messagebox.showinfo("Excluir", msg + self._t(self._protected_note(protected), files=files)
+                            + self._stale_note(len(stale)) + self._report_note())
 
 def _report_callback_exception(exc_type, exc_value, exc_tb):
     """Erros dentro de callbacks do Tk (cliques de botão etc.) iam para o stderr,
@@ -4775,13 +6125,16 @@ def _report_callback_exception(exc_type, exc_value, exc_tb):
         pass
 
 
-def run_selftest(folder, reference=None, confirm_similar=None, same_photo=None):
+def run_selftest(folder, reference=None, confirm_similar=None, same_photo=None,
+                 videos=False, others=False):
     """
     Modo de diagnóstico sem interface: `ImageCleaner.exe --selftest PASTA`
     ou `--selftest PASTA --ref REFERENCIA` (modo de comparação), opcionalmente
     com `--no-confirm` (desliga a confirmação de semelhantes por dhash;
     confirm_similar=None usa o padrão CONFIRM_SIMILAR) e `--no-same-photo`
-    (same_photo=None usa o padrão SAME_PHOTO_ENABLED).
+    (same_photo=None usa o padrão SAME_PHOTO_ENABLED). `--videos` e `--others`
+    ligam a comparação por bytes desses tipos (como as caixas da tela inicial);
+    o resumo ganha o trecho "| BYTES: ..." só quando há algo comparado por bytes.
     Roda o pipeline completo (listar, hash, agrupar, MD5) e escreve o resumo
     no log (e no console, quando houver). Útil para validar o executável e
     para diagnosticar problemas em campo. Não usa o cache e não altera nada.
@@ -4800,13 +6153,24 @@ def run_selftest(folder, reference=None, confirm_similar=None, same_photo=None):
             raise ValueError(f"Pastas em conflito: {reason}")
     t0 = time.time()
     log.info("SELFTEST em %s (threads=%d, draft=%s)", folder, HASH_WORKERS, USE_FAST_JPEG_DECODE)
-    entries = list_image_files(folder, True, VALID_EXTENSIONS)
+    accept = make_scan_accept(True, videos, others)
+    entries = list_image_files(folder, True, VALID_EXTENSIONS, accept=accept)
     ref_keys = set()
     if reference is not None:
-        ref_entries = list_image_files(reference, True, VALID_EXTENSIONS)
+        ref_entries = list_image_files(reference, True, VALID_EXTENSIONS, accept=accept)
         log.info("SELFTEST referência %s: %d arquivos", reference, len(ref_entries))
         entries, ref_keys = merge_scan_entries(entries, ref_entries)
+    # Como na interface: fotos no pipeline de aparência, o resto só por bytes
+    byte_entries = [e for e in entries if classify_file(e[0]) != KIND_PHOTO]
+    entries = [e for e in entries if classify_file(e[0]) == KIND_PHOTO]
     log.info("SELFTEST listagem: %d arquivos em %.1fs", len(entries), time.time() - t0)
+    byte_groups, byte_stats = [], None
+    if byte_entries:
+        b_idx, b_md5, byte_stats, _ = find_identical_files(
+            byte_entries, None, HASH_WORKERS,
+            reference_keys=ref_keys if reference is not None else None)
+        byte_groups = build_byte_groups(byte_entries, b_idx, b_md5)
+        log.info("SELFTEST bytes: %s", {k: v for k, v in byte_stats.items() if k != "errors"})
     results, errors_by_idx, _ = hash_files(entries, None, HASH_WORKERS)
     images_data = [r for r in results if r is not None]
     log.info("SELFTEST hash: %d ok, %d erros em %.1fs", len(images_data), len(errors_by_idx), time.time() - t0)
@@ -4891,6 +6255,20 @@ def run_selftest(folder, reference=None, confirm_similar=None, same_photo=None):
                     f"{n_sel_ident} selecionáveis (idênticas), {n_sel_simil} (semelhantes)")
         if sp_stats is not None:
             summary += f", {n_sel_same} (mesma foto)"
+    if byte_stats is not None:
+        n_sel_bytes = 0
+        byte_mtime = {fp: mt / 1e9 for (fp, _, mt) in byte_entries if mt is not None}
+        for g in byte_groups:
+            images = [{'filepath': fp, 'md5': m, 'is_reference': cache_key(fp) in ref_keys,
+                       'mtime': byte_mtime.get(fp, float("inf"))} for (fp, _, m) in g]
+            sel = plan_identical_selection(images)
+            for i in sel:
+                assert not images[i]['is_reference'], \
+                    f"BUG: arquivo da referência selecionado: {images[i]['filepath']}"
+            n_sel_bytes += len(sel)
+        summary += (f" | BYTES: {byte_stats['files']} arquivos, {byte_stats['groups']} grupos, "
+                    f"{byte_stats['identical_files']} idênticos, {n_sel_bytes} selecionáveis, "
+                    f"{format_bytes(byte_stats['bytes_read'])} lidos, {len(byte_stats['errors'])} erros")
     log.info(summary)
     return summary
 
@@ -4901,6 +6279,7 @@ if __name__ == "__main__":
             reference = None
             confirm_similar = None
             same_photo = None
+            videos = others = False
             extra = sys.argv[3:]
             while extra:
                 opt = extra.pop(0)
@@ -4912,10 +6291,15 @@ if __name__ == "__main__":
                     same_photo = False
                 elif opt == "--same-photo":
                     same_photo = True
+                elif opt == "--videos":
+                    videos = True
+                elif opt == "--others":
+                    others = True
                 else:
                     raise ValueError(f"Opção desconhecida: {opt} (uso: --selftest PASTA "
-                                     "[--ref REFERENCIA] [--no-confirm] [--same-photo | --no-same-photo])")
-            result = run_selftest(sys.argv[2], reference, confirm_similar, same_photo)
+                                     "[--ref REFERENCIA] [--no-confirm] [--same-photo | --no-same-photo] "
+                                     "[--videos] [--others])")
+            result = run_selftest(sys.argv[2], reference, confirm_similar, same_photo, videos, others)
             code = 0
         except (FileNotFoundError, ValueError) as e:
             log.error("SELFTEST: %s", e)
