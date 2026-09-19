@@ -305,6 +305,33 @@ Na tela inicial: **Fotos** (ligada por padrão), **Vídeos** e **Outros arquivos
 - Módulos ao lado do `main.py` (o PyInstaller recolhe sozinho): `shellthumb.py` (miniatura
   do Explorer via ctypes) e `mp4probe.py` (cabeçalho de MP4/MOV em Python puro).
 
+### "Mesmo vídeo" (opcional, precisa do ffmpeg)
+Com **Vídeos** marcado e o ffmpeg na máquina, a caixa "Detectar 'Mesmo vídeo'" acha o mesmo
+vídeo e o mesmo áudio guardados em arquivos **diferentes**: convertido de MP4 para MOV ou MKV
+sem recomprimir, ou com datas e metadados regravados. A comparação por bytes não pega esses
+casos. Vídeo recomprimido (reenviado pelo WhatsApp) **não** entra: os dados mudam.
+- **ffmpeg**: o programa procura sozinho, nesta ordem: caminho salvo, pasta do programa (e
+  `ffmpeg\bin` dentro dela), PATH, `C:\ffmpeg\bin`, Arquivos de Programas, WinGet, Chocolatey
+  e Scoop. A linha ao lado da caixa mostra o que foi achado; **Localizar...** aponta o
+  `ffmpeg.exe` à mão (só é aceito e salvo se `ffmpeg -version` funcionar). Sem ffmpeg, tudo
+  o mais funciona igual. Quem só usa Fotos nunca dispara o ffmpeg.
+- **Prova**: o hash dos pacotes de vídeo e de áudio (`ffmpeg -c copy -f streamhash`), sem
+  decodificar. Trilhas de dados e legendas ficam de fora (o iPhone grava trilhas de metadados
+  que um remux descarta).
+- **Custo**: só iniciar o ffmpeg leva ~0,9 s, então ele nunca é pré-filtro. O `mp4probe.py`
+  lê dimensões, codec e duração em milissegundos, e só viram candidatos os vídeos de mesmas
+  dimensões e codec com duração a menos de `SAME_VIDEO_DURATION_TOL` (0,1 s; medido: um remux
+  muda a duração em 0 a 0,034 s). Duração desconhecida (MP4 fragmentado) é coringa. MKV, AVI
+  e afins são lidos pelo `ffprobe`, se ele estiver ao lado do ffmpeg. Num acervo real de 179
+  vídeos (32 GB): 32 candidatos, 3,8 s.
+- Na tela de grupos: etiqueta **MESMO VÍDEO**, botões "Selecionar Mesmo vídeo" e "Selecionar
+  Todos Mesmo Vídeo" (mantêm o arquivo mais antigo de cada grupo; no empate, o maior; com
+  referência no grupo, saem todos os do alvo). Cópias exatas continuam "Cópia exata" dentro
+  do mesmo grupo.
+- Como no resto: prova vinda do cache é **refeita pelo ffmpeg antes de mover ou excluir**.
+- `--selftest PASTA --videos` inclui o estágio (trecho `| MESMO VIDEO: ...`); `--no-same-video`
+  desliga. Módulo: `ffmpegtools.py`.
+
 ### Live Photos do iPhone (foto + vídeo .MOV com o mesmo nome)
 Uma Live Photo são dois arquivos na mesma pasta: `IMG_1234.JPG` (ou `.HEIC`) e `IMG_1234.MOV`.
 Tirar a foto duplicada deixaria o vídeo dela órfão. O app reconhece o par pela marca que o

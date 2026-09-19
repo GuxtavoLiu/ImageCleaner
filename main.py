@@ -22,6 +22,7 @@ import numpy as np
 from datetime import datetime
 
 # Módulos-folha do próprio projeto (não importam nada daqui)
+import ffmpegtools
 import mp4probe
 import shellthumb
 
@@ -338,6 +339,7 @@ def extension_plate(filepath, kind, width, height):
 BADGE_STYLES = {
     "mesma foto": ("#004D40", "#B2DFDB"),
     "live photo": ("#4A148C", "#E1BEE7"),
+    "mesmo vídeo": ("#01579B", "#B3E5FC"),
     "maior resolução": ("#1B5E20", "#C8E6C9"),
     "mais antiga": ("#0D47A1", "#BBDEFB"),
     "maior arquivo": ("#424242", "#EEEEEE"),
@@ -546,6 +548,8 @@ DEFAULT_SETTINGS = {
     "scan_photos": 1,            # tipos procurados (caixas da tela inicial)
     "scan_videos": 0,
     "scan_others": 0,
+    "same_video": 1,             # "Mesmo vídeo" (só age com Vídeos marcado e ffmpeg encontrado)
+    "ffmpeg_path": "",           # escolhido à mão em "Localizar..."; vazio = busca automática
 }
 RECENT_LIMIT = 5
 
@@ -2394,6 +2398,261 @@ def orphaned_live_photos(selected_paths, selected_keys):
 
 
 # ---------------------------------------------------------------------------
+# "Mesmo vídeo": o mesmo vídeo e o mesmo áudio em arquivos DIFERENTES (remux
+# MP4 -> MOV/MKV, metadados ou datas regravados). Precisa do ffmpeg (opcional).
+# A prova é o hash dos pacotes de vídeo e de áudio (ffmpegtools.stream_hashes),
+# que lê o arquivo inteiro: por isso só é calculado para candidatos de mesmas
+# dimensões, mesmo codec e duração quase igual, achados sem ffmpeg (mp4probe).
+# ---------------------------------------------------------------------------
+# Folga da duração entre candidatos, em segundos. Medido em vídeos reais de iPhone:
+# um remux (MP4, MOV, MKV, faststart) muda a duração do cabeçalho em 0 a 0,034 s.
+# 0,1 dá o triplo de margem; cada décimo a mais quase dobra os candidatos (e o
+# custo: 32 candidatos com 0,1 contra 90 com 0,5 num acervo de 179 vídeos).
+SAME_VIDEO_DURATION_TOL = 0.1
+SAME_VIDEO_TOOLTIP = ("Mesmo vídeo: exatamente o mesmo vídeo e o mesmo áudio guardados em arquivos\n"
+                      "diferentes (convertido de MP4 para MOV ou MKV sem recomprimir, ou com datas e\n"
+                      "metadados regravados). A comparação por bytes não pega esses casos.\n"
+                      "Precisa do ffmpeg, que é opcional: o programa procura sozinho (pasta do\n"
+                      "programa, PATH, C:\\ffmpeg, Arquivos de Programas, WinGet, Chocolatey, Scoop).\n"
+                      "Se não achar, use 'Localizar...' e aponte o ffmpeg.exe. Sem ffmpeg, só as\n"
+                      "cópias exatas de vídeo são detectadas.\n"
+                      "Vídeo recomprimido (ex.: reenviado pelo WhatsApp) NÃO entra: os dados mudam.\n"
+                      "O botão mantém o arquivo mais antigo de cada grupo e seleciona os outros.")
+_CODEC_ALIASES = {"avc1": "h264", "avc3": "h264", "hvc1": "hevc", "hev1": "hevc", "h265": "hevc",
+                  "mp4v": "mpeg4", "jpeg": "mjpeg", "mjpa": "mjpeg", "vp09": "vp9", "av01": "av1",
+                  "s263": "h263", "dvh1": "hevc", "dvhe": "hevc"}
+
+
+def _new_same_video_stats():
+    return {"videos": 0, "probed": 0, "candidates": 0, "hashed": 0, "merged_groups": 0,
+            "files_in_merged": 0, "errors": [], "stream_from_cache": []}
+
+
+def same_video_candidates(infos):
+    """
+    infos: {rep: dict com width, height, codec, duration (ou None)}. Devolve o
+    set de reps que valem o custo do hash de fluxos: no mesmo balde (dimensões
+    + codec) há outro de duração a menos de SAME_VIDEO_DURATION_TOL. Duração
+    desconhecida (MP4 fragmentado tem 0 no cabeçalho) é coringa: compara com
+    o balde inteiro.
+    """
+    buckets = {}
+    for rep, info in infos.items():
+        if info and info.get("width") and info.get("height"):
+            codec = _CODEC_ALIASES.get((info.get("codec") or "").lower(), (info.get("codec") or "").lower())
+            buckets.setdefault((info["width"], info["height"], codec), []).append(rep)
+    out = set()
+    for reps in buckets.values():
+        if len(reps) < 2:
+            continue
+        if any(not infos[r].get("duration") for r in reps):
+            out.update(reps)
+            continue
+        ordered = sorted(reps, key=lambda r: infos[r]["duration"])
+        for a, b in zip(ordered, ordered[1:]):
+            if infos[b]["duration"] - infos[a]["duration"] <= SAME_VIDEO_DURATION_TOL:
+                out.update((a, b))
+    return out
+
+
+def find_same_videos(entries, groups_idx, md5_by_idx, ffmpeg_path, ffprobe_path=None, cache=None,
+                     workers=HASH_WORKERS, reference_keys=None, hide_target_only=False,
+                     progress_cb=None, phase_cb=None, cancel_check=None):
+    """
+    Junta aos grupos de bytes os vídeos com os MESMOS fluxos em arquivos
+    diferentes. entries/groups_idx/md5_by_idx: os de find_identical_files.
+    Arquivos de bytes idênticos dividem um hash de fluxos (um representante
+    por classe de MD5); vídeos sem nenhuma cópia exata também entram.
+
+    Retorna (groups_idx, md5_by_idx, same_video_idx, stream_by_idx, stats,
+    cancelled): os grupos novos substituem os antigos (um grupo unido absorve
+    os grupos de bytes das suas classes); md5_by_idx ganha uma sentinela única
+    ("SIZE:...") para quem entrou sem cópia exata (nunca vira "Idêntica");
+    same_video_idx = índices dos membros de grupos unidos; stream_by_idx = o
+    hash de fluxos de cada um deles.
+    """
+    stats = _new_same_video_stats()
+    cancel_event = threading.Event()
+    videos = [i for i, (fp, size, _) in enumerate(entries) if size and classify_file(fp) == KIND_VIDEO]
+    stats["videos"] = len(videos)
+    unchanged = (groups_idx, md5_by_idx, set(), {}, stats, False)
+    if len(videos) < 2 or not ffmpeg_path:
+        return unchanged
+
+    # Um representante por classe de bytes (os idênticos têm os mesmos fluxos)
+    class_of = {}
+    for i in videos:
+        class_of[i] = md5_by_idx.get(i) or ("solo", i)
+    members = {}
+    for i in videos:
+        members.setdefault(class_of[i], []).append(i)
+    reps = [m[0] for m in members.values()]
+    if len(reps) < 2:
+        return unchanged
+    cached = cache.lookup_many([entries[i] for i in reps]) if cache is not None else {}
+
+    def run_stage(phase, todo, job, store):
+        results = {}
+        if not todo:
+            return results
+        total = sum(entries[i][1] for i in todo)
+        state = {"done": 0, "current": ""}
+        if phase_cb:
+            phase_cb(phase, len(todo), total)
+
+        def worker(i):
+            state["current"] = entries[i][0]
+            try:
+                return i, job(i), None
+            except Exception as e:
+                return i, None, e
+
+        def on_result(result):
+            i, value, err = result
+            state["done"] += entries[i][1]
+            if err is not None:
+                stats["errors"].append({'filepath': entries[i][0], 'message': str(err)})
+            elif value is not None:
+                results[i] = value
+                store(i, value)
+
+        def tick():
+            if progress_cb:
+                progress_cb(min(state["done"], total), total, state["current"])
+            if cancel_check and cancel_check():
+                cancel_event.set()
+
+        # O custo de um vídeo pequeno é quase só iniciar o ffmpeg (~0,9 s): esses
+        # rodam com todos os workers; os grandes, com poucos (leitura longa em HD)
+        small = [i for i in todo if phase == "probe" or entries[i][1] < BYTE_LARGE_FILE]
+        small_set = set(small)
+        large = [i for i in todo if i not in small_set]
+        for batch, n_workers in ((small, workers), (large, min(workers, BYTE_LARGE_WORKERS))):
+            if batch and not cancel_event.is_set():
+                _run_parallel_ticking(batch, worker, on_result, n_workers, tick, cancel_event)
+        tick()
+        return results
+
+    try:
+        # 1) Cabeçalho: dimensões, codec e duração (mp4probe; ffprobe para o que ele não lê)
+        infos, todo = {}, []
+        for i in reps:
+            raw = (cached.get(entries[i][0]) or {}).get("probe")
+            try:
+                infos[i] = json.loads(raw) if raw else None
+            except ValueError:
+                infos[i] = None
+            if infos[i] is None:
+                todo.append(i)
+
+        def probe_job(i):
+            fp = entries[i][0]
+            if os.path.splitext(fp)[1].lower() in mp4probe.MP4_EXTENSIONS:
+                info = mp4probe.probe(fp)
+            elif ffprobe_path:
+                info = ffmpegtools.probe_video(ffprobe_path, fp, cancel_event) or {}
+            else:
+                info = {}
+            return {k: info.get(k) for k in ("duration", "width", "height", "codec")}
+
+        def probe_store(i, info):
+            if cache is not None:
+                cache.store(*entries[i], probe=json.dumps(info))
+
+        infos.update(run_stage("probe", todo, probe_job, probe_store))
+        stats["probed"] = len(todo)
+        if cancel_event.is_set():
+            return groups_idx, md5_by_idx, set(), {}, stats, True
+
+        # 2) Hash dos fluxos só dos candidatos
+        candidates = sorted(same_video_candidates(infos))
+        stats["candidates"] = len(candidates)
+        stream_by_rep, todo, from_cache = {}, [], set()
+        for i in candidates:
+            value = (cached.get(entries[i][0]) or {}).get("stream")
+            if value:
+                stream_by_rep[i] = value
+                from_cache.add(i)
+            else:
+                todo.append(i)
+
+        def stream_job(i):
+            before = _stat_before_read(entries[i][0], entries[i][1], entries[i][2])
+            value = ffmpegtools.stream_hashes(ffmpeg_path, entries[i][0], cancel_event)
+            if value is not None:
+                _check_unchanged(entries[i][0], before)
+            return value
+
+        def stream_store(i, value):
+            if cache is not None:
+                cache.store(*entries[i], stream=value)
+
+        stream_by_rep.update(run_stage("stream", todo, stream_job, stream_store))
+        stats["hashed"] = len(todo)
+        if cancel_event.is_set():
+            return groups_idx, md5_by_idx, set(), {}, stats, True
+
+        # 3) Classes de bytes com o mesmo hash de fluxos viram um grupo só
+        by_stream = {}
+        for rep, value in stream_by_rep.items():
+            by_stream.setdefault(value, []).append(rep)
+        merged, absorbed = [], set()
+        for value, same in by_stream.items():
+            if len(same) < 2:
+                continue
+            group = sorted(i for rep in same for i in members[class_of[rep]])
+            merged.append((group, value))
+            absorbed.update(group)
+        if not merged:
+            return unchanged
+        new_md5 = dict(md5_by_idx)
+        same_video_idx, stream_by_idx, out_groups = set(), {}, []
+        for group in groups_idx:
+            if not any(i in absorbed for i in group):
+                out_groups.append(group)
+        for group, value in merged:
+            out_groups.append(group)
+        if reference_keys is not None:
+            out_groups = filter_groups_for_reference(out_groups, entries, reference_keys,
+                                                     hide_target_only=hide_target_only)
+        kept = {id(g) for g in out_groups}
+        for group, value in merged:
+            if id(group) not in kept:
+                continue
+            stats["merged_groups"] += 1
+            stats["files_in_merged"] += len(group)
+            for i in group:
+                same_video_idx.add(i)
+                stream_by_idx[i] = value
+                new_md5.setdefault(i, f"SIZE:{entries[i][1]}:{i}")   # sem cópia exata: nunca "Idêntica"
+                if any(rep in from_cache for rep in members[class_of[i]]):
+                    stats["stream_from_cache"].append(entries[i][0])
+        out_groups.sort(key=lambda g: g[0])
+        return (out_groups, {i: new_md5[i] for g in out_groups for i in g}, same_video_idx,
+                stream_by_idx, stats, False)
+    finally:
+        if cache is not None:
+            cache.flush()
+
+
+def plan_same_video_selection(images):
+    """
+    Botão "Selecionar Mesmo vídeo": num grupo unido todos os arquivos têm o
+    mesmo vídeo e o mesmo áudio. Mantém UM (o mais antigo; no empate, o maior)
+    e seleciona os outros. Com arquivo da referência no grupo, seleciona todos
+    os do alvo. Nunca devolve referência.
+    """
+    idxs = [i for i, img in enumerate(images) if img.get('same_video')]
+    if len(idxs) < 2:
+        return []
+    targets = [i for i in idxs if not images[i].get('is_reference')]
+    if len(targets) < len(idxs):
+        return targets
+    keep = min(targets, key=lambda i: keep_sort_key(images[i], i, ("mtime", "size")))
+    return [i for i in targets if i != keep]
+
+
+# ---------------------------------------------------------------------------
 # Confirmação de "Semelhante" por segundo hash (dhash): pós-filtro dos grupos
 # ---------------------------------------------------------------------------
 
@@ -3065,11 +3324,14 @@ def same_photo_stage(images_data, stats, groups_idx, md5_by_idx, dhash_by_idx,
 
 
 def image_status(info, md5_count):
-    """'Idêntica' (MD5 repetido no grupo) > 'Mesma foto' (classe) > 'Semelhante'."""
+    """'Idêntica' (MD5 repetido no grupo) > 'Mesma foto' (classe) > 'Mesmo vídeo'
+       (mesmos fluxos, arquivo diferente) > 'Semelhante'."""
     if md5_count.get(info['md5'], 0) > 1:
         return "Idêntica"
     if info.get('same_photo') is not None:
         return "Mesma foto"
+    if info.get('same_video'):
+        return "Mesmo vídeo"
     return "Semelhante"
 
 
@@ -3124,6 +3386,12 @@ class ImageCleaner:
         self.byte_stats = None
         self.byte_entry_count = 0
         self.byte_cached_proof = set()
+        self.byte_same_video = set()    # cache_key dos membros de grupos "Mesmo vídeo"
+        self.byte_stream = {}           # cache_key -> hash de fluxos (para reconferir)
+        self.byte_cached_stream = set() # cache_key cuja prova de fluxos veio do cache
+        self.same_video_stats = None
+        self.ffmpeg_path = None         # achado na máquina (ou escolhido à mão)
+        self.ffmpeg_version = None      # None = ainda não validado; "" = não funciona
         self.session_report = SessionReport()   # CSV criado no primeiro registro
         self.action_log = []            # lotes de ações desta sessão (para "Desfazer")
         self.settings = load_settings()
@@ -3141,6 +3409,8 @@ class ImageCleaner:
         self.scan_photos_var.set(st["scan_photos"])
         self.scan_videos_var.set(st["scan_videos"])
         self.scan_others_var.set(st["scan_others"])
+        self.same_video_var.set(st["same_video"])
+        self.ffmpeg_path = ffmpegtools.find_ffmpeg(st["ffmpeg_path"] or None, self._app_dir())
         self._on_kinds_changed()
         targets = [f for f in st["recent_targets"] if os.path.isdir(f)]
         refs = [f for f in st["recent_references"] if os.path.isdir(f)]
@@ -3160,6 +3430,7 @@ class ImageCleaner:
         st["scan_photos"] = self.scan_photos_var.get()
         st["scan_videos"] = self.scan_videos_var.get()
         st["scan_others"] = self.scan_others_var.get()
+        st["same_video"] = self.same_video_var.get()
         if self.selected_folder:
             st["recent_targets"] = push_recent(st["recent_targets"], self.selected_folder)
         if self.reference_folder:
@@ -3178,8 +3449,8 @@ class ImageCleaner:
     def create_widgets(self):
         # Janela inicial: tamanho decente e centralizada (só aparência; o
         # fluxo de botões/opções abaixo é o mesmo de sempre).
-        width, height = 700, 620
-        self.master.minsize(660, 580)
+        width, height = 700, 650
+        self.master.minsize(660, 610)
         try:
             sw = self.master.winfo_screenwidth()
             sh = self.master.winfo_screenheight()
@@ -3221,6 +3492,8 @@ class ImageCleaner:
         self.subfolder_frame = tk.Frame(self.master)
         kinds_row = tk.Frame(self.subfolder_frame)
         kinds_row.pack(anchor="w", pady=(0, 4))
+        video_row = tk.Frame(self.subfolder_frame)
+        video_row.pack(anchor="w", pady=(0, 4))
         options_row1 = tk.Frame(self.subfolder_frame)
         options_row1.pack(anchor="w")
         options_row2 = tk.Frame(self.subfolder_frame)
@@ -3250,6 +3523,21 @@ class ImageCleaner:
                             "Cuidado com 'Outros' em pastas de programas ou de projetos: eles\n"
                             "têm muitos arquivos iguais de propósito, e apagar um deles pode\n"
                             "quebrar o programa. Use em pastas de documentos e acervos.")
+
+        # "Mesmo vídeo": precisa do ffmpeg (opcional). O programa procura sozinho;
+        # "Localizar..." aponta o ffmpeg.exe à mão quando a busca não acha.
+        self.same_video_var = tk.IntVar(value=1)
+        self.same_video_check = tk.Checkbutton(video_row, text="Detectar 'Mesmo vídeo'",
+                                               variable=self.same_video_var, state="disabled")
+        self.same_video_check.pack(side="left", padx=(20, 0))
+        self.ffmpeg_label = tk.Label(video_row, text="", fg=PALETTE["muted"])
+        self.ffmpeg_label.pack(side="left", padx=(6, 0))
+        self.ffmpeg_btn = make_button(video_row, "Localizar...", "light", command=self.locate_ffmpeg,
+                                      pady=1, state="disabled")
+        self.ffmpeg_btn.pack(side="left", padx=(6, 0))
+        self.ffmpeg_info_label = tk.Label(video_row, text="ℹ️", fg="blue", cursor="hand2")
+        self.ffmpeg_info_label.pack(side="left", padx=5)
+        self.create_tooltip(self.ffmpeg_info_label, SAME_VIDEO_TOOLTIP)
 
         # Checkbox para escanear subpastas (marcada por padrão)
         self.scan_subfolders_var = tk.IntVar(value=1)
@@ -3369,13 +3657,105 @@ class ImageCleaner:
                 self.scan_others_var.get() == 1)
 
     def _on_kinds_changed(self):
-        """As opções de 2º hash e 'Mesma foto' só fazem sentido com Fotos."""
+        """As opções de 2º hash e 'Mesma foto' só fazem sentido com Fotos; a de
+           'Mesmo vídeo', com Vídeos (e é aí que o ffmpeg passa a interessar)."""
         state = "normal" if self.scan_photos_var.get() == 1 else "disabled"
         for chk in (self.confirm_check, self.same_photo_check):
             try:
                 chk.config(state=state)
             except tk.TclError:
                 pass
+        self._refresh_ffmpeg_status()
+
+    @staticmethod
+    def _app_dir():
+        """Pasta do programa (do .exe empacotado ou do main.py)."""
+        if getattr(sys, "frozen", False):
+            return os.path.dirname(sys.executable)
+        return os.path.dirname(os.path.abspath(__file__))
+
+    def _refresh_ffmpeg_status(self):
+        """Linha do ffmpeg na tela inicial. Só com Vídeos marcado o ffmpeg é
+           validado (roda `-version` numa thread: leva ~1 s); quem só usa Fotos
+           nunca dispara processo nenhum."""
+        videos = self.scan_videos_var.get() == 1
+        try:
+            self.ffmpeg_btn.config(state="normal" if videos else "disabled")
+            if not videos:
+                self.same_video_check.config(state="disabled")
+                self.ffmpeg_label.config(text="(marque Vídeos)", fg=PALETTE["muted"])
+                return
+            if not self.ffmpeg_path:
+                self.same_video_check.config(state="disabled")
+                self.ffmpeg_label.config(text="ffmpeg não encontrado: só cópias exatas", fg="#B26A00")
+                return
+            if self.ffmpeg_version is None:
+                self.same_video_check.config(state="disabled")
+                self.ffmpeg_label.config(text="conferindo o ffmpeg...", fg=PALETTE["muted"])
+                self._validate_ffmpeg_async()
+                return
+            if not self.ffmpeg_version:
+                self.same_video_check.config(state="disabled")
+                self.ffmpeg_label.config(text="o ffmpeg encontrado não funciona", fg="#B26A00")
+                return
+            self.same_video_check.config(state="normal")
+            short = self.ffmpeg_version.split("-")[0][:18]      # "8.1.1-full_build-www..." -> "8.1.1"
+            self.ffmpeg_label.config(text=f"ffmpeg {short} encontrado", fg=PALETTE["primary"])
+        except tk.TclError:
+            pass
+
+    def _validate_ffmpeg_async(self):
+        if getattr(self, '_ffmpeg_check_running', False):
+            return
+        self._ffmpeg_check_running = True
+        path = self.ffmpeg_path
+        box = {}
+
+        def work():
+            box["version"] = ffmpegtools.check_version(path) or ""
+
+        threading.Thread(target=work, name="ffmpeg-version", daemon=True).start()
+
+        def poll():
+            if "version" not in box:
+                try:
+                    self.master.after(150, poll)
+                except tk.TclError:
+                    self._ffmpeg_check_running = False
+                return
+            self._ffmpeg_check_running = False
+            if path == self.ffmpeg_path:
+                self.ffmpeg_version = box["version"]
+                log.info("ffmpeg: %s -> %s", path, self.ffmpeg_version or "não funciona")
+            self._refresh_ffmpeg_status()
+
+        poll()
+
+    def locate_ffmpeg(self):
+        """Aponta o ffmpeg.exe à mão; só é aceito (e salvo) se funcionar."""
+        chosen = filedialog.askopenfilename(
+            title="Onde está o ffmpeg.exe?",
+            filetypes=[("ffmpeg", "ffmpeg.exe ffmpeg"), ("Todos os arquivos", "*.*")])
+        if not chosen:
+            return
+        version = ffmpegtools.check_version(chosen)
+        if not version:
+            messagebox.showerror("ffmpeg", f"Este arquivo não é um ffmpeg que funciona:\n{chosen}")
+            return
+        self.ffmpeg_path = os.path.normpath(chosen)
+        self.ffmpeg_version = version
+        self.settings["ffmpeg_path"] = self.ffmpeg_path
+        save_settings(self.settings)
+        self._refresh_ffmpeg_status()
+
+    def _same_video_ready(self):
+        """ffmpeg pronto para o estágio 'Mesmo vídeo' desta varredura? (valida na
+           hora se a checagem em segundo plano ainda não terminou)"""
+        if self.scan_videos_var.get() != 1 or self.same_video_var.get() != 1 or not self.ffmpeg_path:
+            return False
+        if self.ffmpeg_version is None:
+            self.ffmpeg_version = ffmpegtools.check_version(self.ffmpeg_path) or ""
+        return bool(self.ffmpeg_version)
 
     def _make_recent_menubutton(self, parent, key, apply):
         mb = tk.Menubutton(parent, text="Recentes ▾", relief="flat", bg="#E0E0E0",
@@ -3655,6 +4035,10 @@ class ImageCleaner:
         self.byte_stats = None
         self.byte_entry_count = 0       # quantos arquivos foram para a comparação por bytes
         self.byte_cached_proof = set()  # cache_key dos agrupados cuja prova veio do cache
+        self.byte_same_video = set()
+        self.byte_stream = {}
+        self.byte_cached_stream = set()
+        self.same_video_stats = None
         ref = self.reference_folder
         scan_started = time.time()
         log.info("Iniciando escaneamento de: %s (subpastas=%s, cache=%s, threads=%d, "
@@ -3836,6 +4220,8 @@ class ImageCleaner:
         t0 = time.time()
         self.progress_window.title("Comparando Arquivos")
         phase_text = {
+            "probe": "Lendo o cabeçalho dos vídeos (dimensões, duração)...",
+            "stream": "Comparando o vídeo e o áudio dos candidatos a 'Mesmo vídeo' (ffmpeg)...",
             "head": "Comparando o começo dos arquivos de mesmo tamanho...",
             "quick": "Comparando o meio e o fim dos que empataram no começo...",
             "full": "Conferindo o conteúdo inteiro dos candidatos a cópia exata...",
@@ -3862,12 +4248,21 @@ class ImageCleaner:
                 pass
 
         cache = FileHashCache() if use_cache else None
+        ref_keys = self.reference_keys if self.reference_folder else None
+        hide_target_only = self.show_target_only_var.get() == 0
+        same_idx, stream_by_idx, sv_stats = set(), {}, None
         try:
             groups_idx, md5_by_idx, stats, cancelled = find_identical_files(
-                byte_entries, cache, HASH_WORKERS,
-                reference_keys=self.reference_keys if self.reference_folder else None,
-                hide_target_only=self.show_target_only_var.get() == 0,
+                byte_entries, cache, HASH_WORKERS, reference_keys=ref_keys,
+                hide_target_only=hide_target_only,
                 progress_cb=on_progress, phase_cb=on_phase, cancel_check=cancel_check)
+            if not (cancelled or self.scan_cancelled) and self._same_video_ready():
+                # "Mesmo vídeo": mesmos fluxos em arquivos diferentes (só com ffmpeg)
+                groups_idx, md5_by_idx, same_idx, stream_by_idx, sv_stats, cancelled = find_same_videos(
+                    byte_entries, groups_idx, md5_by_idx, self.ffmpeg_path,
+                    ffmpegtools.ffprobe_beside(self.ffmpeg_path), cache, HASH_WORKERS,
+                    reference_keys=ref_keys, hide_target_only=hide_target_only,
+                    progress_cb=on_progress, phase_cb=on_phase, cancel_check=cancel_check)
         finally:
             if cache is not None:
                 cache.close()
@@ -3875,6 +4270,13 @@ class ImageCleaner:
         if cancelled or self.scan_cancelled:
             return True
         self.byte_groups = build_byte_groups(byte_entries, groups_idx, md5_by_idx)
+        self.same_video_stats = sv_stats
+        self.byte_same_video = {cache_key(byte_entries[i][0]) for i in same_idx}
+        self.byte_stream = {cache_key(byte_entries[i][0]): v for i, v in stream_by_idx.items()}
+        self.byte_cached_stream = {cache_key(fp) for fp in (sv_stats or {}).get("stream_from_cache", [])}
+        if sv_stats:
+            stats["groups"] = len(groups_idx)     # o resumo conta os grupos como ficaram
+            log.info("Mesmo vídeo: %s", {k: v for k, v in sv_stats.items() if k != "errors"})
         # Provas que vieram do cache (não foram lidas nesta rodada): são
         # reconferidas na hora de mover/excluir (ver _verify_cached_proofs)
         self.byte_cached_proof = {cache_key(fp) for fp in stats["md5_from_cache"]}
@@ -4380,6 +4782,8 @@ class ImageCleaner:
                     # KIND_PHOTO = imagem que o Pillow abre; o resto veio da
                     # comparação por bytes (miniatura do Explorer, sem resolução)
                     'kind': classify_file(filepath),
+                    # mesmos fluxos de vídeo e áudio que os outros do grupo (ffmpeg)
+                    'same_video': cache_key(filepath) in self.byte_same_video,
                     'var': var,
                     'mtime': self._get_mtime(filepath),
                     # True só no modo comparação, para arquivos vindos da
@@ -4469,6 +4873,12 @@ class ImageCleaner:
                                    command=self.select_same_photo_images)
             btn_same.pack(side="left", padx=5)
             self.create_tooltip(btn_same, SAME_PHOTO_RULE_TOOLTIP)
+
+        if self.byte_same_video:
+            btn_video = make_button(top_frame, "Selecionar Todos Mesmo Vídeo", "same",
+                                    command=self.select_same_video_images)
+            btn_video.pack(side="left", padx=5)
+            self.create_tooltip(btn_video, SAME_VIDEO_TOOLTIP)
 
         # Botões de ação global
         btn_move_all = make_button(top_frame, "Mover Todas Selecionadas", "move",
@@ -4742,6 +5152,9 @@ class ImageCleaner:
         if sp:
             info += (f"   |   Mesma foto: {sp['classes']} classe(s), {sp['images_in_classes']} img"
                      + (f", {sp['classes_suspect']} suspeita(s)" if sp['classes_suspect'] else ""))
+        sv = getattr(self, 'same_video_stats', None)
+        if sv and sv.get("merged_groups"):
+            info += f"   |   Mesmo vídeo: {sv['merged_groups']} grupo(s), {sv['files_in_merged']} arq"
         self.page_info_label.config(text=info)
         self.prev_btn.config(state="normal" if self.current_page > 0 else "disabled")
         self.next_btn.config(state="normal" if end_idx < total else "disabled")
@@ -4874,6 +5287,11 @@ class ImageCleaner:
                                  command=lambda g=idx, c=select_cmd: c(g, "same_photo"))
             b_same.pack(side="left", padx=5)
             self.create_tooltip(b_same, SAME_PHOTO_RULE_TOOLTIP)
+        if plan_same_video_selection(images):
+            b_video = make_button(btn_frame, "Selecionar Mesmo vídeo", "same",
+                                  command=lambda g=idx, c=select_cmd: c(g, "same_video"))
+            b_video.pack(side="left", padx=5)
+            self.create_tooltip(b_video, SAME_VIDEO_TOOLTIP)
         if verified_view:
             make_button(btn_frame, "Voltar para pendentes", "light",
                         command=lambda g=idx: self.unverify_group(g)).pack(side="left", padx=5)
@@ -5005,6 +5423,12 @@ class ImageCleaner:
                 lbl_same = tk.Label(text_frame, text=tag_text, fg=tfg, bg=tbg, font=FONT_BOLD, padx=4)
                 lbl_same.pack(anchor="w")
                 lbl_same.bind("<Button-1>", toggle_row)
+            if status == "Mesmo vídeo":
+                vfg, vbg = BADGE_STYLES["mesmo vídeo"]
+                lbl_video = tk.Label(text_frame, text="MESMO VÍDEO  ·  mesmo conteúdo, arquivo diferente",
+                                     fg=vfg, bg=vbg, font=FONT_BOLD, padx=4)
+                lbl_video.pack(anchor="w")
+                lbl_video.bind("<Button-1>", toggle_row)
             if kind in (KIND_PHOTO, KIND_PHOTO_BYTES) and self._live_companion(filepath):
                 # Live Photo do iPhone: avisa que há um vídeo .MOV par ao lado
                 lfg, lbg = BADGE_STYLES["live photo"]
@@ -5020,7 +5444,7 @@ class ImageCleaner:
                                f"Resolução: {format_resolution(self.image_dims.get(filepath))}")
             else:
                 # Sem "Resolução": no lugar, o tipo e (vídeo) dimensões e duração
-                status_line = (f"Status: Cópia exata   |   "
+                status_line = (f"Status: {'Cópia exata' if status == 'Idêntica' else status}   |   "
                                f"{media_summary(kind, filepath, self._media_info(filepath, kind, md5_val))}")
             try:
                 st = os.stat(filepath)
@@ -5457,7 +5881,7 @@ class ImageCleaner:
                 if kind == KIND_PHOTO:
                     summary = f"{status}   |   {format_resolution(dims)}"
                 else:
-                    summary = (f"Cópia exata   |   "
+                    summary = (f"{'Cópia exata' if status == 'Idêntica' else status}   |   "
                                f"{media_summary(kind, fp, self._media_info(fp, kind, info['md5']))}")
                 tk.Label(col, text=(f"{summary}   |   "
                                     f"{format_bytes(size)}\nModificado em: {mt_str}"),
@@ -5616,6 +6040,8 @@ class ImageCleaner:
         if kind == "identical":
             return plan_identical_selection(images)
         self._ensure_metrics(images)
+        if kind == "same_video":
+            return plan_same_video_selection(images)
         if kind == "same_photo":
             return plan_same_photo_selection(images)
         return plan_similar_selection(images, group_data['md5_count'])
@@ -5655,6 +6081,22 @@ class ImageCleaner:
             msg += (f"\n\nAtenção: em {ref_worse} classe(s) a cópia do acervo de referência tem resolução "
                     "MENOR que a do alvo; a referência é mantida mesmo assim (revise se quiser).")
         messagebox.showinfo("Seleção Concluída", msg + self._verified_note() + self._reference_selection_note())
+
+    def select_same_video_images(self):
+        """Em todos os grupos PENDENTES com "Mesmo vídeo": mantém um arquivo por
+           grupo (o mais antigo; no empate, o maior) e seleciona os outros."""
+        selected_count = 0
+        for idx in self.pending_idx:
+            group_data = self.group_check_vars[idx]
+            if not any(im.get('same_video') for im in group_data['images']):
+                continue
+            for i in self._plan_for_group(group_data, "same_video"):
+                group_data['images'][i]['var'].set(1)
+                selected_count += 1
+        messagebox.showinfo("Seleção Concluída",
+                            f"{selected_count} arquivos 'Mesmo vídeo' foram selecionados (mantendo, em cada "
+                            "grupo, o arquivo mais antigo; no empate, o maior)."
+                            + self._verified_note() + self._t(self._reference_selection_note(), files=True))
 
     def select_group(self, group_idx, kind):
         """Seleção automática (idênticas ou semelhantes) só de UM grupo,
@@ -5754,6 +6196,89 @@ class ImageCleaner:
         return False
 
     def _stale_proofs(self, selected_paths):
+        """Reconfere as provas que vieram do cache, de bytes (_stale_md5_proofs) e
+           de "Mesmo vídeo" (_stale_stream_proofs). Retorna o set de selecionados
+           que NÃO podem ser tocados, ou None se o usuário cancelou."""
+        selected_paths = list(selected_paths)
+        stale = self._stale_md5_proofs(selected_paths)
+        if stale is None:
+            return None
+        more = self._stale_stream_proofs([fp for fp in selected_paths if fp not in stale])
+        return None if more is None else stale | more
+
+    def _stale_stream_proofs(self, selected_paths):
+        """
+        Como _stale_md5_proofs, para "Mesmo vídeo": um selecionado que NÃO tem
+        cópia exata ficando depende da prova por hash de fluxos. Se essa prova
+        (a dele ou a de quem fica) veio do cache, o ffmpeg a refaz agora; só sai
+        se o hash ainda é o registrado e sobra um mantido com o mesmo hash
+        confirmado.
+        """
+        cached = getattr(self, 'byte_cached_stream', None)
+        if not cached or not self.ffmpeg_path:
+            return set()
+        selected = set(selected_paths)
+        plan = []    # (selecionado, mantidos com "Mesmo vídeo")
+        for group_data in self.group_check_vars.values():
+            members = [im for im in group_data['images'] if im.get('same_video')]
+            kept = [im['filepath'] for im in members if im['filepath'] not in selected]
+            for im in members:
+                fp = im['filepath']
+                if fp not in selected or not kept:
+                    continue
+                if any(k['md5'] == im['md5'] and k['filepath'] not in selected for k in members
+                       if k is not im):
+                    continue   # tem cópia EXATA ficando: já coberto pela reconferência de bytes
+                if cache_key(fp) in cached or any(cache_key(k) in cached for k in kept):
+                    plan.append((fp, kept))
+        if not plan:
+            return set()
+        cancel_event = threading.Event()
+        self.scan_cancelled = False
+        self.create_progress_window()
+        self.progress_window.title("Reconferindo Cópias")
+        self.progress_label.config(text="Refazendo a comparação de vídeo e áudio (ffmpeg)...")
+        self.progress_window.update()
+        results = {}
+        state = {"n": 0}
+        total = len({fp for fp, _ in plan}) + len(plan)
+
+        def pump():
+            self.progress_window.update()
+            if self.scan_cancelled:
+                cancel_event.set()
+
+        def confirmed(fp):
+            key = cache_key(fp)
+            if key not in cached:
+                return True          # calculado nesta varredura
+            if fp not in results:
+                state["n"] += 1
+                self.update_progress(state["n"], max(total, state["n"]), fp, force=True, unit="vídeos")
+                now = ffmpegtools.stream_hashes(self.ffmpeg_path, fp, cancel_event, tick=pump)
+                if cancel_event.is_set():
+                    raise ScanCancelled()
+                results[fp] = now is not None and now == self.byte_stream.get(key)
+                if not results[fp]:
+                    log.warning("Prova de 'Mesmo vídeo' do cache NÃO confirmada: %s", fp)
+            return results[fp]
+
+        stale = set()
+        try:
+            for fp, kept in plan:
+                kept_ok = any(confirmed(k) for k in sorted(kept, key=lambda k: cache_key(k) in cached))
+                if not kept_ok or not confirmed(fp):
+                    stale.add(fp)
+        except (ScanCancelled, tk.TclError):
+            return None
+        finally:
+            self._close_progress_window()
+        for fp, ok in results.items():
+            if ok:
+                cached.discard(cache_key(fp))
+        return stale
+
+    def _stale_md5_proofs(self, selected_paths):
         """
         Última trava antes de mover/excluir arquivos comparados por bytes.
         O cache vale por caminho + tamanho + data, e há programas que mudam o
@@ -6501,7 +7026,7 @@ def _report_callback_exception(exc_type, exc_value, exc_tb):
 
 
 def run_selftest(folder, reference=None, confirm_similar=None, same_photo=None,
-                 videos=False, others=False):
+                 videos=False, others=False, same_video=None):
     """
     Modo de diagnóstico sem interface: `ImageCleaner.exe --selftest PASTA`
     ou `--selftest PASTA --ref REFERENCIA` (modo de comparação), opcionalmente
@@ -6539,11 +7064,20 @@ def run_selftest(folder, reference=None, confirm_similar=None, same_photo=None,
     byte_entries = [e for e in entries if classify_file(e[0]) != KIND_PHOTO]
     entries = [e for e in entries if classify_file(e[0]) == KIND_PHOTO]
     log.info("SELFTEST listagem: %d arquivos em %.1fs", len(entries), time.time() - t0)
-    byte_groups, byte_stats = [], None
+    byte_groups, byte_stats, sv_stats = [], None, None
     if byte_entries:
         b_idx, b_md5, byte_stats, _ = find_identical_files(
             byte_entries, None, HASH_WORKERS,
             reference_keys=ref_keys if reference is not None else None)
+        ffmpeg_path = ffmpegtools.find_ffmpeg(load_settings().get("ffmpeg_path") or None,
+                                              ImageCleaner._app_dir()) if videos else None
+        if same_video is None:
+            same_video = bool(ffmpeg_path)
+        if videos and same_video and ffmpeg_path and ffmpegtools.check_version(ffmpeg_path):
+            b_idx, b_md5, _, _, sv_stats, _ = find_same_videos(
+                byte_entries, b_idx, b_md5, ffmpeg_path, ffmpegtools.ffprobe_beside(ffmpeg_path),
+                None, HASH_WORKERS, reference_keys=ref_keys if reference is not None else None)
+            log.info("SELFTEST mesmo vídeo: %s", {k: v for k, v in sv_stats.items() if k != "errors"})
         byte_groups = build_byte_groups(byte_entries, b_idx, b_md5)
         log.info("SELFTEST bytes: %s", {k: v for k, v in byte_stats.items() if k != "errors"})
     results, errors_by_idx, _ = hash_files(entries, None, HASH_WORKERS)
@@ -6644,6 +7178,9 @@ def run_selftest(folder, reference=None, confirm_similar=None, same_photo=None,
         summary += (f" | BYTES: {byte_stats['files']} arquivos, {byte_stats['groups']} grupos, "
                     f"{byte_stats['identical_files']} idênticos, {n_sel_bytes} selecionáveis, "
                     f"{format_bytes(byte_stats['bytes_read'])} lidos, {len(byte_stats['errors'])} erros")
+        if sv_stats is not None:
+            summary += (f" | MESMO VIDEO: {sv_stats['merged_groups']} grupos, "
+                        f"{sv_stats['files_in_merged']} arquivos, {sv_stats['hashed']} hashes de fluxos")
     log.info(summary)
     return summary
 
@@ -6655,6 +7192,7 @@ if __name__ == "__main__":
             confirm_similar = None
             same_photo = None
             videos = others = False
+            same_video = None
             extra = sys.argv[3:]
             while extra:
                 opt = extra.pop(0)
@@ -6670,11 +7208,14 @@ if __name__ == "__main__":
                     videos = True
                 elif opt == "--others":
                     others = True
+                elif opt == "--no-same-video":
+                    same_video = False
                 else:
                     raise ValueError(f"Opção desconhecida: {opt} (uso: --selftest PASTA "
                                      "[--ref REFERENCIA] [--no-confirm] [--same-photo | --no-same-photo] "
-                                     "[--videos] [--others])")
-            result = run_selftest(sys.argv[2], reference, confirm_similar, same_photo, videos, others)
+                                     "[--videos] [--others] [--no-same-video])")
+            result = run_selftest(sys.argv[2], reference, confirm_similar, same_photo, videos, others,
+                                  same_video)
             code = 0
         except (FileNotFoundError, ValueError) as e:
             log.error("SELFTEST: %s", e)
