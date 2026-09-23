@@ -3883,8 +3883,7 @@ class ImageCleaner:
         self.progress_window.resizable(False, False)
 
         # Centraliza a janela
-        self.progress_window.transient(self.master)
-        self.progress_window.grab_set()
+        self._make_modal(self.progress_window)
 
         # Fechar a janela pelo "X" equivale a cancelar
         # (a flag scan_cancelled é zerada em start_scan, não aqui: um pedido de
@@ -3980,6 +3979,55 @@ class ImageCleaner:
             return bool(self.master.winfo_exists())
         except tk.TclError:
             return False
+
+    def _make_modal(self, win, master=None):
+        """Torna `win` modal sobre `master` (transient + grab) sem deixar o
+           programa preso quando a dona está, ou fica, minimizada.
+
+           No Windows, o Tk esconde a transient ("withdrawn") enquanto a dona
+           está minimizada. Se o grab estiver nessa janela invisível, a dona
+           recusa ser restaurada pela barra de tarefas e não fecha: o programa
+           parece travado, com wait_window esperando um clique que ninguém
+           consegue dar. Aconteceu com o relatório de erros ao fim de uma
+           varredura de 20 minutos, com a principal minimizada. Por isso, a
+           dona é restaurada antes do grab, e o grab é solto enquanto ela
+           estiver minimizada e refeito quando ela reaparece."""
+        master = master if master is not None else self.master
+        try:
+            if master.state() == "iconic":
+                master.deiconify()
+        except tk.TclError:
+            pass
+        win.transient(master)
+        win.grab_set()
+        if not hasattr(self, "_modal_windows"):
+            self._modal_windows = []            # [(modal, dona)]; mortas são varridas
+            self._modal_bound = []              # donas que já têm o par de binds
+        self._modal_windows.append((win, master))
+        if not any(m is master for m in self._modal_bound):
+            # A marca fica na instância, não no widget: nos testes a mesma raiz
+            # Tk serve a vários ImageCleaner, cada um com sua lista de modais.
+            self._modal_bound.append(master)
+            master.bind("<Unmap>", lambda e, m=master: self._on_master_state(e, m, "unmap"), add="+")
+            master.bind("<Map>", lambda e, m=master: self._on_master_state(e, m, "map"), add="+")
+
+    def _on_master_state(self, event, master, what):
+        """Solta o grab dos modais de `master` quando ela é minimizada e o
+           devolve ao modal mais recente quando ela volta."""
+        if event.widget is not master:
+            return                              # filhos também geram <Map>/<Unmap>
+        self._modal_windows = [(w, m) for (w, m) in self._modal_windows if self._widget_alive(w)]
+        mine = [w for (w, m) in self._modal_windows if m is master]
+        if not mine:
+            return
+        try:
+            if what == "unmap":
+                for w in mine:
+                    w.grab_release()
+            elif master.state() != "iconic":
+                mine[-1].grab_set()
+        except tk.TclError:
+            pass
 
     def scan_folder(self):
         """Lista os arquivos e calcula os hashes (em paralelo, com cache e cancelamento)."""
@@ -4331,9 +4379,8 @@ class ImageCleaner:
         error_window.title("Relatório de Escaneamento")
         error_window.geometry("700x500")
 
-        # Torna a janela modal
-        error_window.transient(self.master)
-        error_window.grab_set()
+        # Torna a janela modal (e traz a principal de volta se estiver minimizada)
+        self._make_modal(error_window)
 
         # Frame superior com resumo
         summary_frame = tk.Frame(error_window, bg="#fff3cd", padx=10, pady=10)
@@ -4677,8 +4724,7 @@ class ImageCleaner:
         self.groups_progress_window.resizable(False, False)
 
         # Centraliza a janela
-        self.groups_progress_window.transient(self.master)
-        self.groups_progress_window.grab_set()
+        self._make_modal(self.groups_progress_window)
 
         # Frame principal
         main_frame = tk.Frame(self.groups_progress_window, padx=20, pady=20)
@@ -5957,7 +6003,7 @@ class ImageCleaner:
         win.focus_force()
         # Modal: enquanto aberta, cliques na lista de grupos não passam
         try:
-            win.grab_set()
+            self._make_modal(win, self.groups_window)
         except tk.TclError:
             pass
 
