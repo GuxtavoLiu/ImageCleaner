@@ -265,7 +265,7 @@ automática mantém a cópia do acervo em vez da mais antiga. Grupos só com
 imagens da referência não são exibidos; a checkbox "Mostrar duplicatas
 internas da pasta alvo" controla os grupos sem par no acervo.
 
-### Vídeos e outros arquivos (caixas "Procurar duplicatas em")
+### Vídeos e outros arquivos (cartão "O que procurar" da tela inicial)
 Na tela inicial: **Fotos** (ligada por padrão), **Vídeos** e **Outros arquivos**.
 - **Fotos** segue como sempre (Idêntica, Mesma foto, Semelhante), com duas diferenças
   deliberadas: as pastas de sistema `$RECYCLE.BIN` e `System Volume Information` deixaram de

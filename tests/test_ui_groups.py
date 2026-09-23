@@ -154,12 +154,12 @@ def test_linha_resolucao_caminho_curto_e_cor(app_with_groups):
     assert "Idêntica" in info_text and "bytes)" in info_text
     # cor da linha acompanha a seleção
     var = app.group_check_vars[idx]['images'][pos]['var']
-    assert widgets[0].cget("bg") == ic.PALETTE["bg"]
+    assert widgets[0].cget("bg") == ic.PALETTE["panel"]      # fundo do cartão
     var.set(1); root.update()
     assert widgets[0].cget("bg") == ic.PALETTE["selected_row"]
     assert widgets[2].cget("bg") == ic.PALETTE["selected_row"]   # checkbox também
     var.set(0); root.update()
-    assert widgets[0].cget("bg") == ic.PALETTE["bg"]
+    assert widgets[0].cget("bg") == ic.PALETTE["panel"]      # fundo do cartão
     # re-render preserva a cor conforme o var
     var.set(1); app.render_page(); root.update()
     _, _, widgets2 = _row_labels(app, "a_copy.jpg")

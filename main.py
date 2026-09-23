@@ -192,8 +192,9 @@ PREVIEW_COLUMNS = 3
 # Tema ttk "vista" (nativo do Windows) para caixas, barras e scrollbars.
 # ---------------------------------------------------------------------------
 PALETTE = {
-    "primary": "#2E7D32", "bg": "#FAFAFA", "panel": "#FFFFFF", "text": "#333333",
-    "muted": "#777777", "selected_row": "#E8F5E9", "reference_row": "#F1F8E9",
+    "primary": "#2E7D32", "bg": "#F0F2F5", "panel": "#FFFFFF", "text": "#333333",
+    "muted": "#6B6F76", "selected_row": "#E8F5E9", "reference_row": "#F1F8E9",
+    "border": "#DCDFE3", "field": "#F3F4F6",
 }
 FONT_UI = ("Segoe UI", 9)
 FONT_BOLD = ("Segoe UI", 9, "bold")
@@ -211,13 +212,43 @@ BUTTON_KINDS = {
 }
 
 
-def make_button(parent, text, kind="light", **kw):
+def _mix(hex_color, target, amount):
+    """Mistura a cor com `target` (0..255 por canal) na fração `amount`."""
+    r, g, b = (int(hex_color[i:i + 2], 16) for i in (1, 3, 5))
+    mix = lambda c: int(round(c + (target - c) * amount))
+    return f"#{mix(r):02X}{mix(g):02X}{mix(b):02X}"
+
+
+def _tint(hex_color, amount=0.82):
+    """Versão clareada da cor (fundo dos botões tonais)."""
+    return _mix(hex_color, 255, amount)
+
+
+def _shade(hex_color, amount=0.38):
+    """Versão escurecida da cor (texto dos botões tonais: contraste AA)."""
+    return _mix(hex_color, 0, amount)
+
+
+def make_button(parent, text, kind="light", soft=False, **kw):
     """Botão plano com a paleta do app. kind: chave de BUTTON_KINDS.
+       soft=True: botão tonal (fundo clareado, texto escurecido na mesma cor),
+       peso visual menor para os botões repetidos em cada grupo; os da barra
+       continuam cheios. (Contorno não serve: o Tk no Windows não desenha o
+       anel de highlight em botões.)
        Continua sendo um tk.Button (os testes localizam por classe)."""
     bg, active, fg = BUTTON_KINDS[kind]
-    opts = dict(text=text, bg=bg, fg=fg, activebackground=active, activeforeground=fg,
-                relief="flat", bd=0, padx=10, pady=4, cursor="hand2", font=FONT_UI,
-                disabledforeground="#9E9E9E")
+    if soft:
+        if kind == "light":
+            soft_bg, hover, ink = "#EEEEEE", "#E0E0E0", PALETTE["text"]
+        else:
+            soft_bg, hover, ink = _tint(bg), _tint(bg, 0.68), _shade(bg)
+        opts = dict(text=text, bg=soft_bg, fg=ink, activebackground=hover, activeforeground=ink,
+                    relief="flat", bd=0, padx=10, pady=4, cursor="hand2", font=FONT_UI,
+                    disabledforeground="#9E9E9E")
+    else:
+        opts = dict(text=text, bg=bg, fg=fg, activebackground=active, activeforeground=fg,
+                    relief="flat", bd=0, padx=10, pady=4, cursor="hand2", font=FONT_UI,
+                    disabledforeground="#9E9E9E")
     opts.update(kw)
     return tk.Button(parent, **opts)
 
@@ -3447,10 +3478,12 @@ class ImageCleaner:
             menu.add_command(label=f, command=lambda p=f: apply(p))
 
     def create_widgets(self):
-        # Janela inicial: tamanho decente e centralizada (só aparência; o
-        # fluxo de botões/opções abaixo é o mesmo de sempre).
-        width, height = 700, 650
-        self.master.minsize(660, 610)
+        # Tela inicial em três cartões numerados (pasta, o que procurar,
+        # referência) e uma barra fixa com o botão de iniciar. Só aparência:
+        # os widgets, textos, variáveis e comandos são os mesmos de sempre, e
+        # os cartões 2 e 3 continuam aparecendo só depois da pasta escolhida.
+        width, height = 720, 730
+        self.master.minsize(700, 700)
         try:
             sw = self.master.winfo_screenwidth()
             sh = self.master.winfo_screenheight()
@@ -3458,23 +3491,70 @@ class ImageCleaner:
         except tk.TclError:
             self.master.geometry(f"{width}x{height}")
 
-        header = tk.Frame(self.master, bg="#2E7D32", padx=20, pady=14)
+        card_bg, border = PALETTE["panel"], PALETTE["border"]
+        try:
+            ttk.Style(self.master).configure("Card.TCheckbutton", background=card_bg,
+                                             foreground=PALETTE["text"], font=FONT_UI)
+        except tk.TclError:
+            pass
+
+        def card(number, title):
+            """Cartão branco com borda fina, número num círculo e título.
+               Devolve (moldura, corpo): a moldura é o que se mostra/esconde."""
+            outer = tk.Frame(self.master, bg=card_bg, highlightbackground=border,
+                             highlightthickness=1)
+            head = tk.Frame(outer, bg=card_bg)
+            head.pack(fill="x", padx=16, pady=(12, 8))
+            badge = tk.Canvas(head, width=22, height=22, bg=card_bg, highlightthickness=0)
+            badge.create_oval(1, 1, 21, 21, fill=PALETTE["primary"], outline="")
+            badge.create_text(11, 11, text=str(number), fill="white", font=("Segoe UI", 9, "bold"))
+            badge.pack(side="left")
+            tk.Label(head, text=title, bg=card_bg, fg=PALETTE["text"],
+                     font=("Segoe UI", 10, "bold")).pack(side="left", padx=(8, 0))
+            body = tk.Frame(outer, bg=card_bg)
+            body.pack(fill="x", padx=(46, 16), pady=(0, 12))
+            return outer, body
+
+        def row(parent, indent=0, pady=(0, 6)):
+            r = tk.Frame(parent, bg=card_bg)
+            r.pack(anchor="w", fill="x", padx=(indent, 0), pady=pady)
+            return r
+
+        def check(parent, text, var, **kw):
+            chk = ttk.Checkbutton(parent, text=text, variable=var, style="Card.TCheckbutton", **kw)
+            chk.pack(side="left")
+            return chk
+
+        def help_marker(parent, text):
+            """Um '?' discreto com o tooltip (no lugar do ℹ️ azul)."""
+            m = tk.Label(parent, text="?", bg="#E8EAED", fg="#5F6368", cursor="hand2",
+                         font=("Segoe UI", 8, "bold"), padx=5, pady=0)
+            m.pack(side="left", padx=(5, 14))
+            self.create_tooltip(m, text)
+            return m
+
+        # Cabeçalho
+        header = tk.Frame(self.master, bg=PALETTE["primary"], padx=24, pady=14)
         header.pack(fill="x")
         tk.Label(header, text="Image Cleaner", font=FONT_TITLE,
-                 fg="white", bg="#2E7D32").pack(anchor="w")
+                 fg="white", bg=PALETTE["primary"]).pack(anchor="w")
         tk.Label(header, text="Encontre fotos duplicadas ou semelhantes e limpe seu acervo com segurança",
-                 font=("Segoe UI", 10), fg="#E8F5E9", bg="#2E7D32").pack(anchor="w")
+                 font=("Segoe UI", 10), fg="#E8F5E9", bg=PALETTE["primary"]).pack(anchor="w")
 
-        steps = tk.Label(
-            self.master, justify="left", fg="#444444", font=("Segoe UI", 9),
-            text=("1. Selecione a pasta a limpar e marque o que procurar (fotos, vídeos, outros arquivos).\n"
-                  "2. (Opcional) Selecione uma pasta de referência já organizada: nada dela será alterado.\n"
-                  "3. Clique em Iniciar e revise os grupos encontrados antes de mover ou excluir.")
-        )
-        steps.pack(anchor="w", padx=20, pady=(14, 6))
+        # Barra fixa do rodapé (aparece junto com o botão Iniciar)
+        self.footer = tk.Frame(self.master, bg=card_bg, highlightbackground=border,
+                               highlightthickness=1)
+        tk.Label(self.footer, text="Você revisa os grupos encontrados antes de mover ou excluir qualquer coisa.",
+                 bg=card_bg, fg=PALETTE["muted"], font=FONT_UI).pack(pady=(10, 0))
+        self.start_btn = make_button(self.footer, "Iniciar escaneamento", "primary",
+                                     command=self.start_scan,
+                                     font=("Segoe UI", 11, "bold"), padx=18, pady=9)
+        # (o botão e o rodapé só são exibidos depois da pasta escolhida)
 
-        folder_row = tk.Frame(self.master)
-        folder_row.pack(pady=10)
+        # Cartão 1: pasta a limpar
+        card1, body1 = card(1, "Pasta a limpar")
+        card1.pack(fill="x", padx=20, pady=(16, 10))
+        folder_row = row(body1, pady=(0, 8))
         self.select_btn = make_button(folder_row, "Selecionar Pasta", "primary",
                                       command=self.select_folder,
                                       font=("Segoe UI", 10, "bold"), padx=18, pady=6)
@@ -3483,133 +3563,105 @@ class ImageCleaner:
             folder_row, "recent_targets", self._apply_target_folder)
         self.recent_targets_mb.pack(side="left", padx=(6, 0))
 
-        # Label para exibir o caminho selecionado
-        self.path_label = tk.Label(self.master, text="", fg="blue", wraplength=600)
-        self.path_label.pack(pady=5)
+        # Caminho escolhido, num campo cinza (não parece link)
+        path_field = tk.Frame(body1, bg=PALETTE["field"], padx=10, pady=6)
+        path_field.pack(fill="x")
+        tk.Label(path_field, text="📁", bg=PALETTE["field"], font=("Segoe UI", 10)).pack(side="left")
+        self.path_label = tk.Label(path_field, text="Nenhuma pasta selecionada", bg=PALETTE["field"],
+                                   fg=PALETTE["muted"], wraplength=560, justify="left", anchor="w")
+        self.path_label.pack(side="left", padx=(6, 0), fill="x", expand=True)
 
-        # Frame das opções (inicialmente oculto): duas linhas, para caber na
-        # largura padrão da janela
-        self.subfolder_frame = tk.Frame(self.master)
-        kinds_row = tk.Frame(self.subfolder_frame)
-        kinds_row.pack(anchor="w", pady=(0, 4))
-        video_row = tk.Frame(self.subfolder_frame)
-        video_row.pack(anchor="w", pady=(0, 4))
-        options_row1 = tk.Frame(self.subfolder_frame)
-        options_row1.pack(anchor="w")
-        options_row2 = tk.Frame(self.subfolder_frame)
-        options_row2.pack(anchor="w", pady=(4, 0))
+        # Dica do estado vazio (some quando a pasta é escolhida)
+        self.empty_hint = tk.Label(
+            self.master, fg=PALETTE["muted"], font=FONT_UI, justify="left",
+            text="Depois de escolher a pasta, as opções de busca e a referência aparecem aqui.")
+        self.empty_hint.pack(anchor="w", padx=24)
+
+        # Cartão 2: o que procurar (inicialmente oculto)
+        self.subfolder_frame, body2 = card(2, "O que procurar")
+        kinds_row = row(body2)
+        photo_row = row(body2, indent=24)
+        video_row = row(body2, indent=24)
+        ttk.Separator(body2, orient="horizontal").pack(fill="x", pady=(6, 10))
+        options_row1 = row(body2, pady=(0, 0))
 
         # O que procurar. Fotos: por aparência (como sempre). Vídeos e outros:
         # só cópias exatas, comparando o conteúdo byte a byte.
-        tk.Label(kinds_row, text="Procurar duplicatas em:", font=FONT_BOLD).pack(side="left")
         self.scan_photos_var = tk.IntVar(value=1)
         self.scan_videos_var = tk.IntVar(value=0)
         self.scan_others_var = tk.IntVar(value=0)
         self.kind_checks = []
-        for text, var in (("Fotos", self.scan_photos_var), ("Vídeos", self.scan_videos_var),
-                          ("Outros arquivos", self.scan_others_var)):
-            chk = tk.Checkbutton(kinds_row, text=text, variable=var, command=self._on_kinds_changed)
-            chk.pack(side="left", padx=(10, 0))
+        for k, (text, var) in enumerate((("Fotos", self.scan_photos_var), ("Vídeos", self.scan_videos_var),
+                                         ("Outros arquivos", self.scan_others_var))):
+            chk = check(kinds_row, text, var, command=self._on_kinds_changed)
+            chk.pack_configure(padx=(0 if k == 0 else 14, 0))
             self.kind_checks.append(chk)
-        self.kinds_info_label = tk.Label(kinds_row, text="ℹ️", fg="blue", cursor="hand2")
-        self.kinds_info_label.pack(side="left", padx=5)
-        self.create_tooltip(self.kinds_info_label,
-                            "Fotos: acha cópias idênticas, a mesma foto em outra versão e fotos\n"
-                            "semelhantes. Formatos que o programa não abre (HEIC, RAW) entram\n"
-                            "só como cópia exata.\n"
-                            "Vídeos e Outros arquivos: só cópias EXATAS (mesmo conteúdo, byte a\n"
-                            "byte). O programa lê o mínimo possível: arquivos de tamanho único\n"
-                            "nem são abertos.\n"
-                            "Cuidado com 'Outros' em pastas de programas ou de projetos: eles\n"
-                            "têm muitos arquivos iguais de propósito, e apagar um deles pode\n"
-                            "quebrar o programa. Use em pastas de documentos e acervos.")
+        self.kinds_info_label = help_marker(
+            kinds_row,
+            "Fotos: acha cópias idênticas, a mesma foto em outra versão e fotos\n"
+            "semelhantes. Formatos que o programa não abre (HEIC, RAW) entram\n"
+            "só como cópia exata.\n"
+            "Vídeos e Outros arquivos: só cópias EXATAS (mesmo conteúdo, byte a\n"
+            "byte). O programa lê o mínimo possível: arquivos de tamanho único\n"
+            "nem são abertos.\n"
+            "Cuidado com 'Outros' em pastas de programas ou de projetos: eles\n"
+            "têm muitos arquivos iguais de propósito, e apagar um deles pode\n"
+            "quebrar o programa. Use em pastas de documentos e acervos.")
+
+        # Opções só de fotos, recuadas sob a linha dos tipos
+        self.confirm_similar_var = tk.IntVar(value=1 if CONFIRM_SIMILAR else 0)
+        self.confirm_check = check(photo_row, "Confirmar semelhantes com segundo hash",
+                                   self.confirm_similar_var)
+        self.confirm_info_label = help_marker(
+            photo_row,
+            "Antes de chamar duas fotos de 'Semelhantes', faz uma segunda\n"
+            "verificação independente. Evita juntar fotos diferentes que só\n"
+            "coincidem na distribuição de luz e sombra.\n"
+            "Cópias idênticas nunca são afetadas.\n"
+            "Desmarque para ver o agrupamento amplo de antes.")
+        self.same_photo_var = tk.IntVar(value=1 if SAME_PHOTO_ENABLED else 0)
+        self.same_photo_check = ttk.Checkbutton(photo_row, text="Detectar 'Mesma foto'",
+                                                variable=self.same_photo_var, style="Card.TCheckbutton")
+        if SAME_PHOTO_ENABLED:
+            self.same_photo_check.pack(side="left")
+            self.same_photo_info_label = help_marker(photo_row, SAME_PHOTO_RULE_TOOLTIP)
 
         # "Mesmo vídeo": precisa do ffmpeg (opcional). O programa procura sozinho;
         # "Localizar..." aponta o ffmpeg.exe à mão quando a busca não acha.
         self.same_video_var = tk.IntVar(value=1)
-        self.same_video_check = tk.Checkbutton(video_row, text="Detectar 'Mesmo vídeo'",
-                                               variable=self.same_video_var, state="disabled")
-        self.same_video_check.pack(side="left", padx=(20, 0))
-        self.ffmpeg_label = tk.Label(video_row, text="", fg=PALETTE["muted"])
-        self.ffmpeg_label.pack(side="left", padx=(6, 0))
+        self.same_video_check = check(video_row, "Detectar 'Mesmo vídeo'", self.same_video_var,
+                                      state="disabled")
+        self.ffmpeg_dot = tk.Label(video_row, text="●", bg=card_bg, fg=PALETTE["muted"],
+                                   font=("Segoe UI", 8))
+        self.ffmpeg_dot.pack(side="left", padx=(12, 0))
+        self.ffmpeg_label = tk.Label(video_row, text="", bg=card_bg, fg=PALETTE["muted"])
+        self.ffmpeg_label.pack(side="left", padx=(4, 0))
         self.ffmpeg_btn = make_button(video_row, "Localizar...", "light", command=self.locate_ffmpeg,
                                       pady=1, state="disabled")
-        self.ffmpeg_btn.pack(side="left", padx=(6, 0))
-        self.ffmpeg_info_label = tk.Label(video_row, text="ℹ️", fg="blue", cursor="hand2")
-        self.ffmpeg_info_label.pack(side="left", padx=5)
-        self.create_tooltip(self.ffmpeg_info_label, SAME_VIDEO_TOOLTIP)
+        self.ffmpeg_btn.pack(side="left", padx=(8, 0))
+        self.ffmpeg_info_label = help_marker(video_row, SAME_VIDEO_TOOLTIP)
 
-        # Checkbox para escanear subpastas (marcada por padrão)
+        # Opções gerais (valem para qualquer tipo)
         self.scan_subfolders_var = tk.IntVar(value=1)
-        self.subfolder_check = tk.Checkbutton(
+        self.subfolder_check = check(options_row1, "Escanear subpastas", self.scan_subfolders_var)
+        self.info_label = help_marker(
             options_row1,
-            text="Escanear subpastas",
-            variable=self.scan_subfolders_var
-        )
-        self.subfolder_check.pack(side="left")
-
-        # Ícone de informação (tooltip)
-        self.info_label = tk.Label(options_row1, text="ℹ️", fg="blue", cursor="hand2")
-        self.info_label.pack(side="left", padx=5)
-
-        # Binds para o tooltip
-        self.create_tooltip(self.info_label,
-                           "Se marcado, o programa irá escanear a pasta selecionada\n"
-                           "e todas as suas subpastas recursivamente.\n"
-                           "Se desmarcado, apenas a pasta raiz será escaneada.")
-
-        # Checkbox para usar cache de hashes (marcada por padrão)
+            "Se marcado, o programa irá escanear a pasta selecionada\n"
+            "e todas as suas subpastas recursivamente.\n"
+            "Se desmarcado, apenas a pasta raiz será escaneada.")
         self.use_cache_var = tk.IntVar(value=1)
-        self.cache_check = tk.Checkbutton(
+        self.cache_check = check(options_row1, "Usar cache de hashes", self.use_cache_var)
+        self.cache_info_label = help_marker(
             options_row1,
-            text="Usar cache de hashes",
-            variable=self.use_cache_var
-        )
-        self.cache_check.pack(side="left", padx=(15, 0))
+            "Guarda os hashes já calculados em um cache local\n"
+            "(chave: caminho + tamanho + data de modificação).\n"
+            "Re-escanear a mesma pasta fica quase instantâneo e\n"
+            "um escaneamento cancelado pode ser retomado depois.\n"
+            "Arquivos alterados são sempre recalculados.")
 
-        self.cache_info_label = tk.Label(options_row1, text="ℹ️", fg="blue", cursor="hand2")
-        self.cache_info_label.pack(side="left", padx=5)
-        self.create_tooltip(self.cache_info_label,
-                            "Guarda os hashes já calculados em um cache local\n"
-                            "(chave: caminho + tamanho + data de modificação).\n"
-                            "Re-escanear a mesma pasta fica quase instantâneo e\n"
-                            "um escaneamento cancelado pode ser retomado depois.\n"
-                            "Arquivos alterados são sempre recalculados.")
-
-        # Confirmação de semelhantes por segundo hash (2ª linha das opções)
-        self.confirm_similar_var = tk.IntVar(value=1 if CONFIRM_SIMILAR else 0)
-        self.confirm_check = tk.Checkbutton(
-            options_row2,
-            text="Confirmar semelhantes com segundo hash",
-            variable=self.confirm_similar_var
-        )
-        self.confirm_check.pack(side="left")
-        self.confirm_info_label = tk.Label(options_row2, text="ℹ️", fg="blue", cursor="hand2")
-        self.confirm_info_label.pack(side="left", padx=5)
-        self.create_tooltip(self.confirm_info_label,
-                            "Antes de chamar duas fotos de 'Semelhantes', faz uma segunda\n"
-                            "verificação independente. Evita juntar fotos diferentes que só\n"
-                            "coincidem na distribuição de luz e sombra.\n"
-                            "Cópias idênticas nunca são afetadas.\n"
-                            "Desmarque para ver o agrupamento amplo de antes.")
-
-        # Detecção de "Mesma foto" (mesma captura em outra versão)
-        self.same_photo_var = tk.IntVar(value=1 if SAME_PHOTO_ENABLED else 0)
-        self.same_photo_check = tk.Checkbutton(
-            options_row2,
-            text="Detectar 'Mesma foto'",
-            variable=self.same_photo_var
-        )
-        if SAME_PHOTO_ENABLED:
-            self.same_photo_check.pack(side="left", padx=(15, 0))
-            self.same_photo_info_label = tk.Label(options_row2, text="ℹ️", fg="blue", cursor="hand2")
-            self.same_photo_info_label.pack(side="left", padx=5)
-            self.create_tooltip(self.same_photo_info_label, SAME_PHOTO_RULE_TOOLTIP)
-
-        # Área da pasta de referência (modo comparação; inicialmente oculta)
-        self.reference_container = tk.Frame(self.master)
-        ref_row = tk.Frame(self.reference_container)
-        ref_row.pack(fill="x")
+        # Cartão 3: referência (modo comparação; inicialmente oculto)
+        self.reference_container, body3 = card(3, "Referência protegida (opcional)")
+        ref_row = row(body3)
         self.reference_btn = make_button(
             ref_row, "Selecionar Pasta de Referência (protegida)...", "light",
             command=self.select_reference_folder
@@ -3623,33 +3675,28 @@ class ImageCleaner:
             state="disabled"
         )
         self.reference_clear_btn.pack(side="left", padx=(5, 0))
-        self.reference_info_label = tk.Label(ref_row, text="ℹ️", fg="blue", cursor="hand2")
-        self.reference_info_label.pack(side="left", padx=5)
-        self.create_tooltip(self.reference_info_label,
-                            "Opcional. Compara a pasta selecionada acima (ALVO) com um\n"
-                            "acervo de REFERÊNCIA já organizado.\n"
-                            "Imagens da referência NUNCA são selecionadas, movidas ou\n"
-                            "excluídas: as duplicatas são removidas somente da pasta alvo.\n"
-                            "A referência é sempre escaneada com subpastas.\n"
-                            "Sem referência, o programa funciona no modo normal.")
+        self.reference_info_label = help_marker(
+            ref_row,
+            "Opcional. Compara a pasta selecionada acima (ALVO) com um\n"
+            "acervo de REFERÊNCIA já organizado.\n"
+            "Imagens da referência NUNCA são selecionadas, movidas ou\n"
+            "excluídas: as duplicatas são removidas somente da pasta alvo.\n"
+            "A referência é sempre escaneada com subpastas.\n"
+            "Sem referência, o programa funciona no modo normal.")
+        ref_field = tk.Frame(body3, bg=PALETTE["field"], padx=10, pady=6)
+        ref_field.pack(fill="x")
+        tk.Label(ref_field, text="🔒", bg=PALETTE["field"], font=("Segoe UI", 10)).pack(side="left")
         self.reference_path_label = tk.Label(
-            self.reference_container, text="Nenhuma pasta de referência (modo normal)",
-            fg="#2E7D32", wraplength=600
+            ref_field, text="Nenhuma pasta de referência (modo normal)", bg=PALETTE["field"],
+            fg=PALETTE["muted"], wraplength=560, justify="left", anchor="w"
         )
-        self.reference_path_label.pack(pady=(3, 0))
+        self.reference_path_label.pack(side="left", padx=(6, 0), fill="x", expand=True)
         self.show_target_only_var = tk.IntVar(value=1)
-        self.show_target_only_check = tk.Checkbutton(
-            self.reference_container,
-            text="Mostrar duplicatas internas da pasta alvo (sem par na referência)",
-            variable=self.show_target_only_var
+        self.show_target_only_check = ttk.Checkbutton(
+            body3, text="Mostrar duplicatas internas da pasta alvo (sem par na referência)",
+            variable=self.show_target_only_var, style="Card.TCheckbutton"
         )
         # (exibido só quando há referência selecionada; ver select_reference_folder)
-
-        # Botão Iniciar (inicialmente oculto)
-        self.start_btn = make_button(self.master, "Iniciar escaneamento", "move",
-                                     command=self.start_scan,
-                                     font=("Segoe UI", 10, "bold"), padx=18, pady=6)
-        # Não exibe o botão nem o frame de subpastas inicialmente
 
     def _scan_kinds(self):
         """(fotos, vídeos, outros) marcados na tela inicial."""
@@ -3674,6 +3721,11 @@ class ImageCleaner:
             return os.path.dirname(sys.executable)
         return os.path.dirname(os.path.abspath(__file__))
 
+    def _ffmpeg_status(self, text, color):
+        """Linha do ffmpeg: texto e a bolinha de estado na mesma cor."""
+        self.ffmpeg_label.config(text=text, fg=color)
+        self.ffmpeg_dot.config(fg=color)
+
     def _refresh_ffmpeg_status(self):
         """Linha do ffmpeg na tela inicial. Só com Vídeos marcado o ffmpeg é
            validado (roda `-version` numa thread: leva ~1 s); quem só usa Fotos
@@ -3683,24 +3735,24 @@ class ImageCleaner:
             self.ffmpeg_btn.config(state="normal" if videos else "disabled")
             if not videos:
                 self.same_video_check.config(state="disabled")
-                self.ffmpeg_label.config(text="(marque Vídeos)", fg=PALETTE["muted"])
+                self._ffmpeg_status("(marque Vídeos)", PALETTE["muted"])
                 return
             if not self.ffmpeg_path:
                 self.same_video_check.config(state="disabled")
-                self.ffmpeg_label.config(text="ffmpeg não encontrado: só cópias exatas", fg="#B26A00")
+                self._ffmpeg_status("ffmpeg não encontrado: só cópias exatas", "#B26A00")
                 return
             if self.ffmpeg_version is None:
                 self.same_video_check.config(state="disabled")
-                self.ffmpeg_label.config(text="conferindo o ffmpeg...", fg=PALETTE["muted"])
+                self._ffmpeg_status("conferindo o ffmpeg...", PALETTE["muted"])
                 self._validate_ffmpeg_async()
                 return
             if not self.ffmpeg_version:
                 self.same_video_check.config(state="disabled")
-                self.ffmpeg_label.config(text="o ffmpeg encontrado não funciona", fg="#B26A00")
+                self._ffmpeg_status("o ffmpeg encontrado não funciona", "#B26A00")
                 return
             self.same_video_check.config(state="normal")
             short = self.ffmpeg_version.split("-")[0][:18]      # "8.1.1-full_build-www..." -> "8.1.1"
-            self.ffmpeg_label.config(text=f"ffmpeg {short} encontrado", fg=PALETTE["primary"])
+            self._ffmpeg_status(f"ffmpeg {short} encontrado", PALETTE["primary"])
         except tk.TclError:
             pass
 
@@ -3759,7 +3811,7 @@ class ImageCleaner:
 
     def _make_recent_menubutton(self, parent, key, apply):
         mb = tk.Menubutton(parent, text="Recentes ▾", relief="flat", bg="#E0E0E0",
-                           activebackground="#BDBDBD", padx=8, pady=4, cursor="hand2")
+                           activebackground="#BDBDBD", padx=10, pady=5, cursor="hand2", font=FONT_UI)
         menu = tk.Menu(mb, tearoff=0)
         menu.configure(postcommand=lambda m=menu: self._fill_recent_menu(m, key, apply))
         mb["menu"] = menu
@@ -3801,10 +3853,12 @@ class ImageCleaner:
     def _apply_target_folder(self, folder):
         """Define a pasta alvo (pelo diálogo, pelos recentes ou pelas configurações)."""
         self.selected_folder = folder
-        self.path_label.config(text=f"Pasta selecionada: {folder}")
-        self.subfolder_frame.pack(pady=5)
-        self.reference_container.pack(pady=5)
-        self.start_btn.pack(pady=10)
+        self.path_label.config(text=f"Pasta selecionada: {folder}", fg=PALETTE["text"])
+        self.empty_hint.pack_forget()
+        self.footer.pack(side="bottom", fill="x")
+        self.start_btn.pack(fill="x", padx=20, pady=(6, 12))
+        self.subfolder_frame.pack(fill="x", padx=20, pady=(0, 10))
+        self.reference_container.pack(fill="x", padx=20, pady=(0, 10))
         # O alvo pode ter sido trocado por uma pasta que engloba (ou está
         # dentro) da referência já escolhida: nesse caso a referência cai.
         if self.reference_folder:
@@ -3833,14 +3887,14 @@ class ImageCleaner:
             )
             return
         self.reference_folder = folder
-        self.reference_path_label.config(text=f"Referência (protegida): {folder}")
+        self.reference_path_label.config(text=f"Referência (protegida): {folder}", fg=PALETTE["primary"])
         self.reference_clear_btn.config(state="normal")
-        self.show_target_only_check.pack(pady=(3, 0))
+        self.show_target_only_check.pack(anchor="w", pady=(8, 0))
 
     def clear_reference_folder(self):
         """Volta ao modo normal de uma pasta."""
         self.reference_folder = ""
-        self.reference_path_label.config(text="Nenhuma pasta de referência (modo normal)")
+        self.reference_path_label.config(text="Nenhuma pasta de referência (modo normal)", fg=PALETTE["muted"])
         self.reference_clear_btn.config(state="disabled")
         self.show_target_only_check.pack_forget()
 
@@ -3895,7 +3949,7 @@ class ImageCleaner:
         main_frame.pack(fill="both", expand=True)
 
         # Label de status
-        self.progress_label = tk.Label(main_frame, text="Inicializando...", font=("Arial", 10))
+        self.progress_label = tk.Label(main_frame, text="Inicializando...", font=("Segoe UI", 10))
         self.progress_label.pack(pady=(0, 10))
 
         # Barra de progresso
@@ -3903,11 +3957,11 @@ class ImageCleaner:
         self.progress_bar.pack(pady=10)
 
         # Label de contagem
-        self.progress_count_label = tk.Label(main_frame, text="0 / 0 imagens", font=("Arial", 9))
+        self.progress_count_label = tk.Label(main_frame, text="0 / 0 imagens", font=("Segoe UI", 9))
         self.progress_count_label.pack(pady=(5, 0))
 
         # Label de tempo (decorrido / estimado)
-        self.progress_time_label = tk.Label(main_frame, text="", font=("Arial", 9), fg="#555555")
+        self.progress_time_label = tk.Label(main_frame, text="", font=("Segoe UI", 9), fg="#555555")
         self.progress_time_label.pack(pady=(2, 0))
 
         # Botão cancelar
@@ -4397,7 +4451,7 @@ class ImageCleaner:
             + (f"\n{byte_line.rstrip()}" if byte_line else "")
         )
 
-        tk.Label(summary_frame, text=summary_text, font=("Arial", 10, "bold"),
+        tk.Label(summary_frame, text=summary_text, font=("Segoe UI", 10, "bold"),
                 bg="#fff3cd", justify="left").pack(anchor="w")
 
         # Aviso sobre tempo de carregamento
@@ -4405,7 +4459,7 @@ class ImageCleaner:
         warning_frame.pack(fill="x", padx=10, pady=(0, 10))
 
         warning_text = "⚠️ Ao fechar esta janela, o carregamento pode demorar alguns minutos. Por favor, aguarde."
-        tk.Label(warning_frame, text=warning_text, font=("Arial", 9),
+        tk.Label(warning_frame, text=warning_text, font=("Segoe UI", 9),
                 bg="#fff3cd", fg="#856404", justify="left").pack(anchor="w")
 
         # Categoriza erros
@@ -4421,19 +4475,19 @@ class ImageCleaner:
         categories_frame.pack(fill="x", padx=10, pady=5)
 
         tk.Label(categories_frame, text="Tipos de Erro Encontrados:",
-                font=("Arial", 9, "bold")).pack(anchor="w")
+                font=("Segoe UI", 9, "bold")).pack(anchor="w")
 
         for error_type, errors in error_types.items():
             tk.Label(categories_frame, text=f"  • {error_type}: {len(errors)} arquivo(s)",
-                    font=("Arial", 9)).pack(anchor="w")
+                    font=("Segoe UI", 9)).pack(anchor="w")
 
         # Lista de erros em scrolled text
-        tk.Label(error_window, text="Detalhes dos Erros:", font=("Arial", 9, "bold")).pack(anchor="w", padx=10, pady=(10, 5))
+        tk.Label(error_window, text="Detalhes dos Erros:", font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=10, pady=(10, 5))
 
         text_frame = tk.Frame(error_window)
         text_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
-        error_text = scrolledtext.ScrolledText(text_frame, wrap=tk.WORD, font=("Courier", 8))
+        error_text = scrolledtext.ScrolledText(text_frame, wrap=tk.WORD, font=("Consolas", 9))
         error_text.pack(fill="both", expand=True)
 
         # Agrupa por tipo
@@ -4444,7 +4498,7 @@ class ImageCleaner:
                 error_text.insert(tk.END, f"💬 Detalhes: {error['message']}\n")
 
         # Configurações de tag
-        error_text.tag_config("header", font=("Courier", 9, "bold"), foreground="#d9534f")
+        error_text.tag_config("header", font=("Consolas", 9, "bold"), foreground="#d9534f")
         error_text.config(state="disabled")
 
         # Frame inferior com botões e informações
@@ -4463,7 +4517,7 @@ class ImageCleaner:
             "   especializadas ou movê-las para uma pasta separada para análise manual."
         )
 
-        tk.Label(info_frame, text=info_text, justify="left", font=("Arial", 8)).pack(anchor="w")
+        tk.Label(info_frame, text=info_text, justify="left", font=("Segoe UI", 8)).pack(anchor="w")
 
         # Botão fechar
         make_button(bottom_frame, "Fechar", "select", command=error_window.destroy, padx=20).pack()
@@ -4731,7 +4785,7 @@ class ImageCleaner:
         main_frame.pack(fill="both", expand=True)
 
         # Label de status
-        self.groups_progress_label = tk.Label(main_frame, text="Inicializando grupos...", font=("Arial", 10))
+        self.groups_progress_label = tk.Label(main_frame, text="Inicializando grupos...", font=("Segoe UI", 10))
         self.groups_progress_label.pack(pady=(0, 10))
 
         # Barra de progresso
@@ -4739,7 +4793,7 @@ class ImageCleaner:
         self.groups_progress_bar.pack(pady=10)
 
         # Label de contagem
-        self.groups_progress_count_label = tk.Label(main_frame, text="0 / 0 grupos", font=("Arial", 9))
+        self.groups_progress_count_label = tk.Label(main_frame, text="0 / 0 grupos", font=("Segoe UI", 9))
         self.groups_progress_count_label.pack(pady=(5, 0))
 
         # Força atualização
@@ -4896,9 +4950,18 @@ class ImageCleaner:
         self.groups_window.title(self._t("Grupos de Imagens Similares"))
         self.groups_window.bind("<Destroy>", self._cancel_thumb_poll, add="+")
 
-        # Frame superior com informações e navegação
-        top_frame = tk.Frame(self.groups_window)
-        top_frame.pack(fill="x", padx=10, pady=5)
+        # Barra superior (botões) e barra de status num painel branco com
+        # borda inferior; os botões ficam em grupos separados por linhas finas:
+        # selecionar, agir, navegar entre vistas. Só aparência.
+        bar_bg, border = PALETTE["panel"], PALETTE["border"]
+        bar = tk.Frame(self.groups_window, bg=bar_bg)
+        bar.pack(fill="x")
+        tk.Frame(self.groups_window, bg=border, height=1).pack(fill="x")
+        top_frame = tk.Frame(bar, bg=bar_bg)
+        top_frame.pack(fill="x", padx=12, pady=(8, 4))
+
+        def vsep():
+            ttk.Separator(top_frame, orient="vertical").pack(side="left", fill="y", padx=8, pady=3)
 
         # A informação de paginação/contagens fica na barra de status (2ª linha),
         # para a 1ª linha caber só com os botões mesmo em telas menores.
@@ -4927,6 +4990,7 @@ class ImageCleaner:
             self.create_tooltip(btn_video, SAME_VIDEO_TOOLTIP)
 
         # Botões de ação global
+        vsep()
         btn_move_all = make_button(top_frame, "Mover Todas Selecionadas", "move",
                                    command=self.move_all_selected)
         btn_move_all.pack(side="left", padx=5)
@@ -4936,12 +5000,13 @@ class ImageCleaner:
         btn_delete_all.pack(side="left", padx=5)
 
         # Alterna entre a fila de pendentes e a lista de grupos já verificados
+        vsep()
         self.view_toggle_btn = make_button(top_frame, "", "neutral", command=self.toggle_view)
-        self.view_toggle_btn.pack(side="left", padx=(20, 5))
+        self.view_toggle_btn.pack(side="left", padx=5)
 
         # Menu "Mais": desfazer, relatórios, log
         more = tk.Menubutton(top_frame, text="Mais ▾", relief="flat", bg="#E0E0E0",
-                             activebackground="#BDBDBD", padx=10, pady=4, cursor="hand2")
+                             activebackground="#BDBDBD", padx=10, pady=5, cursor="hand2", font=FONT_UI)
         more_menu = tk.Menu(more, tearoff=0)
         more_menu.add_command(label="Desfazer último lote (mover)", command=self.undo_last_action)
         more_menu.add_separator()
@@ -4959,13 +5024,13 @@ class ImageCleaner:
         self._update_view_toggle()
 
         # Botões de navegação
-        nav_frame = tk.Frame(top_frame)
+        nav_frame = tk.Frame(top_frame, bg=bar_bg)
         nav_frame.pack(side="right")
 
-        self.prev_btn = make_button(nav_frame, "← Anterior (F1)", "light", command=self.prev_page)
+        self.prev_btn = make_button(nav_frame, "← Anterior (F1)", "light", soft=True, command=self.prev_page)
         self.prev_btn.pack(side="left", padx=5)
 
-        self.next_btn = make_button(nav_frame, "Próximo (F2) →", "light", command=self.next_page)
+        self.next_btn = make_button(nav_frame, "Próximo (F2) →", "light", soft=True, command=self.next_page)
         self.next_btn.pack(side="left", padx=5)
 
         # Atalhos de teclado da paginação (valem com a janela de grupos em foco)
@@ -4973,15 +5038,15 @@ class ImageCleaner:
         self.groups_window.bind("<F2>", lambda e: self.next_page())
 
         # Barra de status: progresso da revisão e o que está selecionado
-        status_frame = tk.Frame(self.groups_window)
-        status_frame.pack(fill="x", padx=15, pady=(0, 4))
+        status_frame = tk.Frame(bar, bg=bar_bg)
+        status_frame.pack(fill="x", padx=17, pady=(2, 8))
         self.review_progress = ttk.Progressbar(status_frame, length=220, mode="determinate")
         self.review_progress.pack(side="left")
-        self.review_label = tk.Label(status_frame, text="", font=FONT_BOLD)
+        self.review_label = tk.Label(status_frame, text="", font=FONT_BOLD, bg=bar_bg, fg=PALETTE["text"])
         self.review_label.pack(side="left", padx=(8, 20))
-        self.selection_label = tk.Label(status_frame, text="", fg=PALETTE["muted"])
+        self.selection_label = tk.Label(status_frame, text="", fg=PALETTE["primary"], bg=bar_bg, font=FONT_BOLD)
         self.selection_label.pack(side="left")
-        self.page_info_label = tk.Label(status_frame, text="", fg=PALETTE["text"])
+        self.page_info_label = tk.Label(status_frame, text="", fg=PALETTE["muted"], bg=bar_bg)
         self.page_info_label.pack(side="left", padx=(20, 0))
         self._update_counters()
 
@@ -5004,7 +5069,7 @@ class ImageCleaner:
         gw.bind("<Up>", lambda e: self.canvas.yview_scroll(-3, "units"))
 
         # --- Cria a Scrollbar e vincula ao Canvas ---
-        scrollbar = tk.Scrollbar(scroll_container, orient="vertical", command=self.canvas.yview)
+        scrollbar = ttk.Scrollbar(scroll_container, orient="vertical", command=self.canvas.yview)
         scrollbar.pack(side="right", fill="y")
         self.canvas.configure(yscrollcommand=scrollbar.set)
 
@@ -5012,6 +5077,9 @@ class ImageCleaner:
         self.content_frame = tk.Frame(self.canvas)
         # Insere o content_frame dentro do canvas como uma "janela"
         self.content_window = self.canvas.create_window((0, 0), window=self.content_frame, anchor="nw")
+        # Os cartões ocupam a largura toda da janela (o item acompanha o canvas)
+        self.canvas.bind("<Configure>",
+                         lambda e: self.canvas.itemconfigure(self.content_window, width=e.width))
 
         # Função para ajustar a região de rolagem sempre que o content_frame mudar de tamanho
         def on_configure(event):
@@ -5233,7 +5301,7 @@ class ImageCleaner:
         if total == 0:
             msg = ("Todos os grupos foram verificados. Use 'Voltar aos pendentes' para revê-los."
                    if self.view_mode == "pending" else "Nenhum grupo verificado ainda.")
-            tk.Label(self.content_frame, text=msg, fg="#555555", font=("Arial", 11),
+            tk.Label(self.content_frame, text=msg, fg="#555555", font=("Segoe UI", 11),
                      padx=20, pady=30).pack(anchor="w")
 
         # Renderiza em lotes: no Windows cada widget Tk é uma janela nativa e
@@ -5306,12 +5374,15 @@ class ImageCleaner:
             kind_tag = (" (vídeos)" if kinds == {KIND_VIDEO}
                         else " (fotos)" if kinds == {KIND_PHOTO_BYTES} else " (arquivos)")
         title = f"Grupo {idx + 1}" + kind_tag + (" ✓ verificado" if verified_view else "")
-        frame = tk.LabelFrame(self.content_frame, text=title, padx=10, pady=10)
-        frame.pack(padx=10, pady=10, fill="x", expand=True)
+        card_bg = PALETTE["panel"]
+        frame = tk.LabelFrame(self.content_frame, text=title, padx=12, pady=10, bg=card_bg,
+                              fg=PALETTE["text"], font=("Segoe UI", 10, "bold"), relief="flat", bd=0,
+                              highlightbackground=PALETTE["border"], highlightthickness=1)
+        frame.pack(padx=16, pady=8, fill="x", expand=True)
         self.group_frames[idx] = frame
 
         # Botões do grupo (no topo)
-        btn_frame = tk.Frame(frame)
+        btn_frame = tk.Frame(frame, bg=card_bg)
         btn_frame.pack(fill="x", pady=(0, 5))
 
         # Seleção automática só deste grupo: o botão aparece apenas se a
@@ -5321,43 +5392,47 @@ class ImageCleaner:
         # e o seguinte sobe para o mesmo lugar).
         select_cmd = self.select_group if verified_view else self.select_and_verify
         if plan_identical_selection(images):
-            make_button(btn_frame, "Selecionar Idênticas", "select",
+            make_button(btn_frame, "Selecionar Idênticas", "select", soft=True,
                         command=lambda g=idx, c=select_cmd: c(g, "identical")).pack(side="left", padx=5)
         if plan_similar_selection(images, md5_count):
-            b_sim = make_button(btn_frame, "Selecionar Semelhantes", "similar",
+            b_sim = make_button(btn_frame, "Selecionar Semelhantes", "similar", soft=True,
                                 command=lambda g=idx, c=select_cmd: c(g, "similar"))
             b_sim.pack(side="left", padx=5)
             self.create_tooltip(b_sim, SIMILAR_RULE_TOOLTIP)
         if plan_same_photo_selection(images):
-            b_same = make_button(btn_frame, "Selecionar Mesma foto", "same",
+            b_same = make_button(btn_frame, "Selecionar Mesma foto", "same", soft=True,
                                  command=lambda g=idx, c=select_cmd: c(g, "same_photo"))
             b_same.pack(side="left", padx=5)
             self.create_tooltip(b_same, SAME_PHOTO_RULE_TOOLTIP)
         if plan_same_video_selection(images):
-            b_video = make_button(btn_frame, "Selecionar Mesmo vídeo", "same",
+            b_video = make_button(btn_frame, "Selecionar Mesmo vídeo", "same", soft=True,
                                   command=lambda g=idx, c=select_cmd: c(g, "same_video"))
             b_video.pack(side="left", padx=5)
             self.create_tooltip(b_video, SAME_VIDEO_TOOLTIP)
         if verified_view:
-            make_button(btn_frame, "Voltar para pendentes", "light",
+            make_button(btn_frame, "Voltar para pendentes", "light", soft=True,
                         command=lambda g=idx: self.unverify_group(g)).pack(side="left", padx=5)
         else:
-            make_button(btn_frame, "Marcar verificado ✓", "light",
+            make_button(btn_frame, "Marcar verificado ✓", "light", soft=True,
                         command=lambda g=idx: self.verify_group(g)).pack(side="left", padx=5)
 
-        btn_move = make_button(btn_frame, "Mover Selecionadas", "light",
+        btn_move = make_button(btn_frame, "Mover Selecionadas", "light", soft=True,
                                command=lambda grp=group, vars=group_data['check_vars']: self.move_images(grp, vars))
         btn_move.pack(side="left", padx=5)
 
-        btn_delete = make_button(btn_frame, "Excluir Selecionadas", "light",
+        btn_delete = make_button(btn_frame, "Excluir Selecionadas", "light", soft=True,
                                  command=lambda grp=group, vars=group_data['check_vars']: self.delete_images(grp, vars))
         btn_delete.pack(side="left", padx=5)
+
+        # Resumo do grupo (quantas e de que tipo), para decidir sem ler as linhas
+        tk.Label(btn_frame, text=self._group_summary(images, md5_count, group_files),
+                 bg=card_bg, fg=PALETTE["muted"], font=FONT_UI).pack(side="right", padx=(8, 2))
 
         # Grupos grandes começam recolhidos (só as primeiras imagens)
         collapsible = len(images) > COLLAPSE_THRESHOLD
         collapsed = collapsible and not self.group_expanded.get(idx, False)
         if collapsible and not collapsed:
-            make_button(btn_frame, "Recolher", "light",
+            make_button(btn_frame, "Recolher", "light", soft=True,
                         command=lambda g=idx: self.set_group_expanded(g, False)).pack(side="left", padx=5)
 
         # Grupos gigantes: exibe MAX_IMAGES_PER_GROUP_DISPLAY por vez, com
@@ -5388,9 +5463,11 @@ class ImageCleaner:
             is_ref = img_info.get('is_reference', False)
             kind = img_info.get('kind', KIND_PHOTO)
 
-            # Monta um frame interno para cada imagem
+            # Monta um frame interno para cada imagem (linha fina entre elas)
+            if pos > offset:
+                tk.Frame(frame, bg=PALETTE["border"], height=1).pack(fill="x", padx=4)
             item_frame = tk.Frame(frame)
-            item_frame.pack(side="top", fill="x", pady=5)
+            item_frame.pack(side="top", fill="x", pady=6)
 
             # Clicar em qualquer ponto da linha (fora da miniatura) alterna a
             # seleção; imagens da referência continuam bloqueadas.
@@ -5414,7 +5491,8 @@ class ImageCleaner:
                 photo = self._load_file_thumbnail(filepath, kind, md5_val, label=lbl_img)
                 lbl_img.config(image=photo)
                 lbl_img.image = photo
-            lbl_img.pack(side="left", padx=5)
+            lbl_img.configure(highlightthickness=1, highlightbackground=PALETTE["border"])
+            lbl_img.pack(side="left", padx=(6, 12), pady=2)
             lbl_img.bind("<Button-1>",
                          lambda e, g=idx, p=pos: self.open_preview(g, p))
 
@@ -5455,8 +5533,8 @@ class ImageCleaner:
             # Nome do arquivo em destaque; a pasta curta vai na primeira linha do
             # bloco de texto; caminho completo no tooltip e no menu de contexto
             tag, rel_dir, name = shorten_path(filepath, self._path_roots())
-            lbl_name = tk.Label(text_frame, text=name, font=FONT_BOLD, anchor="w",
-                                cursor="" if is_ref else "hand2")
+            lbl_name = tk.Label(text_frame, text=name, font=("Segoe UI", 10, "bold"), anchor="w",
+                                fg=PALETTE["text"], cursor="" if is_ref else "hand2")
             lbl_name.pack(anchor="w")
             where = (f"[{tag}] " if tag else "") + (rel_dir or "(raiz)")
             self.create_tooltip(lbl_name, filepath)
@@ -5499,7 +5577,7 @@ class ImageCleaner:
                 info_text = (
                     f"{where}\n"
                     f"{status_line}\n"
-                    f"Tamanho: {format_bytes(st.st_size)} ({st.st_size} bytes)\n"
+                    f"Tamanho: {format_bytes(st.st_size)} ({st.st_size} bytes)   |   "
                     f"Criado em: {ctime_str}   |   Modificado em: {mtime_str}"
                 )
             except OSError:
@@ -5510,7 +5588,7 @@ class ImageCleaner:
                 )
 
             lbl_info = tk.Label(text_frame, text=info_text, justify="left", anchor="w",
-                                cursor="" if is_ref else "hand2")
+                                fg="#555555", cursor="" if is_ref else "hand2")
             lbl_info.pack(anchor="w")
             row_widgets.extend([lbl_name, lbl_info])
             for w in row_widgets:
@@ -5535,12 +5613,36 @@ class ImageCleaner:
                                   "As ações de selecionar, mover e excluir valem para o grupo inteiro.",
                                   files=any(is_file_kind(k) for k in kinds))
                      ).pack(side="left", fill="x", expand=True)
-            make_button(strip, f"Expandir ({len(images)})", "light",
+            make_button(strip, f"Expandir ({len(images)})", "light", soft=True,
                         command=lambda g=idx: self.set_group_expanded(g, True)).pack(side="right")
         elif len(images) > MAX_IMAGES_PER_GROUP_DISPLAY:
             # Repete a navegação no fim de grupos grandes (evita rolar até o topo)
             self._render_group_nav(frame, idx, images, offset)
         return frame
+
+    @staticmethod
+    def _group_summary(images, md5_count, files):
+        """'13 imagens  ·  12 idênticas  ·  1 da referência' (só informação;
+           a decisão continua nas linhas e nos botões)."""
+        n = len(images)
+        counts = {}
+        for im in images:
+            st = image_status(im, md5_count)
+            counts[st] = counts.get(st, 0) + 1
+        refs = sum(1 for im in images if im.get('is_reference'))
+        parts = [f"{n} " + (("arquivo" if n == 1 else "arquivos") if files
+                            else ("imagem" if n == 1 else "imagens"))]
+        words = {"Idêntica": ("cópia exata", "cópias exatas") if files else ("idêntica", "idênticas"),
+                 "Mesma foto": ("mesma foto", "mesma foto"),
+                 "Mesmo vídeo": ("mesmo vídeo", "mesmo vídeo"),
+                 "Semelhante": ("semelhante", "semelhantes")}
+        for st in ("Idêntica", "Mesma foto", "Mesmo vídeo", "Semelhante"):
+            c = counts.get(st, 0)
+            if c:
+                parts.append(f"{c} {words[st][0 if c == 1 else 1]}")
+        if refs:
+            parts.append(f"{refs} da referência")
+        return "  ·  ".join(parts)
 
     def set_group_expanded(self, idx, expanded):
         """Expande/recolhe um grupo grande, redesenhando só ele (no lugar)."""
@@ -5599,7 +5701,7 @@ class ImageCleaner:
         if info.get('is_reference'):
             color = PALETTE["reference_row"]
         else:
-            color = PALETTE["selected_row"] if info['var'].get() == 1 else PALETTE["bg"]
+            color = PALETTE["selected_row"] if info['var'].get() == 1 else PALETTE["panel"]
         for w in widgets:
             try:
                 if not w.winfo_exists():
@@ -6031,11 +6133,11 @@ class ImageCleaner:
             # não deve jogar o usuário de volta ao topo da página.
             self.render_page(keep_scroll_px=max(0, self.canvas.canvasy(0)))
 
-        btn_next = make_button(nav, f"{MAX_IMAGES_PER_GROUP_DISPLAY} seguintes ▶", "light",
+        btn_next = make_button(nav, f"{MAX_IMAGES_PER_GROUP_DISPLAY} seguintes ▶", "light", soft=True,
                                command=lambda: go(offset + MAX_IMAGES_PER_GROUP_DISPLAY),
                                state="normal" if end < total else "disabled")
         btn_next.pack(side="right", padx=3)
-        btn_prev = make_button(nav, f"◀ {MAX_IMAGES_PER_GROUP_DISPLAY} anteriores", "light",
+        btn_prev = make_button(nav, f"◀ {MAX_IMAGES_PER_GROUP_DISPLAY} anteriores", "light", soft=True,
                                command=lambda: go(offset - MAX_IMAGES_PER_GROUP_DISPLAY),
                                state="normal" if offset > 0 else "disabled")
         btn_prev.pack(side="right", padx=3)
