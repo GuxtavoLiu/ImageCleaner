@@ -275,7 +275,7 @@ def snapshot_single_mode(root, confirm=False, priority=None, same_photo=False):
             im['same_photo'] = cid
             im['same_photo_suspect'] = cid in suspect
         snap_groups.append([
-            [rel(im['filepath']), ic.image_status(im, counts).replace("Idêntica", "Identica").replace("Mesma foto", "MesmaFoto")]
+            [rel(im['filepath']), ic.image_status(im, counts).replace("Cópia exata", "Identica").replace("Mesma foto", "MesmaFoto")]
             for im in images
         ])
         # Usa o mecanismo de seleção vigente no main.py: as funções puras se

@@ -157,7 +157,7 @@ def test_tudo_marcado_grupos_de_bytes_depois_dos_de_fotos(cleanup, tmp_path, mon
 
     app.select_similar_images()
     app.select_identical_images()
-    assert "arquivos idênticos foram selecionados" in msgs[-1][2]
+    assert "cópias exatas foram selecionadas" in msgs[-1][2]
     app.open_preview(2, 0)
     root.update()
     assert "Abrir no programa padrão" in _buttons(app.preview_window, [])
@@ -198,7 +198,7 @@ def test_excluir_vai_para_a_lixeira_com_vocabulario_de_arquivos_e_csv(cleanup, t
     with open(app.session_report.path, encoding="utf-8-sig") as f:
         rows = list(csv.DictReader(f, delimiter=";"))
     assert [(r["acao"], r["status"], os.path.basename(r["caminho"])) for r in rows] == \
-        [("lixeira", "Idêntica", "clip_copia.mp4")]
+        [("lixeira", "Cópia exata", "clip_copia.mp4")]
     # por grupo, com o grupo já sem nada selecionado
     app.delete_images(app.group_check_vars[1]['group'], app.group_check_vars[1]['check_vars'])
     assert "Nenhum arquivo selecionado neste grupo." in msgs[-1][2]

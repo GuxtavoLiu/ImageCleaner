@@ -10,7 +10,7 @@
     "progress_titles": [
       "Escaneando Imagens",
       "Agrupando Imagens",
-      "Verificando Imagens Idênticas",
+      "Verificando Cópias Exatas",
       "Confirmando Semelhantes",
       "Identificando 'Mesma foto'"
     ],
@@ -96,7 +96,7 @@
       "Grupo 2"
     ],
     "buttons": [
-      "Selecionar Todas Idênticas",
+      "Selecionar Todas Cópias Exatas",
       "Selecionar Todas Semelhantes",
       "Selecionar Todas Mesma Foto",
       "Mover Todas Selecionadas",
@@ -104,13 +104,13 @@
       "Grupos verificados (0)",
       "← Anterior (F1)",
       "Próximo (F2) →",
-      "Selecionar Idênticas",
+      "Selecionar Cópias exatas",
       "Selecionar Semelhantes",
       "Selecionar Mesma foto",
       "Marcar verificado ✓",
       "Mover Selecionadas",
       "Excluir Selecionadas",
-      "Selecionar Idênticas",
+      "Selecionar Cópias exatas",
       "Marcar verificado ✓",
       "Mover Selecionadas",
       "Excluir Selecionadas"
@@ -118,11 +118,11 @@
     "rows": {
       "0:0": [
         "[ALVO] (raiz)",
-        "Status: Idêntica   |   Resolução: 128 x 128 (0,0 MP)"
+        "Status: Cópia exata   |   Resolução: 128 x 128 (0,0 MP)"
       ],
       "0:1": [
         "[ALVO] (raiz)",
-        "Status: Idêntica   |   Resolução: 128 x 128 (0,0 MP)"
+        "Status: Cópia exata   |   Resolução: 128 x 128 (0,0 MP)"
       ],
       "0:2": [
         "[ALVO] (raiz)",
@@ -134,23 +134,23 @@
       ],
       "1:0": [
         "[ALVO] sub",
-        "Status: Idêntica   |   Resolução: 128 x 128 (0,0 MP)"
+        "Status: Cópia exata   |   Resolução: 128 x 128 (0,0 MP)"
       ],
       "1:1": [
         "[ALVO] sub",
-        "Status: Idêntica   |   Resolução: 128 x 128 (0,0 MP)"
+        "Status: Cópia exata   |   Resolução: 128 x 128 (0,0 MP)"
       ]
     },
     "statuses": [
       [
-        "Idêntica",
-        "Idêntica",
+        "Cópia exata",
+        "Cópia exata",
         "Mesma foto",
         "Mesma foto"
       ],
       [
-        "Idêntica",
-        "Idêntica"
+        "Cópia exata",
+        "Cópia exata"
       ]
     ]
   },
@@ -165,7 +165,7 @@
     "progress_titles": [
       "Escaneando Imagens",
       "Agrupando Imagens",
-      "Verificando Imagens Idênticas"
+      "Verificando Cópias Exatas"
     ],
     "scan_in_progress": false,
     "has_groups_window": true,
@@ -214,19 +214,19 @@
       "Grupo 2"
     ],
     "buttons": [
-      "Selecionar Todas Idênticas",
+      "Selecionar Todas Cópias Exatas",
       "Selecionar Todas Semelhantes",
       "Mover Todas Selecionadas",
       "Excluir Todas Selecionadas",
       "Grupos verificados (0)",
       "← Anterior (F1)",
       "Próximo (F2) →",
-      "Selecionar Idênticas",
+      "Selecionar Cópias exatas",
       "Selecionar Semelhantes",
       "Marcar verificado ✓",
       "Mover Selecionadas",
       "Excluir Selecionadas",
-      "Selecionar Idênticas",
+      "Selecionar Cópias exatas",
       "Marcar verificado ✓",
       "Mover Selecionadas",
       "Excluir Selecionadas"
@@ -234,11 +234,11 @@
     "rows": {
       "0:0": [
         "[ALVO] (raiz)",
-        "Status: Idêntica   |   Resolução: 128 x 128 (0,0 MP)"
+        "Status: Cópia exata   |   Resolução: 128 x 128 (0,0 MP)"
       ],
       "0:1": [
         "[ALVO] (raiz)",
-        "Status: Idêntica   |   Resolução: 128 x 128 (0,0 MP)"
+        "Status: Cópia exata   |   Resolução: 128 x 128 (0,0 MP)"
       ],
       "0:2": [
         "[ALVO] (raiz)",
@@ -250,23 +250,23 @@
       ],
       "1:0": [
         "[ALVO] sub",
-        "Status: Idêntica   |   Resolução: 128 x 128 (0,0 MP)"
+        "Status: Cópia exata   |   Resolução: 128 x 128 (0,0 MP)"
       ],
       "1:1": [
         "[ALVO] sub",
-        "Status: Idêntica   |   Resolução: 128 x 128 (0,0 MP)"
+        "Status: Cópia exata   |   Resolução: 128 x 128 (0,0 MP)"
       ]
     },
     "statuses": [
       [
-        "Idêntica",
-        "Idêntica",
+        "Cópia exata",
+        "Cópia exata",
         "Semelhante",
         "Semelhante"
       ],
       [
-        "Idêntica",
-        "Idêntica"
+        "Cópia exata",
+        "Cópia exata"
       ]
     ]
   },
@@ -315,7 +315,7 @@
     "progress_titles": [
       "Escaneando Imagens",
       "Agrupando Imagens",
-      "Verificando Imagens Idênticas",
+      "Verificando Cópias Exatas",
       "Confirmando Semelhantes",
       "Identificando 'Mesma foto'"
     ],
@@ -406,7 +406,7 @@
       "Grupo 2"
     ],
     "buttons": [
-      "Selecionar Todas Idênticas",
+      "Selecionar Todas Cópias Exatas",
       "Selecionar Todas Semelhantes",
       "Selecionar Todas Mesma Foto",
       "Mover Todas Selecionadas",
@@ -414,13 +414,13 @@
       "Grupos verificados (0)",
       "← Anterior (F1)",
       "Próximo (F2) →",
-      "Selecionar Idênticas",
+      "Selecionar Cópias exatas",
       "Selecionar Semelhantes",
       "Selecionar Mesma foto",
       "Marcar verificado ✓",
       "Mover Selecionadas",
       "Excluir Selecionadas",
-      "Selecionar Idênticas",
+      "Selecionar Cópias exatas",
       "Selecionar Mesma foto",
       "Marcar verificado ✓",
       "Mover Selecionadas",
@@ -429,7 +429,7 @@
     "rows": {
       "0:0": [
         "[ALVO] (raiz)",
-        "Status: Idêntica   |   Resolução: 128 x 128 (0,0 MP)"
+        "Status: Cópia exata   |   Resolução: 128 x 128 (0,0 MP)"
       ],
       "0:1": [
         "[ALVO] (raiz)",
@@ -437,36 +437,36 @@
       ],
       "0:2": [
         "[REF] (raiz)",
-        "Status: Idêntica   |   Resolução: 128 x 128 (0,0 MP)"
+        "Status: Cópia exata   |   Resolução: 128 x 128 (0,0 MP)"
       ],
       "1:0": [
         "[ALVO] (raiz)",
-        "Status: Idêntica   |   Resolução: 128 x 128 (0,0 MP)"
+        "Status: Cópia exata   |   Resolução: 128 x 128 (0,0 MP)"
       ],
       "1:1": [
         "[ALVO] (raiz)",
-        "Status: Idêntica   |   Resolução: 128 x 128 (0,0 MP)"
+        "Status: Cópia exata   |   Resolução: 128 x 128 (0,0 MP)"
       ],
       "1:2": [
         "[REF] (raiz)",
-        "Status: Idêntica   |   Resolução: 128 x 128 (0,0 MP)"
+        "Status: Cópia exata   |   Resolução: 128 x 128 (0,0 MP)"
       ],
       "1:3": [
         "[REF] (raiz)",
-        "Status: Idêntica   |   Resolução: 128 x 128 (0,0 MP)"
+        "Status: Cópia exata   |   Resolução: 128 x 128 (0,0 MP)"
       ]
     },
     "statuses": [
       [
-        "Idêntica",
+        "Cópia exata",
         "Mesma foto",
-        "Idêntica"
+        "Cópia exata"
       ],
       [
-        "Idêntica",
-        "Idêntica",
-        "Idêntica",
-        "Idêntica"
+        "Cópia exata",
+        "Cópia exata",
+        "Cópia exata",
+        "Cópia exata"
       ]
     ]
   },
@@ -481,7 +481,7 @@
     "progress_titles": [
       "Escaneando Imagens",
       "Agrupando Imagens",
-      "Verificando Imagens Idênticas",
+      "Verificando Cópias Exatas",
       "Confirmando Semelhantes",
       "Identificando 'Mesma foto'"
     ],
@@ -572,7 +572,7 @@
       "Grupo 2"
     ],
     "buttons": [
-      "Selecionar Todas Idênticas",
+      "Selecionar Todas Cópias Exatas",
       "Selecionar Todas Semelhantes",
       "Selecionar Todas Mesma Foto",
       "Mover Todas Selecionadas",
@@ -580,13 +580,13 @@
       "Grupos verificados (0)",
       "← Anterior (F1)",
       "Próximo (F2) →",
-      "Selecionar Idênticas",
+      "Selecionar Cópias exatas",
       "Selecionar Semelhantes",
       "Selecionar Mesma foto",
       "Marcar verificado ✓",
       "Mover Selecionadas",
       "Excluir Selecionadas",
-      "Selecionar Idênticas",
+      "Selecionar Cópias exatas",
       "Selecionar Mesma foto",
       "Marcar verificado ✓",
       "Mover Selecionadas",
@@ -595,7 +595,7 @@
     "rows": {
       "0:0": [
         "[ALVO] (raiz)",
-        "Status: Idêntica   |   Resolução: 128 x 128 (0,0 MP)"
+        "Status: Cópia exata   |   Resolução: 128 x 128 (0,0 MP)"
       ],
       "0:1": [
         "[ALVO] (raiz)",
@@ -603,36 +603,36 @@
       ],
       "0:2": [
         "[REF] (raiz)",
-        "Status: Idêntica   |   Resolução: 128 x 128 (0,0 MP)"
+        "Status: Cópia exata   |   Resolução: 128 x 128 (0,0 MP)"
       ],
       "1:0": [
         "[ALVO] (raiz)",
-        "Status: Idêntica   |   Resolução: 128 x 128 (0,0 MP)"
+        "Status: Cópia exata   |   Resolução: 128 x 128 (0,0 MP)"
       ],
       "1:1": [
         "[ALVO] (raiz)",
-        "Status: Idêntica   |   Resolução: 128 x 128 (0,0 MP)"
+        "Status: Cópia exata   |   Resolução: 128 x 128 (0,0 MP)"
       ],
       "1:2": [
         "[REF] (raiz)",
-        "Status: Idêntica   |   Resolução: 128 x 128 (0,0 MP)"
+        "Status: Cópia exata   |   Resolução: 128 x 128 (0,0 MP)"
       ],
       "1:3": [
         "[REF] (raiz)",
-        "Status: Idêntica   |   Resolução: 128 x 128 (0,0 MP)"
+        "Status: Cópia exata   |   Resolução: 128 x 128 (0,0 MP)"
       ]
     },
     "statuses": [
       [
-        "Idêntica",
+        "Cópia exata",
         "Mesma foto",
-        "Idêntica"
+        "Cópia exata"
       ],
       [
-        "Idêntica",
-        "Idêntica",
-        "Idêntica",
-        "Idêntica"
+        "Cópia exata",
+        "Cópia exata",
+        "Cópia exata",
+        "Cópia exata"
       ]
     ]
   },
@@ -692,7 +692,7 @@
     "progress_titles": [
       "Escaneando Imagens",
       "Agrupando Imagens",
-      "Verificando Imagens Idênticas",
+      "Verificando Cópias Exatas",
       "Confirmando Semelhantes"
     ],
     "scan_in_progress": false,
@@ -709,7 +709,7 @@
     "progress_titles": [
       "Escaneando Imagens",
       "Agrupando Imagens",
-      "Verificando Imagens Idênticas",
+      "Verificando Cópias Exatas",
       "Confirmando Semelhantes",
       "Identificando 'Mesma foto'"
     ],
@@ -785,7 +785,7 @@
       "Grupo 2"
     ],
     "buttons": [
-      "Selecionar Todas Idênticas",
+      "Selecionar Todas Cópias Exatas",
       "Selecionar Todas Semelhantes",
       "Selecionar Todas Mesma Foto",
       "Mover Todas Selecionadas",
@@ -793,7 +793,7 @@
       "Grupos verificados (0)",
       "← Anterior (F1)",
       "Próximo (F2) →",
-      "Selecionar Idênticas",
+      "Selecionar Cópias exatas",
       "Marcar verificado ✓",
       "Mover Selecionadas",
       "Excluir Selecionadas",
@@ -806,11 +806,11 @@
     "rows": {
       "0:0": [
         "[ALVO] (raiz)",
-        "Status: Idêntica   |   Resolução: 128 x 128 (0,0 MP)"
+        "Status: Cópia exata   |   Resolução: 128 x 128 (0,0 MP)"
       ],
       "0:1": [
         "[ALVO] (raiz)",
-        "Status: Idêntica   |   Resolução: 128 x 128 (0,0 MP)"
+        "Status: Cópia exata   |   Resolução: 128 x 128 (0,0 MP)"
       ],
       "1:0": [
         "[ALVO] (raiz)",
@@ -823,8 +823,8 @@
     },
     "statuses": [
       [
-        "Idêntica",
-        "Idêntica"
+        "Cópia exata",
+        "Cópia exata"
       ],
       [
         "Mesma foto",
@@ -843,7 +843,7 @@
     "progress_titles": [
       "Escaneando Imagens",
       "Agrupando Imagens",
-      "Verificando Imagens Idênticas",
+      "Verificando Cópias Exatas",
       "Confirmando Semelhantes",
       "Identificando 'Mesma foto'"
     ],
@@ -932,7 +932,7 @@
       "Grupo 1"
     ],
     "buttons": [
-      "Selecionar Todas Idênticas",
+      "Selecionar Todas Cópias Exatas",
       "Selecionar Todas Semelhantes",
       "Selecionar Todas Mesma Foto",
       "Mover Todas Selecionadas",
@@ -1046,13 +1046,13 @@
       [
         "showinfo",
         "Cancelado",
-        "Verificação de imagens idênticas cancelada."
+        "Verificação de cópias exatas cancelada."
       ]
     ],
     "progress_titles": [
       "Escaneando Imagens",
       "Agrupando Imagens",
-      "Verificando Imagens Idênticas"
+      "Verificando Cópias Exatas"
     ],
     "scan_in_progress": false,
     "has_groups_window": false
@@ -1073,7 +1073,7 @@
     "progress_titles": [
       "Escaneando Imagens",
       "Agrupando Imagens",
-      "Verificando Imagens Idênticas",
+      "Verificando Cópias Exatas",
       "Confirmando Semelhantes"
     ],
     "scan_in_progress": false,
@@ -1095,7 +1095,7 @@
     "progress_titles": [
       "Escaneando Imagens",
       "Agrupando Imagens",
-      "Verificando Imagens Idênticas",
+      "Verificando Cópias Exatas",
       "Confirmando Semelhantes",
       "Identificando 'Mesma foto'"
     ],

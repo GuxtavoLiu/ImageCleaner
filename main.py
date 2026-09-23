@@ -281,9 +281,6 @@ def format_resolution(dims):
 # "arquivos" (com a concordância certa). Só com fotos, NADA é trocado: os
 # textos de sempre ficam byte a byte iguais. Ordem importa: frases primeiro.
 FILE_WORDING = [
-    ("imagens idênticas foram selecionadas (mantendo a mais antiga",
-     "arquivos idênticos foram selecionados (mantendo o mais antigo"),
-    ("imagens idênticas foram selecionadas", "arquivos idênticos foram selecionados"),
     ("Imagens da referência nunca são selecionadas", "Arquivos da referência nunca são selecionados"),
     ("imagem(ns) da referência foram ignoradas (protegidas)",
      "arquivo(s) da referência foram ignorados (protegidos)"),
@@ -483,7 +480,7 @@ SIMILAR_RULE_TOOLTIP = ("Semelhantes: fotos parecidas entre si, mas que não sã
                         "Este botão mantém a melhor versão de cada grupo (maior resolução, depois\n"
                         "arquivo maior, depois a mais antiga) e seleciona as outras.\n"
                         "Se houver foto do acervo de referência no grupo, ela é a mantida.\n"
-                        "Cópias idênticas não entram aqui: use 'Selecionar Idênticas'.")
+                        "Cópias exatas não entram aqui: use 'Selecionar Cópias exatas'.")
 
 # ---------------------------------------------------------------------------
 # "Mesma foto": mesma captura em outra versão (redimensionada, recomprimida,
@@ -3355,10 +3352,10 @@ def same_photo_stage(images_data, stats, groups_idx, md5_by_idx, dhash_by_idx,
 
 
 def image_status(info, md5_count):
-    """'Idêntica' (MD5 repetido no grupo) > 'Mesma foto' (classe) > 'Mesmo vídeo'
+    """'Cópia exata' (MD5 repetido no grupo) > 'Mesma foto' (classe) > 'Mesmo vídeo'
        (mesmos fluxos, arquivo diferente) > 'Semelhante'."""
     if md5_count.get(info['md5'], 0) > 1:
-        return "Idêntica"
+        return "Cópia exata"
     if info.get('same_photo') is not None:
         return "Mesma foto"
     if info.get('same_video'):
@@ -3598,7 +3595,7 @@ class ImageCleaner:
             self.kind_checks.append(chk)
         self.kinds_info_label = help_marker(
             kinds_row,
-            "Fotos: acha cópias idênticas, a mesma foto em outra versão e fotos\n"
+            "Fotos: acha cópias exatas, a mesma foto em outra versão e fotos\n"
             "semelhantes. Formatos que o programa não abre (HEIC, RAW) entram\n"
             "só como cópia exata.\n"
             "Vídeos e Outros arquivos: só cópias EXATAS (mesmo conteúdo, byte a\n"
@@ -3617,7 +3614,7 @@ class ImageCleaner:
             "Antes de chamar duas fotos de 'Semelhantes', faz uma segunda\n"
             "verificação independente. Evita juntar fotos diferentes que só\n"
             "coincidem na distribuição de luz e sombra.\n"
-            "Cópias idênticas nunca são afetadas.\n"
+            "Cópias exatas nunca são afetadas.\n"
             "Desmarque para ver o agrupamento amplo de antes.")
         self.same_photo_var = tk.IntVar(value=1 if SAME_PHOTO_ENABLED else 0)
         self.same_photo_check = ttk.Checkbutton(photo_row, text="Detectar 'Mesma foto'",
@@ -4301,7 +4298,7 @@ class ImageCleaner:
                     "Comparação incompleta",
                     f"{len(byte_errors)} arquivo(s) não puderam ser lidos (sem permissão, em uso ou "
                     "alterados durante a leitura) e ficaram FORA da comparação por conteúdo: o "
-                    "programa nunca chama de 'Idêntica' o que não conseguiu ler inteiro.\n\n"
+                    "programa nunca chama de 'Cópia exata' o que não conseguiu ler inteiro.\n\n"
                     f"Os caminhos estão no log: {get_log_path()}"
                 )
 
@@ -4634,8 +4631,8 @@ class ImageCleaner:
         # MD5 apenas para as imagens agrupadas (com pré-filtro por tamanho)
         stats = [self.file_stats.get(fp, (None, None)) for (fp, _, _) in self.images_data]
         self.create_progress_window()
-        self.progress_window.title("Verificando Imagens Idênticas")
-        self.progress_label.config(text="Verificando arquivos idênticos (MD5)...")
+        self.progress_window.title("Verificando Cópias Exatas")
+        self.progress_label.config(text="Verificando cópias exatas (MD5)...")
         self.progress_window.update()
         try:
             md5_by_idx, cancelled = md5_for_groups(
@@ -4649,7 +4646,7 @@ class ImageCleaner:
         if cancelled or self.scan_cancelled or self.close_requested:
             log.info("Verificação de MD5 cancelada")
             if not self.close_requested:
-                messagebox.showinfo("Cancelado", "Verificação de imagens idênticas cancelada.")
+                messagebox.showinfo("Cancelado", "Verificação de cópias exatas cancelada.")
             return "abort", None
 
         # Confirmação de "Semelhante" por segundo hash (pós-filtro opcional).
@@ -4765,7 +4762,7 @@ class ImageCleaner:
             messagebox.showwarning(
                 "Verificação incompleta",
                 f"{md5_failures} arquivo(s) não puderam ser lidos na verificação de "
-                f"idênticas (MD5) e serão exibidos como 'Semelhante'.\n\n"
+                f"cópias exatas (MD5) e serão exibidos como 'Semelhante'.\n\n"
                 f"Os caminhos estão no log: {get_log_path()}"
             )
         return "ok", photo_groups
@@ -4967,7 +4964,7 @@ class ImageCleaner:
         # para a 1ª linha caber só com os botões mesmo em telas menores.
 
         # Botão para selecionar idênticas
-        btn_select_identical = make_button(top_frame, "Selecionar Todas Idênticas", "select",
+        btn_select_identical = make_button(top_frame, "Selecionar Todas Cópias Exatas", "select",
                                            command=self.select_identical_images)
         btn_select_identical.pack(side="left", padx=5)
 
@@ -5017,7 +5014,7 @@ class ImageCleaner:
         more["menu"] = more_menu
         more.pack(side="left", padx=5)
         self.create_tooltip(self.view_toggle_btn,
-                            "Ao usar 'Selecionar Idênticas/Semelhantes' ou 'Marcar verificado' de um\n"
+                            "Ao usar 'Selecionar Cópias exatas/Semelhantes' ou 'Marcar verificado' de um\n"
                             "grupo, ele sai da fila de pendentes e vai para 'Grupos verificados'.\n"
                             "As seleções feitas continuam valendo para 'Mover/Excluir Todas Selecionadas'.\n"
                             "A lista de verificados vale só nesta sessão.")
@@ -5392,7 +5389,7 @@ class ImageCleaner:
         # e o seguinte sobe para o mesmo lugar).
         select_cmd = self.select_group if verified_view else self.select_and_verify
         if plan_identical_selection(images):
-            make_button(btn_frame, "Selecionar Idênticas", "select", soft=True,
+            make_button(btn_frame, "Selecionar Cópias exatas", "select", soft=True,
                         command=lambda g=idx, c=select_cmd: c(g, "identical")).pack(side="left", padx=5)
         if plan_similar_selection(images, md5_count):
             b_sim = make_button(btn_frame, "Selecionar Semelhantes", "similar", soft=True,
@@ -5568,7 +5565,7 @@ class ImageCleaner:
                                f"Resolução: {format_resolution(self.image_dims.get(filepath))}")
             else:
                 # Sem "Resolução": no lugar, o tipo e (vídeo) dimensões e duração
-                status_line = (f"Status: {'Cópia exata' if status == 'Idêntica' else status}   |   "
+                status_line = (f"Status: {status}   |   "
                                f"{media_summary(kind, filepath, self._media_info(filepath, kind, md5_val))}")
             try:
                 st = os.stat(filepath)
@@ -5622,7 +5619,7 @@ class ImageCleaner:
 
     @staticmethod
     def _group_summary(images, md5_count, files):
-        """'13 imagens  ·  12 idênticas  ·  1 da referência' (só informação;
+        """'13 imagens  ·  12 cópias exatas  ·  1 da referência' (só informação;
            a decisão continua nas linhas e nos botões)."""
         n = len(images)
         counts = {}
@@ -5632,11 +5629,11 @@ class ImageCleaner:
         refs = sum(1 for im in images if im.get('is_reference'))
         parts = [f"{n} " + (("arquivo" if n == 1 else "arquivos") if files
                             else ("imagem" if n == 1 else "imagens"))]
-        words = {"Idêntica": ("cópia exata", "cópias exatas") if files else ("idêntica", "idênticas"),
+        words = {"Cópia exata": ("cópia exata", "cópias exatas"),
                  "Mesma foto": ("mesma foto", "mesma foto"),
                  "Mesmo vídeo": ("mesmo vídeo", "mesmo vídeo"),
                  "Semelhante": ("semelhante", "semelhantes")}
-        for st in ("Idêntica", "Mesma foto", "Mesmo vídeo", "Semelhante"):
+        for st in ("Cópia exata", "Mesma foto", "Mesmo vídeo", "Semelhante"):
             c = counts.get(st, 0)
             if c:
                 parts.append(f"{c} {words[st][0 if c == 1 else 1]}")
@@ -6029,7 +6026,7 @@ class ImageCleaner:
                 if kind == KIND_PHOTO:
                     summary = f"{status}   |   {format_resolution(dims)}"
                 else:
-                    summary = (f"{'Cópia exata' if status == 'Idêntica' else status}   |   "
+                    summary = (f"{status}   |   "
                                f"{media_summary(kind, fp, self._media_info(fp, kind, info['md5']))}")
                 tk.Label(col, text=(f"{summary}   |   "
                                     f"{format_bytes(size)}\nModificado em: {mt_str}"),
@@ -6266,7 +6263,7 @@ class ImageCleaner:
                 selected_count += 1
 
         messagebox.showinfo("Seleção Concluída", self._t(
-                           f"{selected_count} imagens idênticas foram selecionadas (mantendo a mais antiga de cada grupo)."
+                           f"{selected_count} cópias exatas foram selecionadas (mantendo a mais antiga de cada grupo)."
                            + self._verified_note() + self._reference_selection_note()))
 
     def select_similar_images(self):

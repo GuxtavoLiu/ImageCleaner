@@ -106,7 +106,7 @@ def test_remux_entra_no_grupo_e_a_selecao_mantem_um_arquivo(env, monkeypatch):
     fx = build_video_fixture(base)
     app, msgs = _start(root, monkeypatch, fx)
     assert _names(app) == [["copia_exata.mp4", "original.mp4", "remux_outro_nome.mov"]]
-    assert _statuses(app) == {"original.mp4": "Idêntica", "copia_exata.mp4": "Idêntica",
+    assert _statuses(app) == {"original.mp4": "Cópia exata", "copia_exata.mp4": "Cópia exata",
                               "remux_outro_nome.mov": "Mesmo vídeo"}
     buttons = _buttons(app.groups_window, [])
     assert "Selecionar Todos Mesmo Vídeo" in buttons and "Selecionar Mesmo vídeo" in buttons

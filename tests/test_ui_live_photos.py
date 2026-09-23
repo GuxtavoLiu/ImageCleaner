@@ -116,7 +116,7 @@ def test_excluir_leva_o_video_par_e_registra_no_csv(env, monkeypatch):
     with open(app.session_report.path, encoding="utf-8-sig") as f:
         rows = {os.path.basename(r["caminho"]): r for r in csv.DictReader(f, delimiter=";")}
     assert rows["IMG_0001.MOV"]["status"] == "Live Photo (par)" and rows["IMG_0001.MOV"]["acao"] == "lixeira"
-    assert rows["IMG_0001.JPG"]["status"] == "Idêntica"
+    assert rows["IMG_0001.JPG"]["status"] == "Cópia exata"
 
 
 def test_nao_e_cancelar_na_pergunta(env, monkeypatch):

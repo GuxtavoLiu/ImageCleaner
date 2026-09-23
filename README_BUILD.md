@@ -267,7 +267,7 @@ internas da pasta alvo" controla os grupos sem par no acervo.
 
 ### Vídeos e outros arquivos (cartão "O que procurar" da tela inicial)
 Na tela inicial: **Fotos** (ligada por padrão), **Vídeos** e **Outros arquivos**.
-- **Fotos** segue como sempre (Idêntica, Mesma foto, Semelhante), com duas diferenças
+- **Fotos** segue como sempre (Cópia exata, Mesma foto, Semelhante), com duas diferenças
   deliberadas: as pastas de sistema `$RECYCLE.BIN` e `System Volume Information` deixaram de
   ser percorridas (antes, varrer a raiz de um disco listava a Lixeira como duplicata); e os
   formatos que o Pillow não abre (`PHOTO_BYTES_EXTENSIONS`: HEIC/HEIF do iPhone, RAW de
@@ -353,7 +353,7 @@ iPhone grava dentro do `.MOV` (`com.apple.quicktime.content.identifier`, lida pe
   Live Photo real.
 
 ### Tela de grupos: como revisar rápido
-- **Fila de revisão**: "Selecionar Idênticas/Semelhantes" ou "Marcar verificado ✓" de
+- **Fila de revisão**: "Selecionar Cópias exatas/Semelhantes" ou "Marcar verificado ✓" de
   um grupo tira o grupo dos pendentes; o próximo sobe para o mesmo lugar. Os
   verificados ficam em "Grupos verificados (N)" (com "Voltar para pendentes").
   "Selecionar Todas ..." age só nos pendentes; "Mover/Excluir Todas Selecionadas"
@@ -361,10 +361,10 @@ iPhone grava dentro do `.MOV` (`com.apple.quicktime.content.identifier`, lida pe
 - **Regra de "Selecionar Semelhantes"** (`SIMILAR_KEEP_PRIORITY` no `main.py`): em cada
   grupo, entre as imagens não idênticas, MANTÉM a de melhor qualidade e seleciona as
   outras: 1) maior resolução, 2) maior arquivo, 3) mais antiga, 4) a primeira da lista.
-  Se o grupo tem imagem do acervo de referência, ela é a mantida. "Selecionar Idênticas"
-  segue mantendo a cópia mais antiga (idênticas têm a mesma qualidade por definição).
+  Se o grupo tem imagem do acervo de referência, ela é a mantida. "Selecionar Cópias exatas"
+  segue mantendo a cópia mais antiga (cópias exatas têm a mesma qualidade por definição).
 - **Status "Mesma foto"** (`SAME_PHOTO_*` no `main.py`; checkbox "Detectar 'Mesma foto'"):
-  terceiro nível entre Idêntica (mesmo arquivo) e Semelhante (parecida): a mesma captura
+  terceiro nível entre Cópia exata (mesmo arquivo) e Semelhante (parecida): a mesma captura
   em outra versão (redimensionada, recomprimida, EXIF alterado, WhatsApp/iCloud). Só entra
   com TODAS as provas: hashes quase iguais (phash <= 2, dhash <= 4), mesma proporção
   bruta, lado mínimo 100 px, correlação de pixels >= 0,98 no todo (miniatura 64x64),

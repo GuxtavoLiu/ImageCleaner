@@ -285,7 +285,7 @@ def test_same_photo_stage_na_fixture(fx, tmp_path):
 # --------------------------------------------------------------------------
 
 def test_image_status():
-    assert ic.image_status({'md5': "m", 'same_photo': 0}, {"m": 2}) == "Idêntica"
+    assert ic.image_status({'md5': "m", 'same_photo': 0}, {"m": 2}) == "Cópia exata"
     assert ic.image_status({'md5': "m", 'same_photo': 0}, {"m": 1}) == "Mesma foto"
     assert ic.image_status({'md5': "m"}, {"m": 1}) == "Semelhante"
 

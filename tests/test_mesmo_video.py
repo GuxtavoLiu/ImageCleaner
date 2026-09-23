@@ -127,6 +127,6 @@ def test_cache_referencia_cancelamento_e_sem_ffmpeg(acervo, tmp_path):
 def test_status_mesmo_video():
     base = {'md5': 'SIZE:1:0', 'same_photo': None}
     assert ic.image_status({**base, 'same_video': True}, {'SIZE:1:0': 1}) == "Mesmo vídeo"
-    assert ic.image_status({'md5': 'm', 'same_video': True}, {'m': 2}) == "Idêntica"      # cópia exata vence
+    assert ic.image_status({'md5': 'm', 'same_video': True}, {'m': 2}) == "Cópia exata"      # cópia exata vence
     assert ic.image_status(base, {'SIZE:1:0': 1}) == "Semelhante"
     assert ic.plan_same_video_selection([{'same_video': True, 'mtime': 1, 'size': 1}]) == []

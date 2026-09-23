@@ -151,7 +151,7 @@ def test_linha_resolucao_caminho_curto_e_cor(app_with_groups):
     info_text = next(t for t in textos if "Status:" in t)
     assert info_text.startswith("[ALVO] (raiz)")        # caminho curto com a tag
     assert "Resolução: 128 x 128 (0,0 MP)" in info_text
-    assert "Idêntica" in info_text and "bytes)" in info_text
+    assert "Cópia exata" in info_text and "bytes)" in info_text
     # cor da linha acompanha a seleção
     var = app.group_check_vars[idx]['images'][pos]['var']
     assert widgets[0].cget("bg") == ic.PALETTE["panel"]      # fundo do cartão
@@ -287,7 +287,7 @@ def test_excluir_vai_para_lixeira_e_relatorio(app_with_groups, monkeypatch, tmp_
     with open(app.session_report.path, encoding="utf-8-sig", newline="") as f:
         rows = list(csv.DictReader(f, delimiter=";"))
     assert rows[-1]["acao"] == "lixeira" and rows[-1]["caminho"] == fp and rows[-1]["grupo"] == "1"
-    assert rows[-1]["status"] == "Idêntica" and rows[-1]["origem"] == "ALVO"
+    assert rows[-1]["status"] == "Cópia exata" and rows[-1]["origem"] == "ALVO"
     # desfazer com lixeira: só orienta
     app.undo_last_action()
     assert msgs[-1][0] == "showinfo" and "Lixeira" in msgs[-1][2]
